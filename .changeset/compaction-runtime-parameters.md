@@ -7,3 +7,5 @@ Inherit the active Pi session's thinking level and session ID during Remote Comp
 Require Pi 0.99.1 or newer and test both Responses adapters against ordinary requests with simulated HTTP responses. Document installation from the maintained local workspace.
 
 Run the compaction tests through npm using TypeScript compilation and Node's test runner. Use npm for workspace verification and make dry-run package checks portable on Windows. Exclude test sources from the published compaction package.
+
+Build the compaction request from the transcript's system messages instead of re-injecting the system prompt and tools, and apply Pi's image blocking, thinking budgets, WebSocket connect timeout, and retry delay settings. Trim trailing tool outputs to Codex's usable context window before compaction. Classify retained user items by Pi message origin so user shell commands, hidden extension messages, and expanded skill blocks follow Codex's contextual rules.
