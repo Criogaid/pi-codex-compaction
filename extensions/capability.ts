@@ -7,7 +7,6 @@ export const OPENAI_RESPONSES_API = "openai-responses" as const;
 export type RemoteCompactionApi = typeof CODEX_API | typeof OPENAI_RESPONSES_API;
 export const REQUEST_TIMEOUT_MS = 300_000;
 export const MAX_RETRIES = 2;
-export const REPLACEMENT_TOKEN_BUDGET = 64_000;
 
 const OFFICIAL_PROVIDER = "openai-codex";
 const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api";

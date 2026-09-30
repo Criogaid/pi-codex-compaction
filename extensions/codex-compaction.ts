@@ -10,13 +10,12 @@ import {
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { buildReplacementHistory } from "./retention.js";
 import {
   capableModel,
-  REPLACEMENT_TOKEN_BUDGET,
   type RemoteCompactionApi,
 } from "./capability.js";
 import {
-  buildReplacementHistory,
   type CodexCheckpointDetails,
   checkpointMarker,
   createCheckpointDetails,
@@ -182,9 +181,7 @@ async function compactRemotely(
       fetch,
     });
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
-    const replacementHistory = buildReplacementHistory(response.promptInput, response.item, {
-      tokenBudget: REPLACEMENT_TOKEN_BUDGET,
-    });
+    const replacementHistory = buildReplacementHistory(response.promptInput, response.item);
     const details = createCheckpointDetails({
       identity: response.identity,
       replacementHistory,

@@ -29,6 +29,12 @@ The extension observes Responses events with `onProviderStreamEvent`, which work
 
 Tests compare ordinary and compaction requests through the real Pi Responses adapters using simulated HTTP responses. Matching parameters do not guarantee a cache hit or a billing reduction; those depend on the backend and request prefix.
 
+### History retention
+
+[retention.ts](extensions/retention.ts) follows the metadata-free message path in [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs). It keeps the newest user message groups within `RETAINED_MESSAGE_TOKEN_BUDGET`, counts each text part using UTF-8 bytes, and truncates a boundary message by preserving its beginning and end. Empty and media-only messages cost at least one token. Attached image resize notices remain with their source messages.
+
+The opaque item is appended after retained messages and does not consume their text budget. Images and audio follow Codex's path without the optional image-budget feature. Pi does not expose Codex harness annotations, client-authored developer provenance, or Codex agent-message and hook-prompt types; those Codex-specific retention branches are outside this adapter's contract.
+
 ## 自定义 Provider
 
 自定义模型需要使用 `openai-responses` 或 `openai-codex-responses` API，并在 `~/.pi/agent/models.json` 中声明 capability：

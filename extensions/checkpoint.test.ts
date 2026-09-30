@@ -3,7 +3,6 @@ import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
-  buildReplacementHistory,
   createCheckpointDetails,
   fallbackSummary,
   latestCheckpoint,
@@ -62,14 +61,6 @@ test("persists and validates the complete provider endpoint identity", () => {
   assert.doesNotMatch(JSON.stringify(details), /authorization|apiKey|token/i);
 });
 
-test("builds bounded replacement history with the opaque item last", () => {
-  const history = buildReplacementHistory([rawUser("oldest"), rawUser("newest")], opaque, {
-    tokenBudget: 2,
-    byteBudget: 2048,
-  });
-  assert.equal(history.at(-1)?.type, "compaction");
-  assert.match(JSON.stringify(history), /newest/);
-});
 
 test("projects exact retained messages for resume and rejects corrupt state", () => {
   const kept = user("kept", 2);
