@@ -9,7 +9,7 @@ import {
   type ProjectedSessionEntry,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { type JsonObject, REMOTE_COMPACTION_PROTOCOL, validateCompactionItem } from "./protocol.js";
+import { isObject, type JsonObject, REMOTE_COMPACTION_PROTOCOL, validateCompactionItem } from "./protocol.js";
 import {
   CODEX_API,
   OPENAI_RESPONSES_API,
@@ -28,10 +28,6 @@ export interface CodexCheckpointDetails extends ProviderIdentity {
   replacementHistory: JsonObject[];
   keptMessageFingerprints: string[];
   createdAt: string;
-}
-
-function isObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function stableValue(value: unknown): unknown {

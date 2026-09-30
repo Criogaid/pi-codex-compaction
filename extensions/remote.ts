@@ -2,7 +2,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Context, Model, ProviderHeaders, ThinkingBudgets, Transport, Usage } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { capableModel, deriveEndpoint, normalizeUrl, sameIdentity, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
+import { capableModel, deriveEndpoint, normalizeUrl, sameIdentity, sameModel, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
@@ -82,11 +82,6 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     }
     const method = init?.method ?? (input instanceof Request ? input.method : "GET");
     if (method.toUpperCase() !== "POST") throw new CodexCompactionProtocolError("Remote compaction request must use POST");
-    const headers = new Headers(input instanceof Request ? input.headers : undefined);
-    new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
-    if (!(headers.get("x-codex-beta-features") ?? "").split(",").map((value) => value.trim()).includes(REMOTE_COMPACTION_FEATURE)) {
-      throw new CodexCompactionProtocolError("Provider omitted the Remote Compaction V2 feature header");
-    }
     if (actual === identity.endpoint) return baseFetch(input, init);
     // Endpoint overrides are same-origin HTTP routes; authentication remains assembled by Pi.
     return input instanceof Request
@@ -106,7 +101,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     transformHeaders: mergeRemoteCompactionHeader,
     fetch: routedFetch,
     onPayload: async (payload, preparedModel) => {
-      if (preparedModel.api !== request.model.api || preparedModel.provider !== request.model.provider || preparedModel.id !== request.model.id) {
+      if (!sameModel(configured.identity, preparedModel)) {
         throw new CodexCompactionProtocolError("Provider resolved an unexpected compaction model");
       }
       const resolved = capableModel(request.model, preparedModel.baseUrl);

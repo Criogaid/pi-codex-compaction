@@ -1,7 +1,7 @@
 // Own Codex V2 retention for Pi message items, including its enabled image-budget policy.
 // Reference: openai/codex rust-v0.159.2, compact_remote_v2.rs and compact_remote_v2_images.rs.
 import type { ImageEstimates } from "./image-budget.js";
-import { isInputImage, type JsonObject, validateCompactionItem } from "./protocol.js";
+import { isInputImage, type JsonObject } from "./protocol.js";
 import { approximateTokenCount, approximateTokensFromBytes, truncateTextToTokenBudget } from "./text-budget.js";
 
 export const RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
@@ -106,5 +106,6 @@ export function buildReplacementHistory({ groups, images }: RetentionInput, comp
       remaining = 0;
     } else if (hasImages) remaining = 0;
   }
-  return [...structuredClone(reversed.reverse()), validateCompactionItem(compactionItem)];
+  // The collector validated the item; checkpoint parsing validates it again on persistence.
+  return structuredClone([...reversed.reverse(), compactionItem]);
 }

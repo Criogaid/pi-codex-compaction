@@ -14,6 +14,7 @@ import { buildReplacementHistory } from "./retention.js";
 import {
   capableModel,
   sameIdentity,
+  sameModel,
   type CapableModel,
   type ProviderIdentity,
 } from "./capability.js";
@@ -53,7 +54,7 @@ async function compatibleIdentity(
   ctx: ExtensionContext,
   model = ctx.model,
 ): Promise<CapableModel | undefined> {
-  if (!model || model.provider !== details.provider || model.api !== details.api || model.id !== details.modelId) return undefined;
+  if (!model || !sameModel(details, model)) return undefined;
   // Resolve only endpoint identity here; Pi still owns authorization and request dispatch.
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) return undefined;
@@ -109,7 +110,7 @@ function projectedCurrentMessages(
   const session = buildSessionContext(event.branchEntries, leafId);
   const prior = latestCheckpoint(event.branchEntries)?.details;
   if (!prior) return { messages: session.messages };
-  if (prior.provider !== identity.provider || prior.api !== identity.api || prior.modelId !== identity.modelId) {
+  if (!sameModel(prior, { provider: identity.provider, api: identity.api, id: identity.modelId })) {
     throw new Error("The active opaque checkpoint belongs to a different provider identity");
   }
   const projected = projectCheckpointContext(session.messages, prior);

@@ -1,6 +1,7 @@
 // Own model eligibility and endpoint identity; authentication supplies the effective base URL.
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { hasApi } from "@earendil-works/pi-ai";
+import { isObject } from "./protocol.js";
 
 export const CODEX_API = "openai-codex-responses" as const;
 export const OPENAI_RESPONSES_API = "openai-responses" as const;
@@ -20,9 +21,6 @@ export interface CapableModel {
   readonly identity: ProviderIdentity;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 export function normalizeUrl(value: string): string {
   const url = new URL(value);
   if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("URL must use HTTP or HTTPS");
@@ -42,8 +40,8 @@ export function deriveEndpoint(baseUrl: string, api: RemoteCompactionApi): strin
 function configuredEndpoint(model: Model<RemoteCompactionApi>, baseUrl: string): string | undefined {
   // Pi preserves extension metadata but its built-in compatibility type does not declare it.
   const compat: unknown = model.compat;
-  const value = isRecord(compat) ? compat.remoteCompaction : undefined;
-  if (!isRecord(value) || value.protocol !== "v2" ||
+  const value = isObject(compat) ? compat.remoteCompaction : undefined;
+  if (!isObject(value) || value.protocol !== "v2" ||
       (value.endpoint !== undefined && typeof value.endpoint !== "string")) return undefined;
   try {
     const endpoint = typeof value.endpoint === "string"
@@ -72,7 +70,15 @@ export function capableModel(model: Model<Api> | undefined, effectiveBaseUrl?: s
   } : undefined;
 }
 
+/** Compare provider, API, and model before authentication resolves the endpoint. */
+export function sameModel(
+  left: Pick<ProviderIdentity, "provider" | "api" | "modelId">,
+  right: Pick<Model<Api>, "provider" | "api" | "id">,
+): boolean {
+  return left.provider === right.provider && left.api === right.api && left.modelId === right.id;
+}
+
 export function sameIdentity(left: ProviderIdentity, right: ProviderIdentity): boolean {
-  return left.provider === right.provider && left.api === right.api && left.modelId === right.modelId &&
+  return sameModel(left, { provider: right.provider, api: right.api, id: right.modelId }) &&
     left.baseUrl === right.baseUrl && left.endpoint === right.endpoint;
 }
