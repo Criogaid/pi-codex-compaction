@@ -94,6 +94,8 @@ Checkpoint identity uses the resolved endpoint. A changed authentication endpoin
 
 [checkpoint.ts](extensions/checkpoint.ts) 使用 Pi 的 `buildSessionProjection()` 生成保留消息指纹，应用消息编辑和隐藏规则，忽略旧压缩记录，并按 `context` 事件约定排除 system 消息。
 
+保留消息被其他扩展或编辑改变、导致指纹不再匹配时，检查点不会重放，扩展会在当前会话中提示一次。
+
 加载旧检查点时，扩展先按检查点创建时的分支验证旧算法生成的指纹，确认匹配后在内存中修正为标准投影的指纹。此过程不改写会话文件，也不改变 checkpoint 格式。原始记录缺失或旧指纹不匹配时不执行修正；检查点创建之后的消息编辑仍受重放校验约束。
 
 实现基于 `@narumitw/pi-codex-compact`，许可证与 attribution 见 [LICENSE](LICENSE)。

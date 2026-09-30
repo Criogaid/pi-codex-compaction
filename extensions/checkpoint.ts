@@ -40,8 +40,17 @@ function stableValue(value: unknown): unknown {
   );
 }
 
+// Session and context messages are replaced rather than mutated, so object identity keys both caches.
+const fingerprints = new WeakMap<AgentMessage, string>();
+const checkpoints = new WeakMap<SessionEntry, CodexCheckpointDetails | null>();
+
 export function fingerprintMessage(message: AgentMessage): string {
-  return createHash("sha256").update(JSON.stringify(stableValue(message))).digest("hex");
+  let fingerprint = fingerprints.get(message);
+  if (fingerprint === undefined) {
+    fingerprint = createHash("sha256").update(JSON.stringify(stableValue(message))).digest("hex");
+    fingerprints.set(message, fingerprint);
+  }
+  return fingerprint;
 }
 
 export function checkpointMarker(checkpointId: string): string {
@@ -162,10 +171,14 @@ export function latestCheckpoint(
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
     if (entry.type !== "compaction") continue;
-    const details = parseCheckpointDetails(entry.details);
-    return details
-      ? { entry: entry as CompactionEntry<CodexCheckpointDetails>, details: normalizeLegacyFingerprints(entries, entry, details) }
-      : undefined;
+    // A checkpoint's ancestors are immutable, so its normalized details are stable per entry.
+    let details = checkpoints.get(entry);
+    if (details === undefined) {
+      const parsed = parseCheckpointDetails(entry.details);
+      details = parsed ? normalizeLegacyFingerprints(entries, entry, parsed) : null;
+      checkpoints.set(entry, details);
+    }
+    return details ? { entry: entry as CompactionEntry<CodexCheckpointDetails>, details } : undefined;
   }
   return undefined;
 }

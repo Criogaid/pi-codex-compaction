@@ -16,14 +16,21 @@ export function truncateTextToTokenBudget(text: string, maxTokens: number): stri
   if (totalBytes <= budgetBytes) return text;
   const prefixBudgetBytes = Math.floor(budgetBytes / 2);
   const suffixStartBytes = totalBytes - (budgetBytes - prefixBudgetBytes);
+  // Track UTF-16 indices of the character boundaries so both ends are sliced once.
   let offsetBytes = 0;
-  let prefix = "";
-  let suffix = "";
+  let index = 0;
+  let prefixEnd = 0;
+  let suffixStart = text.length;
   for (const character of text) {
     const endBytes = offsetBytes + Buffer.byteLength(character, "utf8");
-    if (endBytes <= prefixBudgetBytes) prefix += character;
-    else if (offsetBytes >= suffixStartBytes) suffix += character;
+    if (endBytes <= prefixBudgetBytes) prefixEnd = index + character.length;
+    else if (offsetBytes >= suffixStartBytes) {
+      suffixStart = index;
+      break;
+    }
     offsetBytes = endBytes;
+    index += character.length;
   }
-  return `${prefix}…${approximateTokensFromBytes(totalBytes - budgetBytes)} tokens truncated…${suffix}`;
+  const marker = `…${approximateTokensFromBytes(totalBytes - budgetBytes)} tokens truncated…`;
+  return `${text.slice(0, prefixEnd)}${marker}${text.slice(suffixStart)}`;
 }

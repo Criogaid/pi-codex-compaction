@@ -139,6 +139,7 @@ async function compactRemotely(
   const sessionId = ctx.sessionManager.getSessionId();
   const reasoning = pi.getThinkingLevel();
   const settings = pi.getSettings();
+  let announced = false;
   ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction...");
   try {
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
@@ -161,6 +162,9 @@ async function compactRemotely(
       signal: event.signal,
       onPrepared: () => {
         if (!sessionStillOwned(ctx, sessionId, event.signal)) throw new Error("Compaction session ownership changed");
+        // Provider retries prepare the payload again; announce the compaction once.
+        if (announced) return;
+        announced = true;
         if (ctx.hasUI) ctx.ui.notify(
           `Starting Codex Remote Compaction V2 for ${supported.identity.provider}/${supported.identity.modelId}.`,
           "info",
@@ -248,7 +252,18 @@ export function createCodexCompactionExtension(
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !await compatibleIdentity(checkpoint.details, ctx)) return undefined;
       const messages = projectCheckpointContext(event.messages, checkpoint.details);
-      return messages ? { messages } : undefined;
+      if (messages) return { messages };
+      const key = `${ctx.sessionManager.getSessionId()}:${checkpoint.details.checkpointId}:projection`;
+      if (!warnings.has(key)) {
+        warnings.add(key);
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            "The active Codex checkpoint no longer matches the retained messages, so its opaque history is not replayed.",
+            "warning",
+          );
+        }
+      }
+      return undefined;
     });
 
     pi.on("before_provider_request", async (event, ctx) => {

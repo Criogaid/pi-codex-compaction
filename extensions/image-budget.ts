@@ -1,5 +1,6 @@
 // Own Codex image byte estimates and the adapter to Pi's image decoder.
 // Decode serially; cancellation is checked between decodes because Pi exposes no decode abort hook.
+import { createHash } from "node:crypto";
 import { resizeImage } from "@earendil-works/pi-coding-agent";
 import { isInputImage, type JsonObject } from "./protocol.js";
 import { approximateBytesForTokens } from "./text-budget.js";
@@ -7,6 +8,7 @@ import { approximateBytesForTokens } from "./text-budget.js";
 export const RESIZED_IMAGE_BYTES_ESTIMATE = 7_373;
 const ORIGINAL_IMAGE_PATCH_SIZE_PX = 32;
 const ORIGINAL_IMAGE_MAX_PATCHES = 10_000;
+const ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE = 32;
 const DIMENSION_PROBE_LIMIT = Number.MAX_SAFE_INTEGER;
 
 /** Byte estimates for input images; original-detail inline images are decoded ahead of lookup. */
@@ -32,6 +34,26 @@ async function inlineOriginalBytes(url: string): Promise<number | undefined> {
     Math.ceil(decoded.originalHeight / ORIGINAL_IMAGE_PATCH_SIZE_PX)));
 }
 
+// Like Codex, cache decode results, including failures, across requests in a SHA-1 keyed LRU.
+const originalEstimateCache = new Map<string, number | undefined>();
+
+async function cachedOriginalBytes(url: string): Promise<number | undefined> {
+  const key = createHash("sha1").update(url).digest("hex");
+  if (originalEstimateCache.has(key)) {
+    const cached = originalEstimateCache.get(key);
+    originalEstimateCache.delete(key);
+    originalEstimateCache.set(key, cached);
+    return cached;
+  }
+  const bytes = await inlineOriginalBytes(url);
+  originalEstimateCache.set(key, bytes);
+  if (originalEstimateCache.size > ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE) {
+    const oldest = originalEstimateCache.keys().next().value;
+    if (oldest !== undefined) originalEstimateCache.delete(oldest);
+  }
+  return bytes;
+}
+
 function contentParts(item: JsonObject): readonly unknown[] {
   if (Array.isArray(item.content)) return item.content;
   return (item.type === "function_call_output" || item.type === "custom_tool_call_output") &&
@@ -52,7 +74,7 @@ export async function estimateImages(input: readonly JsonObject[], signal: Abort
       if (!isInputImage(part)) continue;
       const url = originalInlineUrl(part);
       if (url === undefined || originals.has(url)) continue;
-      originals.set(url, await inlineOriginalBytes(url) ?? RESIZED_IMAGE_BYTES_ESTIMATE);
+      originals.set(url, await cachedOriginalBytes(url) ?? RESIZED_IMAGE_BYTES_ESTIMATE);
     }
   }
   signal.throwIfAborted();
