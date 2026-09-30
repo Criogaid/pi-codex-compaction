@@ -17,10 +17,13 @@ function isTextPart(part: unknown): part is TextPart {
     (part.type === "input_text" || part.type === "output_text") &&
     "text" in part && typeof part.text === "string";
 }
+function approximateTokenCount(text: string): number {
+  return Math.ceil(Buffer.byteLength(text, "utf8") / APPROX_BYTES_PER_TOKEN);
+}
 function textTokenCount(item: JsonObject): number {
   if (!Array.isArray(item.content)) return 0;
   return item.content.reduce((tokens: number, part: unknown) => tokens +
-    (isTextPart(part) ? Math.ceil(Buffer.byteLength(part.text, "utf8") / APPROX_BYTES_PER_TOKEN) : 0), 0);
+    (isTextPart(part) ? approximateTokenCount(part.text) : 0), 0);
 }
 function isResizeNotice(item: JsonObject): boolean {
   if (item.role !== "developer" || !Array.isArray(item.content) || item.content.length !== 1) return false;
@@ -57,7 +60,7 @@ function truncateMessage(item: JsonObject, maxTokens: number): JsonObject | unde
       continue;
     }
     if (remaining === 0) continue;
-    const tokenCount = Math.ceil(Buffer.byteLength(part.text, "utf8") / APPROX_BYTES_PER_TOKEN);
+    const tokenCount = approximateTokenCount(part.text);
     const text = tokenCount <= remaining ? part.text : truncateMiddle(part.text, remaining);
     remaining = Math.max(0, remaining - tokenCount);
     if (text) content.push({ ...part, text });

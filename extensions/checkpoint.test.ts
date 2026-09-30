@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ProviderIdentity } from "./capability.js";
 import {
   createCheckpointDetails,
   fallbackSummary,
   latestCheckpoint,
   parseCheckpointDetails,
   projectCheckpointContext,
-  type ProviderIdentity,
 } from "./checkpoint.js";
 
 const identity: ProviderIdentity = {

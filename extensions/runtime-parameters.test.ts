@@ -42,9 +42,6 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         compat: { supportsLongCacheRetention: true, supportsExplicitPromptCacheMode: true, ...{ remoteCompaction: { protocol: "v2" } } },
       };
-      const endpoint = api === "openai-responses"
-        ? "https://gateway.example/v1/responses"
-        : "https://gateway.example/v1/codex/responses";
       const modelRegistry = await testRegistry(provider, async () => ({ auth: { apiKey }, env: { PI_CACHE_RETENTION: "long" } }));
       let ordinaryPayload: unknown;
       let compactPayload: unknown;
@@ -63,7 +60,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         if (event.type === "error") throw new Error(event.error.errorMessage);
       }
       await requestRemoteCompaction({
-        modelRegistry, model, context, endpoint, reasoning, sessionId, transport: "sse",
+        modelRegistry, model, context, reasoning, sessionId, transport: "sse",
         signal: new AbortController().signal,
         fetch: async (input, init) => {
           const request = new Request(input, init);

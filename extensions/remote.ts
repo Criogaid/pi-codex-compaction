@@ -2,17 +2,18 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Context, Model, ProviderHeaders, Transport, Usage } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import type { ProviderIdentity } from "./checkpoint.js";
-import { capableModel, deriveEndpoint, normalizeUrl, REQUEST_TIMEOUT_MS, MAX_RETRIES, type RemoteCompactionApi } from "./capability.js";
+import { capableModel, deriveEndpoint, normalizeUrl, sameIdentity, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
 import { CodexCompactionProtocolError, createCompactionCollector, type JsonObject, prepareRemoteCompactionPayload } from "./protocol.js";
 
 const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
+const REQUEST_TIMEOUT_MS = 300_000;
+const MAX_RETRIES = 2;
+const MISSING_PAYLOAD_MESSAGE = "Provider did not expose a request payload";
 
 export interface RemoteCompactionRequest {
   modelRegistry: Pick<ModelRegistry, "streamSimple">;
   model: Model<RemoteCompactionApi>;
   context: Context;
-  endpoint: string;
   reasoning: ThinkingLevel;
   sessionId: string;
   transport?: Transport;
@@ -42,15 +43,16 @@ export function mergeRemoteCompactionHeader(headers: ProviderHeaders): ProviderH
 
 export async function requestRemoteCompaction(request: RemoteCompactionRequest): Promise<RemoteCompactionResponse> {
   request.signal.throwIfAborted();
-  const configuredEndpoint = normalizeUrl(request.endpoint);
-  const overridesEndpoint = configuredEndpoint !== deriveEndpoint(normalizeUrl(request.model.baseUrl), request.model.api);
+  const configured = capableModel(request.model);
+  if (!configured) throw new CodexCompactionProtocolError("Model is not configured for remote compaction");
+  const overridesEndpoint = configured.identity.endpoint !== deriveEndpoint(configured.identity.baseUrl, configured.identity.api);
   const collector = createCompactionCollector();
   let sentInput: JsonObject[] | undefined;
   let identity: ProviderIdentity | undefined;
   let usage: Usage | undefined;
   const baseFetch = request.fetch ?? globalThis.fetch;
   const routedFetch: typeof globalThis.fetch = async (input, init) => {
-    if (!identity) throw new CodexCompactionProtocolError("Provider did not expose a request payload");
+    if (!identity) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
     const actual = normalizeUrl(input instanceof Request ? input.url : String(input));
     const defaultEndpoint = deriveEndpoint(identity.baseUrl, identity.api);
     if (actual !== defaultEndpoint && actual !== identity.endpoint) {
@@ -84,9 +86,9 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       }
       const resolved = capableModel(request.model, preparedModel.baseUrl);
       if (!resolved) throw new CodexCompactionProtocolError("Resolved provider endpoint is incompatible with remote compaction");
-      identity = { provider: preparedModel.provider, api: request.model.api, modelId: preparedModel.id, baseUrl: resolved.baseUrl, endpoint: resolved.capability.endpoint };
+      identity = resolved.identity;
       const prior = request.priorCheckpoint?.identity;
-      if (prior && (prior.provider !== identity.provider || prior.api !== identity.api || prior.modelId !== identity.modelId || prior.baseUrl !== identity.baseUrl || prior.endpoint !== identity.endpoint)) {
+      if (prior && !sameIdentity(prior, identity)) {
         throw new CodexCompactionProtocolError("The active opaque checkpoint belongs to a different resolved provider identity");
       }
       const prepared = prepareRemoteCompactionPayload(payload, request.priorCheckpoint);
@@ -109,7 +111,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     if (event.type === "done") usage = event.message.usage;
   }
   request.signal.throwIfAborted();
-  if (!sentInput || !identity) throw new CodexCompactionProtocolError("Provider did not expose a request payload");
+  if (!sentInput || !identity) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
   if (!usage) throw new CodexCompactionProtocolError("Provider stream ended without a completed message");
   return { item: collector.finish(), promptInput: sentInput, identity, usage };
 }

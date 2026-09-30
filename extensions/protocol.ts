@@ -1,6 +1,7 @@
 // Own Responses V2 item validation and checkpoint payload transformations.
 export const MAX_PROVIDER_EVENT_BYTES = 8 * 1024 * 1024;
 export const MAX_COMPACTION_ITEM_BYTES = 2 * 1024 * 1024;
+export const REMOTE_COMPACTION_PROTOCOL = "remote-compaction-v2" as const;
 
 export type JsonObject = Record<string, unknown>;
 
@@ -15,13 +16,16 @@ function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isCompactionType(type: unknown): boolean {
+  return type === "compaction" || type === "compaction_summary";
+}
+
 export function validateCompactionItem(
   value: unknown,
-  maxBytes = MAX_COMPACTION_ITEM_BYTES,
 ): JsonObject {
   if (
     !isObject(value) ||
-    (value.type !== "compaction" && value.type !== "compaction_summary") ||
+    !isCompactionType(value.type) ||
     typeof value.encrypted_content !== "string" ||
     !value.encrypted_content
   ) {
@@ -29,7 +33,7 @@ export function validateCompactionItem(
       "Remote response did not contain a valid compaction item",
     );
   }
-  if (Buffer.byteLength(JSON.stringify(value), "utf8") > maxBytes) {
+  if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_COMPACTION_ITEM_BYTES) {
     throw new CodexCompactionProtocolError("Remote compaction item exceeded the size limit");
   }
   return structuredClone(value);
@@ -60,7 +64,7 @@ export function createCompactionCollector(): CompactionCollector {
         completed = false;
       }
       if (event.type === "response.output_item.done" && isObject(event.item) &&
-          (event.item.type === "compaction" || event.item.type === "compaction_summary")) {
+          isCompactionType(event.item.type)) {
         count += 1;
         item = validateCompactionItem(event.item);
       }

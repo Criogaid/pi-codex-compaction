@@ -1,5 +1,6 @@
+// Own Pi lifecycle integration, active-session ownership, and checkpoint replay hooks.
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, Context, Model, Tool } from "@earendil-works/pi-ai";
+import type { Context, Tool } from "@earendil-works/pi-ai";
 import {
   buildContextEntries,
   buildSessionContext,
@@ -13,7 +14,9 @@ import { Text } from "@earendil-works/pi-tui";
 import { buildReplacementHistory } from "./retention.js";
 import {
   capableModel,
-  type RemoteCompactionApi,
+  sameIdentity,
+  type CapableModel,
+  type ProviderIdentity,
 } from "./capability.js";
 import {
   type CodexCheckpointDetails,
@@ -22,10 +25,9 @@ import {
   fallbackSummary,
   latestCheckpoint,
   parseCheckpointDetails,
-  type ProviderIdentity,
   projectCheckpointContext,
 } from "./checkpoint.js";
-import { hasCheckpointMarker, rewriteCheckpointMarker } from "./protocol.js";
+import { hasCheckpointMarker, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
 
 const STATUS_KEY = "codex-compaction";
@@ -33,56 +35,26 @@ const COMPLETION_ENTRY_TYPE = "pi-codex-compaction-completed";
 
 interface CompletionEntryData {
   message: string;
-  protocol: "remote-compaction-v2";
+  protocol: typeof REMOTE_COMPACTION_PROTOCOL;
   checkpointId: string;
 }
 
-type SupportedModel = Model<RemoteCompactionApi>;
-
-interface SupportedIdentity {
-  model: SupportedModel;
-  identity: ProviderIdentity;
-}
-
-function supportedIdentity(model: Model<Api> | undefined, effectiveBaseUrl?: string): SupportedIdentity | undefined {
-  const supported = capableModel(model, effectiveBaseUrl);
-  if (!supported) return undefined;
-  return {
-    model: supported.model,
-    identity: {
-      provider: supported.model.provider,
-      api: supported.model.api,
-      modelId: supported.model.id,
-      baseUrl: supported.baseUrl,
-      endpoint: supported.capability.endpoint,
-    },
-  };
-}
 
 function activeCheckpoint(ctx: ExtensionContext) {
   return latestCheckpoint(ctx.sessionManager.getBranch());
 }
 
-function sameIdentity(left: ProviderIdentity, right: ProviderIdentity): boolean {
-  return (
-    left.provider === right.provider &&
-    left.api === right.api &&
-    left.modelId === right.modelId &&
-    left.baseUrl === right.baseUrl &&
-    left.endpoint === right.endpoint
-  );
-}
 
 async function compatibleIdentity(
   details: CodexCheckpointDetails,
   ctx: ExtensionContext,
   model = ctx.model,
-): Promise<SupportedIdentity | undefined> {
+): Promise<CapableModel | undefined> {
   if (!model || model.provider !== details.provider || model.api !== details.api || model.id !== details.modelId) return undefined;
   // Resolve only endpoint identity here; Pi still owns authorization and request dispatch.
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) return undefined;
-  const supported = supportedIdentity(model, auth.baseUrl);
+  const supported = capableModel(model, auth.baseUrl);
   return supported && sameIdentity(details, supported.identity) ? supported : undefined;
 }
 
@@ -142,7 +114,7 @@ async function compactRemotely(
   ctx: ExtensionContext,
   fetch?: typeof globalThis.fetch,
 ) {
-  const supported = supportedIdentity(ctx.model);
+  const supported = capableModel(ctx.model);
   if (!supported) return undefined;
   const sessionId = ctx.sessionManager.getSessionId();
   const reasoning = pi.getThinkingLevel();
@@ -159,7 +131,6 @@ async function compactRemotely(
       modelRegistry: ctx.modelRegistry,
       model: supported.model,
       context,
-      endpoint: supported.identity.endpoint,
       reasoning,
       sessionId,
       transport: pi.getSettings().transport,
@@ -239,7 +210,7 @@ export function createCodexCompactionExtension(
       if (!details) return;
       pi.appendEntry<CompletionEntryData>(COMPLETION_ENTRY_TYPE, {
         message: `Codex Remote Compaction V2 completed for ${details.provider}/${details.modelId}.`,
-        protocol: "remote-compaction-v2",
+        protocol: REMOTE_COMPACTION_PROTOCOL,
         checkpointId: details.checkpointId,
       });
     });

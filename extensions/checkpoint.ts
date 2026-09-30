@@ -2,31 +2,23 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { type JsonObject, validateCompactionItem } from "./protocol.js";
+import { type JsonObject, REMOTE_COMPACTION_PROTOCOL, validateCompactionItem } from "./protocol.js";
 import {
   CODEX_API,
   OPENAI_RESPONSES_API,
   normalizeUrl,
-  type RemoteCompactionApi,
+  type ProviderIdentity,
 } from "./capability.js";
 
 export const CHECKPOINT_KIND = "pi-codex-compaction";
 export const CHECKPOINT_VERSION = 1;
 export const REPLACEMENT_BYTE_BUDGET = 8 * 1024 * 1024;
 
-export interface ProviderIdentity {
-  provider: string;
-  api: RemoteCompactionApi;
-  modelId: string;
-  baseUrl: string;
-  endpoint: string;
-}
-
 export interface CodexCheckpointDetails extends ProviderIdentity {
   kind: typeof CHECKPOINT_KIND;
   version: typeof CHECKPOINT_VERSION;
   checkpointId: string;
-  protocol: "remote-compaction-v2";
+  protocol: typeof REMOTE_COMPACTION_PROTOCOL;
   replacementHistory: JsonObject[];
   keptMessageFingerprints: string[];
   createdAt: string;
@@ -92,7 +84,7 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
     !value.modelId ||
     typeof value.baseUrl !== "string" ||
     typeof value.endpoint !== "string" ||
-    value.protocol !== "remote-compaction-v2" ||
+    value.protocol !== REMOTE_COMPACTION_PROTOCOL ||
     !Array.isArray(value.replacementHistory) ||
     !Array.isArray(value.keptMessageFingerprints) ||
     typeof value.createdAt !== "string"
@@ -181,7 +173,7 @@ export function createCheckpointDetails(input: {
     version: CHECKPOINT_VERSION,
     checkpointId: input.checkpointId ?? randomUUID(),
     ...input.identity,
-    protocol: "remote-compaction-v2",
+    protocol: REMOTE_COMPACTION_PROTOCOL,
     replacementHistory: structuredClone(input.replacementHistory),
     keptMessageFingerprints: input.keptMessages.map(fingerprintMessage),
     createdAt: input.createdAt ?? new Date().toISOString(),

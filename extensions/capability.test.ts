@@ -34,9 +34,9 @@ test("enables the official OpenAI Codex endpoint without model metadata", () => 
       compat: undefined,
     }),
   );
-  assert.equal(supported?.capability.protocol, "v2");
+  assert.ok(supported);
   assert.equal(
-    supported?.capability.endpoint,
+    supported?.identity.endpoint,
     "https://chatgpt.com/backend-api/codex/responses",
   );
 });
@@ -49,9 +49,10 @@ test("derives an OpenAI Responses endpoint from models.json capability metadata"
     }),
   );
   assert.equal(supported?.model.api, "openai-responses");
-  assert.equal(supported?.baseUrl, "https://codex-gateway.example/v1");
-  assert.deepEqual(supported?.capability, {
-    protocol: "v2",
+  assert.equal(supported?.identity.baseUrl, "https://codex-gateway.example/v1");
+  assert.deepEqual(supported?.identity, {
+    provider: "custom-codex", api: "openai-responses", modelId: "gpt-example",
+    baseUrl: "https://codex-gateway.example/v1",
     endpoint: "https://codex-gateway.example/v1/responses",
   });
 });
@@ -88,7 +89,7 @@ test("derives the endpoint used by the Codex Responses API", () => {
 test("allows an explicit same-origin endpoint override", () => {
   const supported = capableModel(model({ compat: configuredCompat }));
   assert.equal(
-    supported?.capability.endpoint,
+    supported?.identity.endpoint,
     "https://codex-gateway.example/v1/responses",
   );
 
@@ -104,7 +105,7 @@ test("allows an explicit same-origin endpoint override", () => {
       },
     }),
   );
-  assert.equal(unversioned?.capability.endpoint, "https://codex-gateway.example/responses");
+  assert.equal(unversioned?.identity.endpoint, "https://codex-gateway.example/responses");
 });
 
 test("accepts capabilities inherited from providers or applied by modelOverrides", () => {

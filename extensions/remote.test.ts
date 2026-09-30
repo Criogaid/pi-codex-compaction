@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Model } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, type Model, type Provider } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { mergeRemoteCompactionHeader, requestRemoteCompaction } from "./remote.js";
 import { testRegistry } from "./test-registry.test.js";
@@ -22,7 +22,7 @@ function response() {
 }
 function request(modelRegistry: Awaited<ReturnType<typeof testRegistry>>) {
   return { modelRegistry, model, context: { messages: [{ role: "user" as const, content: "current", timestamp: 1 }] },
-    endpoint: `${model.baseUrl}/responses`, reasoning: "high" as const, sessionId: "session", transport: "sse" as const,
+    reasoning: "high" as const, sessionId: "session", transport: "sse" as const,
     signal: new AbortController().signal };
 }
 
@@ -59,7 +59,7 @@ test("Pi resolves model headers, auth headers, scoped env, and the actual endpoi
 test("routes an explicit same-origin HTTP endpoint without changing the provider model", async () => {
   const registry = await testRegistry(provider);
   const endpoint = "https://gateway.example/custom/responses";
-  await requestRemoteCompaction({ ...request(registry), endpoint,
+  await requestRemoteCompaction({ ...request(registry),
     model: { ...model, compat: { ...model.compat, ...{ remoteCompaction: { protocol: "v2", endpoint } } } },
     fetch: async (input, init) => {
       assert.equal(new Request(input, init).url, endpoint);
@@ -92,3 +92,74 @@ test("rejects a prior checkpoint when authentication changes the endpoint", asyn
   }), /different resolved provider identity/);
   assert.equal(sent, false);
 });
+
+test("accepts header-only auth and raw WebSocket events without requiring an HTTP body", async () => {
+  const websocketModel = { ...model, api: "openai-codex-responses" as const };
+  const eventProvider: Provider = {
+    ...provider, getModels: () => [websocketModel],
+    streamSimple(preparedModel, _context, options) {
+      const stream = createAssistantMessageEventStream();
+      const message: AssistantMessage = {
+        role: "assistant", content: [], api: preparedModel.api, provider: preparedModel.provider, model: preparedModel.id,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "stop", timestamp: 1,
+      };
+      void (async () => {
+        try {
+          assert.equal(options?.apiKey, undefined);
+          assert.equal(options?.headers?.cookie, "fixture-cookie");
+          assert.equal(options?.transport, "websocket");
+          await options?.onPayload?.({ model: preparedModel.id, input: [] }, preparedModel);
+          const item = { type: "compaction", encrypted_content: "websocket-opaque" };
+          await options?.onProviderStreamEvent?.({ type: "response.output_item.done", item }, preparedModel);
+          await options?.onProviderStreamEvent?.({ type: "response.completed" }, preparedModel);
+          stream.push({ type: "done", reason: "stop", message });
+          stream.end(message);
+        } catch (error) {
+          const failed: AssistantMessage = { ...message, stopReason: "error", errorMessage: String(error) };
+          stream.push({ type: "error", reason: "error", error: failed });
+          stream.end(failed);
+        }
+      })();
+      return stream;
+    },
+  };
+  const registry = await testRegistry(eventProvider, async () => ({ auth: { headers: { cookie: "fixture-cookie" } } }));
+  const result = await requestRemoteCompaction({ ...request(registry), model: websocketModel, transport: "websocket",
+    fetch: async () => { assert.fail("WebSocket provider must not require an HTTP request"); },
+  });
+  assert.equal(result.item.encrypted_content, "websocket-opaque");
+});
+
+for (const fault of ["endpoint", "method", "feature-header", "model"] as const) {
+  test(`rejects provider ${fault} substitution before sending a request`, async () => {
+    const faultyProvider: Provider<"openai-responses"> = {
+      ...provider,
+      streamSimple(preparedModel, transcript, options) {
+        assert.ok(options?.fetch);
+        const routedFetch = options.fetch;
+        return provider.streamSimple(preparedModel, transcript, {
+          ...options,
+          onPayload: (payload, currentModel) => options.onPayload?.(
+            fault === "model" && typeof payload === "object" && payload !== null
+              ? { ...payload, model: "other-model" } : payload, currentModel,
+          ),
+          fetch: (input, init) => {
+            const outgoing = new Request(input, init);
+            const headers = new Headers(outgoing.headers);
+            if (fault === "feature-header") headers.delete("x-codex-beta-features");
+            return routedFetch(fault === "endpoint" ? "https://other.example/responses" : input, {
+              ...init, headers, method: fault === "method" ? "GET" : outgoing.method,
+            });
+          },
+        });
+      },
+    };
+    const registry = await testRegistry(faultyProvider);
+    let sent = false;
+    await assert.rejects(requestRemoteCompaction({ ...request(registry),
+      fetch: async () => { sent = true; return response(); },
+    }));
+    assert.equal(sent, false);
+  });
+}
