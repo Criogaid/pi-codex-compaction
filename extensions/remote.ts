@@ -5,6 +5,7 @@ import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { capableModel, deriveEndpoint, normalizeUrl, sameIdentity, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
+import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
 import { CodexCompactionProtocolError, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload } from "./protocol.js";
 
 const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
@@ -25,6 +26,8 @@ export interface RemoteCompactionRequest {
   maxRetryDelayMs?: number;
   websocketConnectTimeoutMs?: number;
   signal: AbortSignal;
+  /** Pi origins of the context's user messages, used to align provider user items with Pi roles. */
+  userItemOrigins?: readonly UserItemOrigin[];
   priorCheckpoint?: { identity: ProviderIdentity; marker: string; replacementHistory: readonly JsonObject[] };
   onPrepared?: () => void;
   fetch?: typeof globalThis.fetch;
@@ -36,6 +39,8 @@ export interface RemoteCompactionResponse {
   identity: ProviderIdentity;
   usage: Usage;
   images: ImageEstimates;
+  /** Whether each promptInput item came from Pi context that Codex would not retain. */
+  contextual: boolean[];
 }
 
 export function mergeRemoteCompactionHeader(headers: ProviderHeaders): ProviderHeaders {
@@ -66,6 +71,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   let identity: ProviderIdentity | undefined;
   let usage: Usage | undefined;
   let images: ImageEstimates | undefined;
+  let contextual: boolean[] | undefined;
   const baseFetch = request.fetch ?? globalThis.fetch;
   const routedFetch: typeof globalThis.fetch = async (input, init) => {
     if (!identity) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
@@ -110,6 +116,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       if (prior && !sameIdentity(prior, identity)) {
         throw new CodexCompactionProtocolError("The active opaque checkpoint belongs to a different resolved provider identity");
       }
+      const contextItems = contextUserItems(isObject(payload) ? payload.input : undefined, request.userItemOrigins);
       const payloadItems = isObject(payload) && Array.isArray(payload.input) ? payload.input.filter(isObject) : [];
       const estimates = await estimateImages([...payloadItems, ...request.priorCheckpoint?.replacementHistory ?? []], request.signal);
       const prepared = prepareRemoteCompactionPayload(payload, request.priorCheckpoint, (history) => ({
@@ -117,7 +124,9 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
         input: trimToolOutputsToContextWindow(objectItems(history.input), history.instructions, request.model.contextWindow, estimates),
       }));
       if (prepared.model !== request.model.id) throw new CodexCompactionProtocolError("Provider payload used an unexpected model");
-      sentInput = structuredClone(objectItems(prepared.input).slice(0, -1));
+      const sent = objectItems(prepared.input).slice(0, -1);
+      contextual = sent.map((item) => contextItems.has(item));
+      sentInput = structuredClone(sent);
       images = estimates;
       request.onPrepared?.();
       return prepared;
@@ -133,7 +142,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     if (event.type === "done") usage = event.message.usage;
   }
   request.signal.throwIfAborted();
-  if (!sentInput || !identity || !images) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
+  if (!sentInput || !identity || !images || !contextual) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
   if (!usage) throw new CodexCompactionProtocolError("Provider stream ended without a completed message");
-  return { item: collector.finish(), promptInput: sentInput, identity, usage, images };
+  return { item: collector.finish(), promptInput: sentInput, identity, usage, images, contextual };
 }

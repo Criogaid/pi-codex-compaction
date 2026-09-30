@@ -35,6 +35,8 @@ Tests compare ordinary and compaction requests through the real Pi Responses ada
 
 [retention-input.ts](extensions/retention-input.ts) 按 [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs) 的默认规则筛选普通 Responses 消息：排除环境、技能、内部上下文及旧版提示片段，识别可见 hook 提示，并把图片缩放通知与来源消息一起处理。Hook XML 使用固定版本的 `saxes` 解析，边界用例与官方 `quick-xml` 实际运行结果对照。
 
+Pi 会把 `!cmd` 的执行结果、扩展消息和展开后的技能都作为 user 消息发送，而 Codex 将对应内容作为独立的上下文消息处理。扩展按 Pi 消息来源对齐这些 user 条目：`bashExecution` 与隐藏的扩展消息（`display: false`）视为上下文不保留，显示的扩展消息与 Codex 的可见 hook 提示一致予以保留；技能块只保留用户在技能之后输入的文字。来源序列与 Provider 实际发送的 user 条目数量不一致时，退回纯文本分类。
+
 [retention.ts](extensions/retention.ts) 从最新消息开始，按 `RETAINED_MESSAGE_TOKEN_BUDGET` 保留消息组。[text-budget.ts](extensions/text-budget.ts) 按 UTF-8 字节估算 token，截断时保留文本首尾；[image-budget.ts](extensions/image-budget.ts) 实现官方默认启用的图片预算，原始图片尺寸通过 Pi 解码器读取。边界图片与标签整体保留；图片放不下时，不回填更旧的消息。
 
 发送压缩请求前，[context-window.ts](extensions/context-window.ts) 按官方 `trim_function_call_history_to_fit_context_window` 估算整份历史：超过模型 `contextWindow` 的 95% 时，从末尾起把连续的工具输出替换为固定截断提示，遇到非工具输出即停止。溢出恢复触发的压缩因此不必先超出上下文窗口。

@@ -1,8 +1,11 @@
 // Adapt Responses messages to Codex rust-v0.159.2's metadata-free retained groups.
 // Context markers mirror core/src/context; XML is parsed at this boundary, not by the budget core.
+// Pi message origins stand in for Codex's separate contextual messages where Pi merges them into user items.
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { convertToLlm, parseSkillBlock } from "@earendil-works/pi-coding-agent";
 import { SaxesParser } from "saxes";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
-import type { JsonObject } from "./protocol.js";
+import { isObject, type JsonObject } from "./protocol.js";
 import type { RetentionInput, HistoryGroup } from "./retention.js";
 
 const CONTEXT_MARKERS: readonly (readonly [string, string])[] = [
@@ -113,14 +116,57 @@ export function historyGroups(input: readonly JsonObject[]): HistoryGroup[] {
   return groups;
 }
 
+/** Pi sends user shell commands and hidden extension messages as user items; Codex treats them as context. */
+export type UserItemOrigin = "user" | "context";
+
+function origin(message: AgentMessage): UserItemOrigin {
+  return message.role === "bashExecution" || (message.role === "custom" && !message.display) ? "context" : "user";
+}
+
+/** Origins of the provider's user items, in order; Pi's Responses adapter skips empty content arrays. */
+export function userItemOrigins(messages: readonly AgentMessage[]): UserItemOrigin[] {
+  return messages.flatMap((message) => convertToLlm([message])
+    .filter((llm) => llm.role === "user" && (typeof llm.content === "string" || llm.content.length > 0))
+    .map(() => origin(message)));
+}
+
+function isUserItem(item: JsonObject): boolean {
+  return (item.type === undefined || item.type === "message") && item.role === "user";
+}
+
+/** Match provider user items to Pi origins; a changed user sequence falls back to text classification. */
+export function contextUserItems(input: unknown, origins: readonly UserItemOrigin[] | undefined): ReadonlySet<JsonObject> {
+  const users = Array.isArray(input) ? input.filter(isObject).filter(isUserItem) : [];
+  if (!origins || users.length !== origins.length) return new Set();
+  return new Set(users.filter((_, index) => origins[index] === "context"));
+}
+
+// Pi prepends an expanded skill to the user's text; Codex keeps the skill as a separate contextual message.
+function withoutSkillBlocks(item: JsonObject): JsonObject | undefined {
+  if (!Array.isArray(item.content)) return item;
+  let changed = false;
+  const content = item.content.flatMap((part: unknown) => {
+    if (!isObject(part) || part.type !== "input_text" || typeof part.text !== "string") return [part];
+    const skill = parseSkillBlock(part.text);
+    if (!skill) return [part];
+    changed = true;
+    return skill.userMessage ? [{ ...part, text: skill.userMessage }] : [];
+  });
+  if (!changed) return item;
+  return content.length ? { ...item, content } : undefined;
+}
+
 export async function prepareRetention(
   input: readonly JsonObject[],
   signal: AbortSignal,
-  images?: ImageEstimates,
+  options: { images?: ImageEstimates; contextual?: readonly boolean[] } = {},
 ): Promise<RetentionInput> {
-  const groups = historyGroups(input).filter((group) => {
+  const contextual = new Set(input.filter((_, index) => options.contextual?.[index]));
+  const groups = historyGroups(input).flatMap((group) => {
     signal.throwIfAborted();
-    return isUserMessage(group.source);
+    if (contextual.has(group.source) || !isUserMessage(group.source)) return [];
+    const source = withoutSkillBlocks(group.source);
+    return source ? [{ ...group, source }] : [];
   });
-  return { groups, images: images ?? await estimateImages(groups.map((group) => group.source), signal) };
+  return { groups, images: options.images ?? await estimateImages(groups.map((group) => group.source), signal) };
 }

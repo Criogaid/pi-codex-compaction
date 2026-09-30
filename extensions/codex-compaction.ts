@@ -1,5 +1,5 @@
 // Own Pi lifecycle integration, active-session ownership, and checkpoint replay hooks.
-import { prepareRetention } from "./retention-input.js";
+import { prepareRetention, userItemOrigins } from "./retention-input.js";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Context, Message, Tool } from "@earendil-works/pi-ai";
 import {
@@ -149,6 +149,7 @@ async function compactRemotely(
       modelRegistry: ctx.modelRegistry,
       model: supported.model,
       context: requestContext(pi, ctx, current.messages, settings),
+      userItemOrigins: userItemOrigins(current.messages),
       reasoning,
       sessionId,
       transport: settings.transport,
@@ -174,7 +175,10 @@ async function compactRemotely(
       fetch,
     });
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
-    const retention = await prepareRetention(response.promptInput, event.signal, response.images);
+    const retention = await prepareRetention(response.promptInput, event.signal, {
+      images: response.images,
+      contextual: response.contextual,
+    });
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
     const replacementHistory = buildReplacementHistory(retention, response.item);
     const details = createCheckpointDetails({
