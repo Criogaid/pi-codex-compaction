@@ -347,7 +347,7 @@ test("creates and resumes a checkpoint for a configured custom provider", async 
   assert.deepEqual(result.compaction.usage, usage);
   assert.doesNotMatch(JSON.stringify(details), /secret/);
   assert.equal(current.statuses.get("codex-compaction"), undefined);
-  assert.deepEqual(current.notifications, [
+  assert.deepEqual(current.notifications.filter((notice) => notice.message.startsWith("Starting Codex Remote Compaction V2")), [
     {
       message: "Starting Codex Remote Compaction V2 for custom-codex/gpt-5.6.",
       level: "info",
@@ -700,9 +700,9 @@ test("announces once when a provider prepares multiple retry payloads and again 
   const compact = mock.events.get("session_before_compact")?.[0];
   assert.ok(compact);
   assert.ok(await compact(compactEvent(), current.ctx));
-  assert.equal(current.notifications.filter((notice) => notice.level === "info").length, 1);
+  assert.equal(current.notifications.filter((notice) => notice.message.startsWith("Starting Codex Remote Compaction V2")).length, 1);
   assert.ok(await compact(compactEvent(), current.ctx));
-  assert.equal(current.notifications.filter((notice) => notice.level === "info").length, 2);
+  assert.equal(current.notifications.filter((notice) => notice.message.startsWith("Starting Codex Remote Compaction V2")).length, 2);
   assert.deepEqual(current.notifications.filter((notice) => notice.level === "warning"), []);
 });
 
@@ -785,7 +785,7 @@ test("keeps projection failures silent without a UI or a compatible model identi
   const details = createCheckpointDetails({ identity: { ...capability, modelId: model.id },
     replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }], keptMessages: [message] });
   session.appendCompaction(fallbackSummary(details.checkpointId), firstKept, 100, details);
-  for (const overrides of [{ hasUI: false }, { model: { ...model, provider: "other" } }, { model: { ...model, id: "other" } }]) {
+  for (const overrides of [{ hasUI: false }, { model: { ...model, provider: "other" } }, { model: { ...model, api: "openai-completions" } }]) {
     const mock = mockPi();
     createCodexCompactionExtension()(mock.pi);
     const current = await context({ sessionManager: session, ...overrides });

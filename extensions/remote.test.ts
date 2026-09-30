@@ -94,7 +94,7 @@ test("rejects a prior checkpoint when authentication changes the endpoint", asyn
   await assert.rejects(requestRemoteCompaction({ ...request(registry),
     priorCheckpoint: { identity: { provider: model.provider, api: model.api, modelId: model.id, baseUrl: model.baseUrl, endpoint: `${model.baseUrl}/responses` }, marker: "checkpoint marker", replacementHistory: [{ type: "compaction", encrypted_content: "prior" }] },
     fetch: async () => { sent = true; return response(); },
-  }), /different resolved provider identity/);
+  }), /different resolved provider backend/);
   assert.equal(sent, false);
 });
 

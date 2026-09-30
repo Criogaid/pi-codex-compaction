@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { capableModel, deriveEndpoint, normalizeUrl, sameIdentity, sameModel } from "./capability.js";
+import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel } from "./capability.js";
 
 function model(overrides: Record<string, unknown> = {}): Model<Api> {
   return {
@@ -167,7 +167,10 @@ test("compares provider, API and model ID independently of endpoint identity", (
   assert.equal(sameModel(identity, { ...prepared, provider: "other" }), false);
   assert.equal(sameModel(identity, { ...prepared, api: "openai-codex-responses" }), false);
   assert.equal(sameModel(identity, { ...prepared, id: "other" }), false);
-  assert.equal(sameIdentity(identity, { ...identity }), true);
-  assert.equal(sameIdentity(identity, { ...identity, baseUrl: prepared.baseUrl }), false);
-  assert.equal(sameIdentity(identity, { ...identity, endpoint: "https://configured.example/other" }), false);
+  assert.equal(sameBackend(identity, { ...identity }), true);
+  assert.equal(sameBackend(identity, { ...identity, modelId: "other" }), true);
+  assert.equal(sameBackend(identity, { ...identity, provider: "other" }), false);
+  assert.equal(sameBackend(identity, { ...identity, api: "openai-codex-responses" }), false);
+  assert.equal(sameBackend(identity, { ...identity, baseUrl: prepared.baseUrl }), false);
+  assert.equal(sameBackend(identity, { ...identity, endpoint: "https://configured.example/other" }), false);
 });
