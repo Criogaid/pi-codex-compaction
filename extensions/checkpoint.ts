@@ -2,6 +2,7 @@
 // Normalize legacy fingerprints from their creation-time branch without rewriting session entries.
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { getCurrentSystemMessage, type Message } from "@earendil-works/pi-ai";
 import {
   buildSessionProjection,
   sessionEntryToContextMessages,
@@ -209,6 +210,19 @@ export function projectCheckpointContext(
   ];
 }
 
+/**
+ * Project a full transcript the way Pi sends a request whose context handler changed messages:
+ * handlers see only non-system messages, and Pi collapses the system messages into one head.
+ */
+export function projectCheckpointRequest(
+  messages: readonly AgentMessage[],
+  details: CodexCheckpointDetails,
+): AgentMessage[] | undefined {
+  const projected = projectCheckpointContext(messages.filter((message) => message.role !== "system"), details);
+  if (!projected) return undefined;
+  const head = getCurrentSystemMessage(messages.filter((message): message is Message => message.role === "system"));
+  return head ? [head, ...projected] : projected;
+}
 
 export function createCheckpointDetails(input: {
   identity: ProviderIdentity;
