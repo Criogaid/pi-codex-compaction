@@ -4,16 +4,18 @@ import { isInputImage, type JsonObject, validateCompactionItem } from "./protoco
 import { approximateTokenCount, truncateTextToTokenBudget } from "./text-budget.js";
 
 export const RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
-const IMAGE_RESIZE_NOTICE_OPEN = "<image_resize_notice>";
-const IMAGE_RESIZE_NOTICE_CLOSE = "</image_resize_notice>";
 const IMAGE_OPEN_TAG = "<image>";
 const IMAGE_CLOSE_TAG = "</image>";
 const LOCAL_IMAGE_OPEN_PREFIX = "<image name=";
 
 type TextPart = JsonObject & { type: "input_text" | "output_text"; text: string };
-interface HistoryGroup {
+export interface HistoryGroup {
   readonly source: JsonObject;
   readonly notice?: JsonObject;
+}
+export interface RetentionInput {
+  readonly groups: readonly HistoryGroup[];
+  readonly images: ReadonlyMap<JsonObject, number>;
 }
 function isTextPart(part: unknown): part is TextPart {
   return typeof part === "object" && part !== null && "type" in part &&
@@ -26,15 +28,6 @@ function isTag(part: unknown, tag: string): boolean {
 function isImageOpenTag(part: unknown): boolean {
   return isTag(part, IMAGE_OPEN_TAG) || (isTextPart(part) && part.type === "input_text" &&
     part.text.startsWith(LOCAL_IMAGE_OPEN_PREFIX) && part.text.endsWith(">"));
-}
-function isResizeNotice(item: JsonObject): boolean {
-  if (item.role !== "developer" || !Array.isArray(item.content) || item.content.length !== 1) return false;
-  const part: unknown = item.content[0];
-  if (!isTextPart(part) || part.type !== "input_text") return false;
-  const text = part.text.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
-  const asciiLower = (value: string) => value.replace(/[A-Z]/g, (character) => character.toLowerCase());
-  return asciiLower(text.slice(0, IMAGE_RESIZE_NOTICE_OPEN.length)) === IMAGE_RESIZE_NOTICE_OPEN &&
-    asciiLower(text.slice(-IMAGE_RESIZE_NOTICE_CLOSE.length)) === IMAGE_RESIZE_NOTICE_CLOSE;
 }
 function partTokenCount(part: unknown, images: ReadonlyMap<JsonObject, number>): number {
   if (isTextPart(part)) return approximateTokenCount(part.text);
@@ -92,14 +85,7 @@ function truncateImageMessage(item: JsonObject, maxTokens: number, images: Reado
 }
 
 /** Keep newest user groups within Codex's fixed budget, preserving image/label groups atomically. */
-export function buildReplacementHistory(input: readonly JsonObject[], compactionItem: JsonObject, images: ReadonlyMap<JsonObject, number>): JsonObject[] {
-  const groups: HistoryGroup[] = [];
-  for (let index = 0; index < input.length; index++) {
-    const source = input[index];
-    const next = input[index + 1];
-    const notice = next && isResizeNotice(next) ? input[++index] : undefined;
-    if ((source.type === undefined || source.type === "message") && source.role === "user") groups.push({ source, notice });
-  }
+export function buildReplacementHistory({ groups, images }: RetentionInput, compactionItem: JsonObject): JsonObject[] {
   let remaining = RETAINED_MESSAGE_TOKEN_BUDGET;
   const reversed: JsonObject[] = [];
   for (let index = groups.length - 1; index >= 0 && remaining > 0; index--) {

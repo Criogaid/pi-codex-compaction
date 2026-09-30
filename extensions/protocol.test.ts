@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendCompactionTrigger, createCompactionCollector, MAX_COMPACTION_ITEM_BYTES, prepareRemoteCompactionPayload, rewriteCheckpointMarker } from "./protocol.js";
+import { appendCompactionTrigger, createCompactionCollector, prepareRemoteCompactionPayload, rewriteCheckpointMarker } from "./protocol.js";
 
 const item = { type: "compaction", encrypted_content: "opaque" };
 const done = { type: "response.output_item.done", item };
@@ -40,9 +40,13 @@ test("accepts the upstream compaction_summary alias and resets on a retried resp
   assert.deepEqual(collector.finish(), item);
 });
 
-test("bounds opaque output before persistence", () => {
+test("accepts opaque output and event volume above the former plugin-only byte ceilings", () => {
   const collector = createCompactionCollector();
-  assert.throws(() => collector.observe({ ...done, item: { ...item, encrypted_content: "x".repeat(MAX_COMPACTION_ITEM_BYTES) } }), /size limit/);
+  const large = { ...item, encrypted_content: "x".repeat(3 * 1024 * 1024) };
+  collector.observe({ type: "response.output_item.added", item: large });
+  collector.observe({ type: "response.output_item.done", item: large });
+  collector.observe({ type: "response.completed", response: { output: [large] } });
+  assert.deepEqual(collector.finish(), large);
 });
 
 test("replays one marker and appends one final trigger", () => {

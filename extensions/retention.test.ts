@@ -2,11 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildReplacementHistory, RETAINED_MESSAGE_TOKEN_BUDGET } from "./retention.js";
 import type { JsonObject } from "./protocol.js";
-import { imageTokenCounts } from "./image-budget.js";
+import { prepareRetention } from "./retention-input.js";
 
 async function retain(input: readonly JsonObject[]) {
-  const images = await imageTokenCounts(input, new AbortController().signal);
-  return buildReplacementHistory(input, opaque, images);
+  return buildReplacementHistory(await prepareRetention(input, new AbortController().signal), opaque);
 }
 
 const opaque = { type: "compaction", encrypted_content: "opaque" };
@@ -117,4 +116,60 @@ test("recognizes resize notices with the upstream ASCII case-insensitive markers
   const notice = { role: "developer", content: [{ type: "input_text", text: "\n<IMAGE_RESIZE_NOTICE>x</IMAGE_RESIZE_NOTICE>\n" }] };
   const source = user("source");
   assert.deepEqual(await retain([source, notice]), [source, notice, opaque]);
+});
+
+test("excludes official contextual user fragments and their attached resize notices", async () => {
+  const hidden = [
+    "# AGENTS.md instructions for /project\n<INSTRUCTIONS>rules</INSTRUCTIONS>",
+    "<ENVIRONMENT_CONTEXT>state</ENVIRONMENT_CONTEXT>",
+    "<agent_message_board_notification>x</agent_message_board_notification>",
+    "<skill>instructions</skill>", "<user_shell_command>ls</user_shell_command>",
+    "<turn_aborted>stopped</turn_aborted>", "<subagent_notification>x</subagent_notification>",
+    "<recommended_plugins>x</recommended_plugins>", "<external_test>data</external_test>",
+    '<codex_internal_context source="goal_1">steering</codex_internal_context>',
+    "<goal_context>legacy</goal_context>",
+    "Warning: apply_patch was requested via bash. Use the apply_patch tool instead of exec_command.",
+    "Warning: The maximum number of unified exec processes you can keep open is 64",
+    "Warning: Your account was flagged for potentially high-risk cyber activity.",
+  ];
+  const notice = { role: "developer", content: [{ type: "input_text", text: "<image_resize_notice>x</image_resize_notice>" }] };
+  for (const text of hidden) {
+    const message = user(`\u0085 ${text}\u0085`);
+    assert.deepEqual(await retain([user("request"), message, notice]), [user("request"), opaque], text);
+    assert.deepEqual(await retain([{ ...message, content: [...content(message), { type: "input_text", text: "ordinary" }] }]), [opaque], text);
+  }
+});
+
+test("keeps ordinary lookalikes and matches the upstream marker case rules", async () => {
+  for (const text of ["<skill>not closed", "<EXTERNAL_test>x</EXTERNAL_test>",
+    '<codex_internal_context source="INVALID">x</codex_internal_context>',
+    "\uFEFF<skill>x</skill>", "<user_instructions>request</user_instructions>"]) {
+    assert.deepEqual(await retain([user(text)]), [user(text), opaque]);
+  }
+});
+
+test("matches hook XML results checked against the actual upstream quick-xml parser", async () => {
+  const context = { type: "input_text", text: "<skill>instructions</skill>" };
+  const fixtures: readonly (readonly [string, boolean])[] = [
+    ['<hook_prompt hook_run_id="r">text</hook_prompt>', true],
+    ['<other hook_run_id="r">text</other>', true],
+    ['<hook_prompt hook_run_id="r"/>', false],
+    ['<hook_prompt hook_run_id="r"> </hook_prompt>', false],
+    ['<hook_prompt hook_run_id="r"><![CDATA[x]]></hook_prompt>', true],
+    ['<hook_prompt hook_run_id="r"><child>x</child></hook_prompt>', false],
+    ['<hook_prompt hook_run_id="r">a<child>x</child>b</hook_prompt>', false],
+    ['<hook_prompt hook_run_id="r">a<!-- comment -->b</hook_prompt>', true],
+    ['<hook_prompt hook_run_id="r">a</hook_prompt><other/>', true],
+    ['<hook_prompt hook_run_id=" ">a</hook_prompt>', false],
+    ['<hook_prompt hook_run_id="r">&amp;</hook_prompt>', true],
+    ['<hook_prompt hook_run_id="r">a</broken>', false],
+    ['<hook_prompt hook_run_id="r">a', false],
+  ];
+  for (const [text, visible] of fixtures) {
+    const message = { role: "user", content: [context, { type: "input_text", text }] };
+    assert.deepEqual(await retain([message]), visible ? [message, opaque] : [opaque], text);
+  }
+  const hook = { type: "input_text", text: fixtures[0][0] };
+  assert.deepEqual(await retain([{ role: "user", content: [hook, { type: "input_text", text: "ordinary" }] }]), [opaque]);
+  assert.deepEqual(await retain([{ role: "user", content: [hook, { type: "input_image", file_id: "image" }] }]), [opaque]);
 });

@@ -1,6 +1,4 @@
 // Own Responses V2 item validation and checkpoint payload transformations.
-export const MAX_PROVIDER_EVENT_BYTES = 8 * 1024 * 1024;
-export const MAX_COMPACTION_ITEM_BYTES = 2 * 1024 * 1024;
 export const REMOTE_COMPACTION_PROTOCOL = "remote-compaction-v2" as const;
 
 export type JsonObject = Record<string, unknown>;
@@ -37,9 +35,6 @@ export function validateCompactionItem(
       "Remote response did not contain a valid compaction item",
     );
   }
-  if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_COMPACTION_ITEM_BYTES) {
-    throw new CodexCompactionProtocolError("Remote compaction item exceeded the size limit");
-  }
   return { ...structuredClone(value), type: "compaction" };
 }
 
@@ -50,17 +45,12 @@ export interface CompactionCollector {
 
 /** Count output-item completion events, as Codex does; response.output is not another source. */
 export function createCompactionCollector(): CompactionCollector {
-  let bytes = 0;
   let count = 0;
   let item: JsonObject | undefined;
   let completed = false;
   return {
     observe(event) {
       if (!isObject(event)) return;
-      bytes += Buffer.byteLength(JSON.stringify(event), "utf8");
-      if (bytes > MAX_PROVIDER_EVENT_BYTES) {
-        throw new CodexCompactionProtocolError("Remote compaction stream exceeded the size limit");
-      }
       // A provider may restart its response when falling back from WebSocket to HTTP.
       if (event.type === "response.created") {
         count = 0;

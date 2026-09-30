@@ -12,7 +12,6 @@ import {
 
 export const CHECKPOINT_KIND = "pi-codex-compaction";
 export const CHECKPOINT_VERSION = 1;
-export const REPLACEMENT_BYTE_BUDGET = 8 * 1024 * 1024;
 
 export interface CodexCheckpointDetails extends ProviderIdentity {
   kind: typeof CHECKPOINT_KIND;
@@ -36,10 +35,6 @@ function stableValue(value: unknown): unknown {
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([key, child]) => [key, stableValue(child)]),
   );
-}
-
-function serializedBytes(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
 export function fingerprintMessage(message: AgentMessage): string {
@@ -107,8 +102,7 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
     !value.replacementHistory.every(isObject) ||
     !value.keptMessageFingerprints.every(
       (fingerprint) => typeof fingerprint === "string" && /^[a-f0-9]{64}$/.test(fingerprint),
-    ) ||
-    serializedBytes(value.replacementHistory) > REPLACEMENT_BYTE_BUDGET
+    )
   ) {
     return undefined;
   }

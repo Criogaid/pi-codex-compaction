@@ -107,3 +107,9 @@ test("normalizes the legacy compaction alias when loading a saved checkpoint", (
   assert.ok(last && "type" in last);
   assert.equal(last.type, "compaction_summary");
 });
+
+test("persists retained images above the former checkpoint byte ceiling", () => {
+  const image = { type: "input_image", image_url: `data:image/png;base64,${"x".repeat(9 * 1024 * 1024)}` };
+  const details = createCheckpointDetails({ identity, replacementHistory: [{ role: "user", content: [image] }, opaque], keptMessages: [] });
+  assert.deepEqual(parseCheckpointDetails(details), details);
+});

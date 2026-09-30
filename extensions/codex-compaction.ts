@@ -1,5 +1,5 @@
 // Own Pi lifecycle integration, active-session ownership, and checkpoint replay hooks.
-import { imageTokenCounts } from "./image-budget.js";
+import { prepareRetention } from "./retention-input.js";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Context, Tool } from "@earendil-works/pi-ai";
 import {
@@ -153,9 +153,9 @@ async function compactRemotely(
       fetch,
     });
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
-    const images = await imageTokenCounts(response.promptInput, event.signal);
+    const retention = await prepareRetention(response.promptInput, event.signal);
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
-    const replacementHistory = buildReplacementHistory(response.promptInput, response.item, images);
+    const replacementHistory = buildReplacementHistory(retention, response.item);
     const details = createCheckpointDetails({
       identity: response.identity,
       replacementHistory,

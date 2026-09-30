@@ -31,11 +31,11 @@ Tests compare ordinary and compaction requests through the real Pi Responses ada
 
 ### History retention
 
-[retention.ts](extensions/retention.ts) follows the message path and enabled image-budget default in [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs). It keeps the newest user message groups within `RETAINED_MESSAGE_TOKEN_BUDGET`. [text-budget.ts](extensions/text-budget.ts) counts each text part using UTF-8 bytes and preserves its beginning and end when truncating. Empty and audio-only messages cost at least one token. Attached image resize notices remain with their source messages.
+[retention-input.ts](extensions/retention-input.ts) 按 [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs) 的默认规则筛选普通 Responses 消息：排除环境、技能、内部上下文及旧版提示片段，识别可见 hook 提示，并把图片缩放通知与来源消息一起处理。Hook XML 使用固定版本的 `saxes` 解析，边界用例与官方 `quick-xml` 实际运行结果对照。
 
-[image-budget.ts](extensions/image-budget.ts) defines the official ordinary-image estimate and original-image patch rules. It reads original dimensions through Pi's image decoder. Image-containing boundary messages retain later content and keep each image with its adjacent labels. A boundary image that cannot fit prevents backfilling older messages.
+[retention.ts](extensions/retention.ts) 从最新消息开始，按 `RETAINED_MESSAGE_TOKEN_BUDGET` 保留消息组。[text-budget.ts](extensions/text-budget.ts) 按 UTF-8 字节估算 token，截断时保留文本首尾；[image-budget.ts](extensions/image-budget.ts) 实现官方默认启用的图片预算，原始图片尺寸通过 Pi 解码器读取。边界图片与标签整体保留；图片放不下时，不回填更旧的消息。
 
-The opaque item is appended after retained messages and does not consume their retention budget. Legacy `compaction_summary` items normalize to `compaction` when received or loaded. Pi does not expose Codex harness annotations, client-authored developer provenance, or Codex agent-message and hook-prompt types; those Codex-specific retention branches are outside this adapter's contract.
+Opaque 项追加在保留消息之后，不占上述预算；旧 `compaction_summary` 项在接收或加载时规范化为 `compaction`。Pi 没有提供 Codex 的 harness 来源标记和 agent 消息类型，相关分支不在适配范围内。原始图片解码器及 XML 解析器不同，回归用例通过不代表所有格式与异常输入均已证明等价。
 
 ## 自定义 Provider
 
@@ -84,7 +84,7 @@ The opaque item is appended after retained messages and does not consume their r
 
 切换 Provider、API、模型、`baseUrl` 或 endpoint 后，已有 checkpoint 不会重放。近期未压缩消息仍可继续使用，但 opaque 历史不会转换为文本摘要。
 
-Checkpoint identity uses the resolved endpoint. A changed authentication endpoint rejects replay before opaque history is sent. Response event and opaque item limits are defined in [protocol.ts](extensions/protocol.ts); the persisted history limit is defined in [checkpoint.ts](extensions/checkpoint.ts). These host limits can cause fallback to Pi compaction.
+Checkpoint identity uses the resolved endpoint. A changed authentication endpoint rejects replay before opaque history is sent. 扩展不再对响应事件、opaque 项或保留历史施加额外的序列化字节上限；历史选择使用官方 token 预算。Pi 负责传输，扩展继续传递取消信号，并使用 [remote.ts](extensions/remote.ts) 的请求超时和重试设置。事件收集器只保存当前压缩项，不积累完整事件流。
 
 实现基于 `@narumitw/pi-codex-compact`，许可证与 attribution 见 [LICENSE](LICENSE)。
 
