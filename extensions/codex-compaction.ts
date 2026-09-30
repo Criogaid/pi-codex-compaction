@@ -13,8 +13,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { buildReplacementHistory } from "./retention.js";
 import {
   capableModel,
-  sameIdentity,
-  sameModel,
+  sameBackend,
+  sameProvider,
   type CapableModel,
   type ProviderIdentity,
 } from "./capability.js";
@@ -56,12 +56,12 @@ async function compatibleIdentity(
   ctx: ExtensionContext,
   model = ctx.model,
 ): Promise<CapableModel | undefined> {
-  if (!model || !sameModel(details, model)) return undefined;
+  if (!model || !sameProvider(details, model)) return undefined;
   // Resolve only endpoint identity here; Pi still owns authorization and request dispatch.
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) return undefined;
   const supported = capableModel(model, auth.baseUrl);
-  return supported && sameIdentity(details, supported.identity) ? supported : undefined;
+  return supported && sameBackend(details, supported.identity) ? supported : undefined;
 }
 
 function activeTools(pi: ExtensionAPI): Tool[] {
@@ -112,8 +112,8 @@ function projectedCurrentMessages(
   const session = buildSessionContext(event.branchEntries, leafId);
   const prior = latestCheckpoint(event.branchEntries)?.details;
   if (!prior) return { messages: session.messages };
-  if (!sameModel(prior, { provider: identity.provider, api: identity.api, id: identity.modelId })) {
-    throw new Error("The active opaque checkpoint belongs to a different provider identity");
+  if (!sameProvider(prior, identity)) {
+    throw new Error("The active opaque checkpoint belongs to a different provider backend");
   }
   const projected = projectCheckpointRequest(session.messages, prior);
   if (!projected) throw new Error("The previous opaque checkpoint could not be projected safely");
@@ -304,7 +304,7 @@ export function createCodexCompactionExtension(
       warnings.add(key);
       if (ctx.hasUI) {
         ctx.ui.notify(
-          "The active Codex checkpoint cannot replay on this provider identity; only its fallback marker and retained recent messages remain available.",
+          "The active Codex checkpoint cannot replay on this provider backend; only its fallback marker and retained recent messages remain available.",
           "warning",
         );
       }

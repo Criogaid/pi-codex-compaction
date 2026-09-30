@@ -70,15 +70,25 @@ export function capableModel(model: Model<Api> | undefined, effectiveBaseUrl?: s
   } : undefined;
 }
 
-/** Compare provider, API, and model before authentication resolves the endpoint. */
+/** Compare provider and API before authentication resolves the endpoint. */
+export function sameProvider(
+  left: Pick<ProviderIdentity, "provider" | "api">,
+  right: { readonly provider: string; readonly api: string },
+): boolean {
+  return left.provider === right.provider && left.api === right.api;
+}
+
 export function sameModel(
   left: Pick<ProviderIdentity, "provider" | "api" | "modelId">,
   right: Pick<Model<Api>, "provider" | "api" | "id">,
 ): boolean {
-  return left.provider === right.provider && left.api === right.api && left.modelId === right.id;
+  return sameProvider(left, right) && left.modelId === right.id;
 }
 
-export function sameIdentity(left: ProviderIdentity, right: ProviderIdentity): boolean {
-  return sameModel(left, { provider: right.provider, api: right.api, id: right.modelId }) &&
-    left.baseUrl === right.baseUrl && left.endpoint === right.endpoint;
+/**
+ * Codex keeps compaction items across model switches on one backend and narrows that only by
+ * the server's comp_hash, which Pi does not expose. Checkpoints therefore bind to the backend.
+ */
+export function sameBackend(left: ProviderIdentity, right: ProviderIdentity): boolean {
+  return sameProvider(left, right) && left.baseUrl === right.baseUrl && left.endpoint === right.endpoint;
 }

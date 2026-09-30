@@ -3,7 +3,7 @@
 在 Pi 的原有 compaction 流程中使用 Codex Remote Compaction V2。压缩结果由 Provider 生成并保存在 session 中，恢复 session、fork 或继续压缩时可以复用。
 
 > [!WARNING]
-> Remote Compaction V2 仍是实验协议。生成的 checkpoint 只能由相同的 Provider、API、模型和 endpoint 重放。
+> Remote Compaction V2 仍是实验协议。生成的 checkpoint 只能在相同的 Provider、API、`baseUrl` 和 endpoint 上重放；同一后端内切换模型会继续重放。
 
 ## 安装
 
@@ -88,7 +88,7 @@ Opaque 项追加在保留消息之后，不占上述预算；旧 `compaction_sum
 
 扩展会将当前对话发送到所选 Provider 的 Responses endpoint。Provider 返回的 opaque `encrypted_content` 会保存在本地 Pi session 中，并在后续兼容请求中重放。
 
-切换 Provider、API、模型、`baseUrl` 或 endpoint 后，已有 checkpoint 不会重放。近期未压缩消息仍可继续使用，但 opaque 历史不会转换为文本摘要。
+与 Codex 一致，同一后端内切换模型后 checkpoint 继续重放，压缩项随新模型一起发送。Codex 另外依据服务端下发的 `comp_hash` 判断模型间的压缩兼容性，不兼容时先用旧模型重新压缩；Pi 不提供该标识，扩展无法提前判断，若新模型拒绝旧压缩项，请切回原模型。切换 Provider、API、`baseUrl` 或 endpoint 后，已有 checkpoint 不会重放。近期未压缩消息仍可继续使用，但 opaque 历史不会转换为文本摘要。
 
 Checkpoint identity uses the resolved endpoint. A changed authentication endpoint rejects replay before opaque history is sent. 扩展不再对响应事件、opaque 项或保留历史施加额外的序列化字节上限；历史选择使用官方 token 预算。Pi 负责传输，扩展继续传递取消信号，并使用 [remote.ts](extensions/remote.ts) 的请求超时和重试设置。事件收集器只保存当前压缩项，不积累完整事件流。
 

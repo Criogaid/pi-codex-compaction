@@ -2,7 +2,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Context, Model, ProviderHeaders, ThinkingBudgets, Transport, Usage } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { capableModel, deriveEndpoint, normalizeUrl, sameIdentity, sameModel, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
+import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
@@ -108,8 +108,8 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       if (!resolved) throw new CodexCompactionProtocolError("Resolved provider endpoint is incompatible with remote compaction");
       identity = resolved.identity;
       const prior = request.priorCheckpoint?.identity;
-      if (prior && !sameIdentity(prior, identity)) {
-        throw new CodexCompactionProtocolError("The active opaque checkpoint belongs to a different resolved provider identity");
+      if (prior && !sameBackend(prior, identity)) {
+        throw new CodexCompactionProtocolError("The active opaque checkpoint belongs to a different resolved provider backend");
       }
       const contextItems = contextUserItems(isObject(payload) ? payload.input : undefined, request.userItemOrigins);
       const payloadItems = isObject(payload) && Array.isArray(payload.input) ? payload.input.filter(isObject) : [];
