@@ -12,9 +12,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import {
   capableModel,
-  MAX_RETRIES,
   REPLACEMENT_TOKEN_BUDGET,
-  REQUEST_TIMEOUT_MS,
   type RemoteCompactionApi,
 } from "./capability.js";
 import {
@@ -47,8 +45,8 @@ interface SupportedIdentity {
   identity: ProviderIdentity;
 }
 
-function supportedIdentity(model: Model<Api> | undefined): SupportedIdentity | undefined {
-  const supported = capableModel(model);
+function supportedIdentity(model: Model<Api> | undefined, effectiveBaseUrl?: string): SupportedIdentity | undefined {
+  const supported = capableModel(model, effectiveBaseUrl);
   if (!supported) return undefined;
   return {
     model: supported.model,
@@ -76,11 +74,16 @@ function sameIdentity(left: ProviderIdentity, right: ProviderIdentity): boolean 
   );
 }
 
-function compatibleIdentity(
+async function compatibleIdentity(
   details: CodexCheckpointDetails,
-  model: Model<Api> | undefined,
-): SupportedIdentity | undefined {
-  const supported = supportedIdentity(model);
+  ctx: ExtensionContext,
+  model = ctx.model,
+): Promise<SupportedIdentity | undefined> {
+  if (!model || model.provider !== details.provider || model.api !== details.api || model.id !== details.modelId) return undefined;
+  // Resolve only endpoint identity here; Pi still owns authorization and request dispatch.
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok) return undefined;
+  const supported = supportedIdentity(model, auth.baseUrl);
   return supported && sameIdentity(details, supported.identity) ? supported : undefined;
 }
 
@@ -116,7 +119,7 @@ function projectedCurrentMessages(
   const session = buildSessionContext(event.branchEntries, leafId);
   const prior = latestCheckpoint(event.branchEntries)?.details;
   if (!prior) return { messages: session.messages };
-  if (!sameIdentity(prior, identity)) {
+  if (prior.provider !== identity.provider || prior.api !== identity.api || prior.modelId !== identity.modelId) {
     throw new Error("The active opaque checkpoint belongs to a different provider identity");
   }
   const projected = projectCheckpointContext(session.messages, prior);
@@ -146,47 +149,36 @@ async function compactRemotely(
   const reasoning = pi.getThinkingLevel();
   ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction...");
   try {
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(supported.model);
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
-    if (!auth.ok || !auth.apiKey) {
-      throw new Error(auth.ok ? "Provider API key is unavailable" : auth.error);
-    }
-    const provider = ctx.modelRegistry.getProvider(supported.model.provider);
-    if (!provider) throw new Error("Configured provider is unavailable");
-    if (provider.id !== supported.model.provider) {
-      throw new Error("Registered provider identity does not match the selected model");
-    }
     const current = projectedCurrentMessages(event, supported.identity);
     const context: Context = {
       systemPrompt: ctx.getSystemPrompt(),
       messages: convertToLlm(current.messages),
       tools: activeTools(pi),
     };
-    if (ctx.hasUI) {
-      ctx.ui.notify(
-        `Starting Codex Remote Compaction V2 for ${supported.identity.provider}/${supported.identity.modelId}.`,
-        "info",
-      );
-    }
     const response = await requestRemoteCompaction({
-      provider,
+      modelRegistry: ctx.modelRegistry,
       model: supported.model,
       context,
       endpoint: supported.identity.endpoint,
       reasoning,
       sessionId,
-      apiKey: auth.apiKey,
-      headers: auth.headers,
-      env: auth.env,
+      transport: pi.getSettings().transport,
       signal: event.signal,
+      onPrepared: () => {
+        if (!sessionStillOwned(ctx, sessionId, event.signal)) throw new Error("Compaction session ownership changed");
+        if (ctx.hasUI) ctx.ui.notify(
+          `Starting Codex Remote Compaction V2 for ${supported.identity.provider}/${supported.identity.modelId}.`,
+          "info",
+        );
+      },
       priorCheckpoint: current.prior
         ? {
+            identity: current.prior,
             marker: checkpointMarker(current.prior.checkpointId),
             replacementHistory: current.prior.replacementHistory,
           }
         : undefined,
-      requestTimeoutMs: REQUEST_TIMEOUT_MS,
-      maxRetries: MAX_RETRIES,
       fetch,
     });
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
@@ -194,7 +186,7 @@ async function compactRemotely(
       tokenBudget: REPLACEMENT_TOKEN_BUDGET,
     });
     const details = createCheckpointDetails({
-      identity: supported.identity,
+      identity: response.identity,
       replacementHistory,
       keptMessages: keptMessages(event),
     });
@@ -255,18 +247,21 @@ export function createCodexCompactionExtension(
       });
     });
 
-    pi.on("context", (event, ctx) => {
+    pi.on("context", async (event, ctx) => {
       const checkpoint = activeCheckpoint(ctx);
-      if (!checkpoint || !compatibleIdentity(checkpoint.details, ctx.model)) return undefined;
+      if (!checkpoint || !await compatibleIdentity(checkpoint.details, ctx)) return undefined;
       const messages = projectCheckpointContext(event.messages, checkpoint.details);
       return messages ? { messages } : undefined;
     });
 
-    pi.on("before_provider_request", (event, ctx) => {
+    pi.on("before_provider_request", async (event, ctx) => {
       const checkpoint = activeCheckpoint(ctx);
-      if (!checkpoint || !compatibleIdentity(checkpoint.details, ctx.model)) return undefined;
+      if (!checkpoint) return undefined;
       const marker = checkpointMarker(checkpoint.details.checkpointId);
       if (!hasCheckpointMarker(event.payload, marker)) return undefined;
+      if (!await compatibleIdentity(checkpoint.details, ctx)) {
+        throw new Error("The active opaque checkpoint no longer matches the resolved provider endpoint");
+      }
       return rewriteCheckpointMarker(
         event.payload,
         marker,
@@ -274,9 +269,9 @@ export function createCodexCompactionExtension(
       );
     });
 
-    pi.on("model_select", (event, ctx) => {
+    pi.on("model_select", async (event, ctx) => {
       const checkpoint = activeCheckpoint(ctx);
-      if (!checkpoint || compatibleIdentity(checkpoint.details, event.model)) return;
+      if (!checkpoint || await compatibleIdentity(checkpoint.details, ctx, event.model)) return;
       const key = `${ctx.sessionManager.getSessionId()}:${event.model.provider}:${event.model.id}`;
       if (warnings.has(key)) return;
       warnings.add(key);

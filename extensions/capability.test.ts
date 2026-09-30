@@ -56,10 +56,10 @@ test("derives an OpenAI Responses endpoint from models.json capability metadata"
   });
 });
 
-test("adds a v1 path when deriving an OpenAI Responses endpoint", () => {
+test("preserves the base path used by Pi's OpenAI Responses adapter", () => {
   assert.equal(
     deriveEndpoint("https://codex-gateway.example", "openai-responses"),
-    "https://codex-gateway.example/v1/responses",
+    "https://codex-gateway.example/responses",
   );
   assert.equal(
     deriveEndpoint("https://codex-gateway.example/v1", "openai-responses"),

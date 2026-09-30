@@ -1,4 +1,5 @@
-export const MAX_SSE_BYTES = 8 * 1024 * 1024;
+// Own Responses V2 item validation and checkpoint payload transformations.
+export const MAX_PROVIDER_EVENT_BYTES = 8 * 1024 * 1024;
 export const MAX_COMPACTION_ITEM_BYTES = 2 * 1024 * 1024;
 
 export type JsonObject = Record<string, unknown>;
@@ -20,7 +21,7 @@ export function validateCompactionItem(
 ): JsonObject {
   if (
     !isObject(value) ||
-    value.type !== "compaction" ||
+    (value.type !== "compaction" && value.type !== "compaction_summary") ||
     typeof value.encrypted_content !== "string" ||
     !value.encrypted_content
   ) {
@@ -34,111 +35,51 @@ export function validateCompactionItem(
   return structuredClone(value);
 }
 
-export interface CollectedCompaction {
-  item: JsonObject;
-  completedResponse?: JsonObject;
+export interface CompactionCollector {
+  observe(event: unknown): void;
+  finish(): JsonObject;
 }
 
-function compactionItemsFromEvent(event: JsonObject): unknown[] {
-  const items: unknown[] = [];
-  if (event.type === "response.output_item.done" && isObject(event.item)) items.push(event.item);
-  if (
-    event.type === "response.completed" &&
-    isObject(event.response) &&
-    Array.isArray(event.response.output)
-  ) {
-    items.push(...event.response.output);
-  }
-  return items.filter((item) => isObject(item) && item.type === "compaction");
-}
-
-export async function collectCompactionSse(
-  stream: ReadableStream<Uint8Array>,
-  options: { signal?: AbortSignal; maxBytes?: number; maxItemBytes?: number } = {},
-): Promise<CollectedCompaction> {
-  const reader = stream.getReader();
-  const onAbort = () => {
-    void reader.cancel(new DOMException("Compaction aborted", "AbortError")).catch(() => undefined);
-  };
-  options.signal?.addEventListener("abort", onAbort, { once: true });
-  const decoder = new TextDecoder();
+/** Count output-item completion events, as Codex does; response.output is not another source. */
+export function createCompactionCollector(): CompactionCollector {
   let bytes = 0;
-  let pending = "";
-  let dataLines: string[] = [];
-  let completedResponse: JsonObject | undefined;
-  const items = new Map<string, JsonObject>();
-
-  const checkAbort = () => {
-    if (options.signal?.aborted) throw new DOMException("Compaction aborted", "AbortError");
-  };
-  const dispatch = () => {
-    if (!dataLines.length) return;
-    const data = dataLines.join("\n");
-    dataLines = [];
-    if (data === "[DONE]") return;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(data);
-    } catch {
-      throw new CodexCompactionProtocolError("Remote compaction returned malformed SSE JSON");
-    }
-    if (!isObject(parsed)) return;
-    if (parsed.type === "response.completed") {
-      completedResponse = isObject(parsed.response) ? parsed.response : {};
-    }
-    for (const candidate of compactionItemsFromEvent(parsed)) {
-      const item = validateCompactionItem(candidate, options.maxItemBytes);
-      items.set(JSON.stringify(item), item);
-    }
-  };
-  const processLine = (line: string) => {
-    if (!line) return dispatch();
-    if (line.startsWith(":")) return;
-    if (line === "data") dataLines.push("");
-    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
-  };
-
-  try {
-    while (true) {
-      checkAbort();
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value.byteLength;
-      if (bytes > (options.maxBytes ?? MAX_SSE_BYTES)) {
+  let count = 0;
+  let item: JsonObject | undefined;
+  let completed = false;
+  return {
+    observe(event) {
+      if (!isObject(event)) return;
+      bytes += Buffer.byteLength(JSON.stringify(event), "utf8");
+      if (bytes > MAX_PROVIDER_EVENT_BYTES) {
         throw new CodexCompactionProtocolError("Remote compaction stream exceeded the size limit");
       }
-      pending += decoder.decode(value, { stream: true });
-      let newline = pending.indexOf("\n");
-      while (newline !== -1) {
-        const line = pending.slice(0, newline);
-        pending = pending.slice(newline + 1);
-        processLine(line.endsWith("\r") ? line.slice(0, -1) : line);
-        newline = pending.indexOf("\n");
+      // A provider may restart its response when falling back from WebSocket to HTTP.
+      if (event.type === "response.created") {
+        count = 0;
+        item = undefined;
+        completed = false;
       }
-    }
-    pending += decoder.decode();
-    if (pending) processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
-    dispatch();
-    checkAbort();
-  } catch (error) {
-    await reader.cancel(error).catch(() => undefined);
-    throw error;
-  } finally {
-    options.signal?.removeEventListener("abort", onAbort);
-    reader.releaseLock();
-  }
-
-  if (!completedResponse) {
-    throw new CodexCompactionProtocolError(
-      "Remote compaction stream ended without response.completed",
-    );
-  }
-  if (items.size !== 1) {
-    throw new CodexCompactionProtocolError(
-      `Remote compaction returned ${items.size} distinct compaction items; expected exactly one`,
-    );
-  }
-  return { item: [...items.values()][0], completedResponse };
+      if (event.type === "response.output_item.done" && isObject(event.item) &&
+          (event.item.type === "compaction" || event.item.type === "compaction_summary")) {
+        count += 1;
+        item = validateCompactionItem(event.item);
+      }
+      if (event.type === "response.completed") completed = true;
+    },
+    finish() {
+      if (!completed) {
+        throw new CodexCompactionProtocolError(
+          "Remote compaction stream ended without response.completed",
+        );
+      }
+      if (count !== 1 || !item) {
+        throw new CodexCompactionProtocolError(
+          `Remote compaction returned ${count} compaction output events; expected exactly one`,
+        );
+      }
+      return item;
+    },
+  };
 }
 
 function markerText(item: unknown): string | undefined {

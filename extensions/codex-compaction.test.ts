@@ -10,6 +10,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { SessionBeforeCompactEvent, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { parseCheckpointDetails } from "./checkpoint.js";
 import { createCodexCompactionExtension } from "./codex-compaction.js";
+import { testRegistry } from "./test-registry.test.js";
 
 const capability = {
   provider: "custom-codex",
@@ -61,6 +62,7 @@ function mockPi(thinkingLevel: ThinkingLevel = "high") {
       appendedEntries.push({ customType, data });
     },
     getThinkingLevel: () => thinkingLevel,
+    getSettings: () => ({ transport: "sse" as const }),
     getActiveTools: () => [],
     getAllTools: () => [],
   };
@@ -89,7 +91,9 @@ function fakeProvider(observe?: (options: SimpleStreamOptions | undefined) => vo
             method: "POST",
             headers: options.headers as HeadersInit,
           });
-          await response?.text();
+          for (const line of (await response?.text() ?? "").split("\n")) {
+            if (line.startsWith("data: ")) await options?.onProviderStreamEvent?.(JSON.parse(line.slice(6)), _model);
+          }
           const message = {
             role: "assistant" as const,
             content: [],
@@ -173,7 +177,7 @@ function compactEvent(signal = new AbortController().signal): SessionBeforeCompa
   };
 }
 
-function context(overrides: Record<string, unknown> = {}) {
+async function context(overrides: Record<string, unknown> = {}) {
   const notifications: Array<{ message: string; level: string }> = [];
   const statuses = new Map<string, string | undefined>();
   const entries = (overrides.entries as SessionEntry[] | undefined) ?? branch();
@@ -189,10 +193,7 @@ function context(overrides: Record<string, unknown> = {}) {
       getSessionId: () => "session",
       getBranch: () => entries,
     },
-    modelRegistry: {
-      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "secret" }),
-      getProvider: () => fakeProvider(),
-    },
+    modelRegistry: await testRegistry(fakeProvider()),
     ...overrides,
   };
   return { ctx: ctx as never, notifications, statuses };
@@ -210,7 +211,7 @@ const fetchSse = (async () => sseResponse()) as unknown as typeof globalThis.fet
 test("does not notify when a session starts", async () => {
   const mock = mockPi();
   createCodexCompactionExtension()(mock.pi);
-  const current = context();
+  const current = await context();
   const start = mock.events.get("session_start")?.[0];
   await start?.({ type: "session_start", reason: "startup" }, current.ctx);
   assert.deepEqual(current.notifications, []);
@@ -221,7 +222,7 @@ test("creates and resumes a checkpoint for a configured custom provider", async 
   createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
   const initial = branch();
-  const current = context({ entries: initial });
+  const current = await context({ entries: initial });
   const result = await compact?.(compactEvent(), current.ctx) as {
     compaction: { details: unknown; summary: string; usage: unknown };
   };
@@ -273,7 +274,7 @@ test("creates and resumes a checkpoint for a configured custom provider", async 
   ]);
   assert.ok(mock.entryRenderers.has("pi-codex-compaction-completed"));
 
-  const replay = context({ entries: [...initial, compactionEntry] });
+  const replay = await context({ entries: [...initial, compactionEntry] });
   const summary = {
     role: "compactionSummary" as const,
     summary: result.compaction.summary,
@@ -331,7 +332,7 @@ test("provider switches do not replay opaque history", async () => {
     details,
   };
   const switchedModel = { ...model, provider: "other" };
-  const switched = context({ model: switchedModel, entries: [entry] });
+  const switched = await context({ model: switchedModel, entries: [entry] });
   const project = mock.events.get("context")?.[0];
   assert.equal(await project?.({ type: "context", messages: [] }, switched.ctx), undefined);
   const select = mock.events.get("model_select")?.[0];
@@ -343,11 +344,8 @@ test("configured auth failures fall back to native Pi compaction", async () => {
   const mock = mockPi();
   createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
-  const failed = context({
-    modelRegistry: {
-      getApiKeyAndHeaders: async () => ({ ok: false, error: "missing auth" }),
-      getProvider: () => fakeProvider(),
-    },
+  const failed = await context({
+    modelRegistry: await testRegistry(fakeProvider(), async () => { throw new Error("missing auth"); }),
   });
   assert.equal(await compact?.(compactEvent(), failed.ctx), undefined);
   assert.equal(failed.notifications.length, 1);
@@ -355,7 +353,7 @@ test("configured auth failures fall back to native Pi compaction", async () => {
 
   const controller = new AbortController();
   controller.abort();
-  assert.deepEqual(await compact?.(compactEvent(controller.signal), context().ctx), { cancel: true });
+  assert.deepEqual(await compact?.(compactEvent(controller.signal), (await context()).ctx), { cancel: true });
 });
 
 test("cancels a pending compaction when session ownership changes", async () => {
@@ -367,18 +365,15 @@ test("cancels a pending compaction when session ownership changes", async () => 
   const authReady = new Promise<void>((resolve) => {
     releaseAuth = resolve;
   });
-  const current = context({
+  const current = await context({
     sessionManager: {
       getSessionId: () => sessionId,
       getBranch: () => branch(),
     },
-    modelRegistry: {
-      getApiKeyAndHeaders: async () => {
-        await authReady;
-        return { ok: true, apiKey: "secret" };
-      },
-      getProvider: () => fakeProvider(),
-    },
+    modelRegistry: await testRegistry(fakeProvider(), async () => {
+      await authReady;
+      return { auth: { apiKey: "secret" } };
+    }),
   });
 
   const pending = compact?.(compactEvent(), current.ctx);
@@ -394,11 +389,11 @@ test("unsupported and unconfigured models use Pi compaction silently", async () 
   createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
 
-  const unsupported = context({ model: { ...model, api: "openai-completions" } });
+  const unsupported = await context({ model: { ...model, api: "openai-completions" } });
   assert.equal(await compact?.(compactEvent(), unsupported.ctx), undefined);
   assert.deepEqual(unsupported.notifications, []);
 
-  const unconfigured = context({ model: { ...model, compat: undefined } });
+  const unconfigured = await context({ model: { ...model, compat: undefined } });
   assert.equal(await compact?.(compactEvent(), unconfigured.ctx), undefined);
   assert.deepEqual(unconfigured.notifications, []);
 });
@@ -414,11 +409,8 @@ test("inherits the runtime thinking level and active session for every compactio
       assert.equal(options?.cacheRetention, undefined);
     });
     createCodexCompactionExtension({ fetch: fetchSse })(pi);
-    const fixture = context({
-      modelRegistry: {
-        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fixture-key" }),
-        getProvider: () => provider,
-      },
+    const fixture = await context({
+      modelRegistry: await testRegistry(provider),
     });
     const result = await events.get("session_before_compact")?.[0]?.(compactEvent(), fixture.ctx);
     assert.ok(result && observed);

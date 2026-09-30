@@ -8,6 +8,7 @@ import { normalizeContext } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { requestRemoteCompaction } from "./remote.js";
+import { testRegistry } from "./test-registry.test.js";
 
 const apiKey = `fixture.${Buffer.from(JSON.stringify({
   "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
@@ -39,18 +40,19 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         contextWindow: 100_000, maxTokens: 10_000,
         thinkingLevelMap: { off: "none", medium: "medium", high: "high", max: "xhigh" },
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        compat: { supportsLongCacheRetention: true, supportsExplicitPromptCacheMode: true },
+        compat: { supportsLongCacheRetention: true, supportsExplicitPromptCacheMode: true, ...{ remoteCompaction: { protocol: "v2" } } },
       };
       const endpoint = api === "openai-responses"
         ? "https://gateway.example/v1/responses"
         : "https://gateway.example/v1/codex/responses";
+      const modelRegistry = await testRegistry(provider, async () => ({ auth: { apiKey }, env: { PI_CACHE_RETENTION: "long" } }));
       let ordinaryPayload: unknown;
       let compactPayload: unknown;
       let ordinaryHeaders: Headers | undefined;
       let compactHeaders: Headers | undefined;
-      const ordinary = provider.streamSimple(model, normalizeContext(context), {
-        apiKey, reasoning: reasoning === "off" ? undefined : reasoning,
-        sessionId, transport: "sse", env: { PI_CACHE_RETENTION: "long" },
+      const ordinary = modelRegistry.streamSimple(model, context, {
+        reasoning: reasoning === "off" ? undefined : reasoning,
+        sessionId, transport: "sse",
         onPayload: (payload) => { ordinaryPayload = JSON.parse(JSON.stringify(payload)); },
         fetch: async (input, init) => {
           ordinaryHeaders = new Request(input, init).headers;
@@ -61,8 +63,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         if (event.type === "error") throw new Error(event.error.errorMessage);
       }
       await requestRemoteCompaction({
-        provider, model, context, endpoint, apiKey, reasoning, sessionId,
-        env: { PI_CACHE_RETENTION: "long" }, signal: new AbortController().signal,
+        modelRegistry, model, context, endpoint, reasoning, sessionId, transport: "sse",
+        signal: new AbortController().signal,
         fetch: async (input, init) => {
           const request = new Request(input, init);
           const bytes = Buffer.from(await request.arrayBuffer());

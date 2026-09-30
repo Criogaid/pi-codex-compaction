@@ -1,3 +1,4 @@
+// Own model eligibility and endpoint identity; authentication supplies the effective base URL.
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { hasApi } from "@earendil-works/pi-ai";
 
@@ -39,10 +40,7 @@ export function normalizeUrl(value: string): string {
 }
 
 export function deriveEndpoint(baseUrl: string, api: RemoteCompactionApi): string {
-  if (api === OPENAI_RESPONSES_API) {
-    const versionedBaseUrl = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
-    return `${versionedBaseUrl}/responses`;
-  }
+  if (api === OPENAI_RESPONSES_API) return `${baseUrl}/responses`;
   if (baseUrl.endsWith("/codex/responses")) return baseUrl;
   if (baseUrl.endsWith("/codex")) return `${baseUrl}/responses`;
   return `${baseUrl}/codex/responses`;
@@ -70,7 +68,7 @@ function configuredCapability(model: Model<Api>, baseUrl: string): RemoteCompact
   }
 }
 
-export function capableModel(model: Model<Api> | undefined): CapableModel | undefined {
+export function capableModel(model: Model<Api> | undefined, effectiveBaseUrl?: string): CapableModel | undefined {
   if (
     !model ||
     (model.api !== CODEX_API && model.api !== OPENAI_RESPONSES_API)
@@ -80,7 +78,7 @@ export function capableModel(model: Model<Api> | undefined): CapableModel | unde
   const remoteModel = model as Model<RemoteCompactionApi>;
   let baseUrl: string;
   try {
-    baseUrl = normalizeUrl(remoteModel.baseUrl);
+    baseUrl = normalizeUrl(effectiveBaseUrl ?? remoteModel.baseUrl);
   } catch {
     return undefined;
   }
@@ -88,7 +86,7 @@ export function capableModel(model: Model<Api> | undefined): CapableModel | unde
   const capability =
     model.provider === OFFICIAL_PROVIDER &&
     hasApi(remoteModel, CODEX_API) &&
-    baseUrl === OFFICIAL_BASE_URL
+    normalizeUrl(remoteModel.baseUrl) === OFFICIAL_BASE_URL
       ? { protocol: "v2" as const, endpoint: deriveEndpoint(baseUrl, CODEX_API) }
       : configuredCapability(remoteModel, baseUrl);
   return capability ? { model: remoteModel, baseUrl, capability } : undefined;

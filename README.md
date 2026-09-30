@@ -21,9 +21,11 @@ pi install ./packages/pi-codex-compaction
 
 ### Runtime parameters
 
-Remote compaction captures the active session ID and current thinking level when it starts. It uses Pi's `streamSimple()` adapter to apply the selected model's thinking-level mapping, including `off`.
+Remote compaction captures the active session ID and current thinking level when it starts. It calls Pi's public `ModelRegistry.streamSimple()` facade so Pi resolves authentication, model and auth headers, provider environment, and the actual `baseUrl` before dispatch. The provider applies the selected model's thinking-level mapping, including `off`.
 
 Cache options use the same provider defaults and resolved `PI_CACHE_RETENTION` environment as normal requests. The extension passes the active session ID for cache keys and routing instead of forcing `cacheRetention: "none"`. Model sampling parameters, resolved authentication, and provider headers remain owned by Pi.
+
+The extension observes Responses events with `onProviderStreamEvent`, which works with Pi's HTTP and WebSocket adapters. It uses the configured transport for standard provider routes. An explicit nonstandard endpoint override uses HTTP because Pi exposes custom HTTP routing through `fetch`.
 
 Tests compare ordinary and compaction requests through the real Pi Responses adapters using simulated HTTP responses. Matching parameters do not guarantee a cache hit or a billing reduction; those depend on the backend and request prefix.
 
@@ -64,7 +66,7 @@ Tests compare ordinary and compaction requests through the real Pi Responses ada
 }
 ```
 
-`endpoint` 必须与模型的 `baseUrl` 同源，且不能包含凭据、query 或 fragment。Provider 还必须支持 Codex compaction payload、SSE response 和 `remote_compaction_v2` beta header。
+`endpoint` 必须与 Pi 认证解析后的 `baseUrl` 同源，且不能包含凭据、query 或 fragment。Provider 必须支持 Codex compaction payload、`remote_compaction_v2` beta header 和 Pi 的 `onProviderStreamEvent` 回调。
 
 也可以通过 Provider 的 `modelOverrides` 为已有模型添加相同的 `compat.remoteCompaction` 配置。
 
@@ -73,6 +75,8 @@ Tests compare ordinary and compaction requests through the real Pi Responses ada
 扩展会将当前对话发送到所选 Provider 的 Responses endpoint。Provider 返回的 opaque `encrypted_content` 会保存在本地 Pi session 中，并在后续兼容请求中重放。
 
 切换 Provider、API、模型、`baseUrl` 或 endpoint 后，已有 checkpoint 不会重放。近期未压缩消息仍可继续使用，但 opaque 历史不会转换为文本摘要。
+
+Checkpoint identity uses the resolved endpoint. A changed authentication endpoint rejects replay before opaque history is sent. Response event and opaque item limits are defined in [protocol.ts](extensions/protocol.ts); the persisted history limit is defined in [checkpoint.ts](extensions/checkpoint.ts). These host limits can cause fallback to Pi compaction.
 
 实现基于 `@narumitw/pi-codex-compact`，许可证与 attribution 见 [LICENSE](LICENSE)。
 
