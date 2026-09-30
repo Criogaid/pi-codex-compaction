@@ -31,9 +31,11 @@ Tests compare ordinary and compaction requests through the real Pi Responses ada
 
 ### History retention
 
-[retention.ts](extensions/retention.ts) follows the metadata-free message path in [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs). It keeps the newest user message groups within `RETAINED_MESSAGE_TOKEN_BUDGET`, counts each text part using UTF-8 bytes, and truncates a boundary message by preserving its beginning and end. Empty and media-only messages cost at least one token. Attached image resize notices remain with their source messages.
+[retention.ts](extensions/retention.ts) follows the message path and enabled image-budget default in [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs). It keeps the newest user message groups within `RETAINED_MESSAGE_TOKEN_BUDGET`. [text-budget.ts](extensions/text-budget.ts) counts each text part using UTF-8 bytes and preserves its beginning and end when truncating. Empty and audio-only messages cost at least one token. Attached image resize notices remain with their source messages.
 
-The opaque item is appended after retained messages and does not consume their text budget. Images and audio follow Codex's path without the optional image-budget feature. Pi does not expose Codex harness annotations, client-authored developer provenance, or Codex agent-message and hook-prompt types; those Codex-specific retention branches are outside this adapter's contract.
+[image-budget.ts](extensions/image-budget.ts) defines the official ordinary-image estimate and original-image patch rules. It reads original dimensions through Pi's image decoder. Image-containing boundary messages retain later content and keep each image with its adjacent labels. A boundary image that cannot fit prevents backfilling older messages.
+
+The opaque item is appended after retained messages and does not consume their retention budget. Legacy `compaction_summary` items normalize to `compaction` when received or loaded. Pi does not expose Codex harness annotations, client-authored developer provenance, or Codex agent-message and hook-prompt types; those Codex-specific retention branches are outside this adapter's contract.
 
 ## 自定义 Provider
 

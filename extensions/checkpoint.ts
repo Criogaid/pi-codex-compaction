@@ -113,11 +113,13 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
     return undefined;
   }
   try {
-    validateCompactionItem(value.replacementHistory.at(-1));
+    const item = validateCompactionItem(value.replacementHistory.at(-1));
+    const parsed = structuredClone(value) as unknown as CodexCheckpointDetails;
+    parsed.replacementHistory[parsed.replacementHistory.length - 1] = item;
+    return parsed;
   } catch {
     return undefined;
   }
-  return structuredClone(value) as unknown as CodexCheckpointDetails;
 }
 
 export function latestCheckpoint(

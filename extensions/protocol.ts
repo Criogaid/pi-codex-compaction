@@ -16,6 +16,10 @@ function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function isInputImage(value: unknown): value is JsonObject {
+  return isObject(value) && value.type === "input_image";
+}
+
 function isCompactionType(type: unknown): boolean {
   return type === "compaction" || type === "compaction_summary";
 }
@@ -36,7 +40,7 @@ export function validateCompactionItem(
   if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_COMPACTION_ITEM_BYTES) {
     throw new CodexCompactionProtocolError("Remote compaction item exceeded the size limit");
   }
-  return structuredClone(value);
+  return { ...structuredClone(value), type: "compaction" };
 }
 
 export interface CompactionCollector {

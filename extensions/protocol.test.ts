@@ -37,7 +37,7 @@ test("accepts the upstream compaction_summary alias and resets on a retried resp
   const alias = { ...item, type: "compaction_summary" };
   collector.observe({ ...done, item: alias });
   collector.observe(completed);
-  assert.deepEqual(collector.finish(), alias);
+  assert.deepEqual(collector.finish(), item);
 });
 
 test("bounds opaque output before persistence", () => {

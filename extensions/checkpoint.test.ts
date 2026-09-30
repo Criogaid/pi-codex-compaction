@@ -98,3 +98,12 @@ test("selects checkpoints from the active fork only", () => {
   const native = { ...entry("native", second, "second"), details: undefined, summary: "native" };
   assert.equal(latestCheckpoint([...branch, native]), undefined);
 });
+
+test("normalizes the legacy compaction alias when loading a saved checkpoint", () => {
+  const details = checkpoint();
+  const legacy = { ...details, replacementHistory: [rawUser("old"), { ...opaque, type: "compaction_summary" }] };
+  assert.deepEqual(parseCheckpointDetails(legacy), details);
+  const last = legacy.replacementHistory.at(-1);
+  assert.ok(last && "type" in last);
+  assert.equal(last.type, "compaction_summary");
+});

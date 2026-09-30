@@ -1,11 +1,14 @@
-// Own Codex's metadata-free V2 retention policy for the message items produced by Pi.
-// Reference: openai/codex rust-v0.159.2, compact_remote_v2.rs and utils/string/src/truncate.rs.
-import { type JsonObject, validateCompactionItem } from "./protocol.js";
+// Own Codex V2 retention for Pi message items, including its enabled image-budget policy.
+// Reference: openai/codex rust-v0.159.2, compact_remote_v2.rs and compact_remote_v2_images.rs.
+import { isInputImage, type JsonObject, validateCompactionItem } from "./protocol.js";
+import { approximateTokenCount, truncateTextToTokenBudget } from "./text-budget.js";
 
 export const RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
-const APPROX_BYTES_PER_TOKEN = 4;
 const IMAGE_RESIZE_NOTICE_OPEN = "<image_resize_notice>";
 const IMAGE_RESIZE_NOTICE_CLOSE = "</image_resize_notice>";
+const IMAGE_OPEN_TAG = "<image>";
+const IMAGE_CLOSE_TAG = "</image>";
+const LOCAL_IMAGE_OPEN_PREFIX = "<image name=";
 
 type TextPart = JsonObject & { type: "input_text" | "output_text"; text: string };
 interface HistoryGroup {
@@ -17,85 +20,107 @@ function isTextPart(part: unknown): part is TextPart {
     (part.type === "input_text" || part.type === "output_text") &&
     "text" in part && typeof part.text === "string";
 }
-function approximateTokenCount(text: string): number {
-  return Math.ceil(Buffer.byteLength(text, "utf8") / APPROX_BYTES_PER_TOKEN);
+function isTag(part: unknown, tag: string): boolean {
+  return isTextPart(part) && part.type === "input_text" && part.text === tag;
 }
-function textTokenCount(item: JsonObject): number {
-  if (!Array.isArray(item.content)) return 0;
-  return item.content.reduce((tokens: number, part: unknown) => tokens +
-    (isTextPart(part) ? approximateTokenCount(part.text) : 0), 0);
+function isImageOpenTag(part: unknown): boolean {
+  return isTag(part, IMAGE_OPEN_TAG) || (isTextPart(part) && part.type === "input_text" &&
+    part.text.startsWith(LOCAL_IMAGE_OPEN_PREFIX) && part.text.endsWith(">"));
 }
 function isResizeNotice(item: JsonObject): boolean {
   if (item.role !== "developer" || !Array.isArray(item.content) || item.content.length !== 1) return false;
   const part: unknown = item.content[0];
-  return isTextPart(part) && part.type === "input_text" &&
-    part.text.trim().startsWith(IMAGE_RESIZE_NOTICE_OPEN) && part.text.trim().endsWith(IMAGE_RESIZE_NOTICE_CLOSE);
+  if (!isTextPart(part) || part.type !== "input_text") return false;
+  const text = part.text.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+  const asciiLower = (value: string) => value.replace(/[A-Z]/g, (character) => character.toLowerCase());
+  return asciiLower(text.slice(0, IMAGE_RESIZE_NOTICE_OPEN.length)) === IMAGE_RESIZE_NOTICE_OPEN &&
+    asciiLower(text.slice(-IMAGE_RESIZE_NOTICE_CLOSE.length)) === IMAGE_RESIZE_NOTICE_CLOSE;
 }
-function truncateMiddle(text: string, maxTokens: number): string {
-  const budgetBytes = maxTokens * APPROX_BYTES_PER_TOKEN;
-  const totalBytes = Buffer.byteLength(text, "utf8");
-  if (totalBytes <= budgetBytes) return text;
-  const prefixBudgetBytes = Math.floor(budgetBytes / 2);
-  const suffixStartBytes = totalBytes - (budgetBytes - prefixBudgetBytes);
-  let offsetBytes = 0;
-  let prefix = "";
-  let suffix = "";
-  for (const character of text) {
-    const endBytes = offsetBytes + Buffer.byteLength(character, "utf8");
-    if (endBytes <= prefixBudgetBytes) prefix += character;
-    else if (offsetBytes >= suffixStartBytes) suffix += character;
-    offsetBytes = endBytes;
-  }
-  const removedTokens = Math.ceil((totalBytes - budgetBytes) / APPROX_BYTES_PER_TOKEN);
-  return `${prefix}…${removedTokens} tokens truncated…${suffix}`;
+function partTokenCount(part: unknown, images: ReadonlyMap<JsonObject, number>): number {
+  if (isTextPart(part)) return approximateTokenCount(part.text);
+  if (!isInputImage(part)) return 0;
+  const tokens = images.get(part);
+  if (tokens === undefined) throw new Error("Input image is missing its token estimate");
+  return tokens;
 }
-function truncateMessage(item: JsonObject, maxTokens: number): JsonObject | undefined {
+function textTokenCount(item: JsonObject): number {
+  return Array.isArray(item.content)
+    ? item.content.reduce((tokens: number, part: unknown) => tokens + (isTextPart(part) ? approximateTokenCount(part.text) : 0), 0)
+    : 0;
+}
+function truncateTextMessage(item: JsonObject, maxTokens: number): JsonObject | undefined {
   if (!Array.isArray(item.content)) return undefined;
   let remaining = maxTokens;
   const content: unknown[] = [];
   for (const part of item.content) {
-    if (!isTextPart(part)) {
-      // Codex's default path preserves media without charging it against the text budget.
-      content.push(part);
-      continue;
-    }
+    if (!isTextPart(part)) { content.push(part); continue; }
     if (remaining === 0) continue;
     const tokenCount = approximateTokenCount(part.text);
-    const text = tokenCount <= remaining ? part.text : truncateMiddle(part.text, remaining);
+    const text = tokenCount <= remaining ? part.text : truncateTextToTokenBudget(part.text, remaining);
     remaining = Math.max(0, remaining - tokenCount);
     if (text) content.push({ ...part, text });
   }
   return content.length ? { ...item, content } : undefined;
 }
+function truncateImageMessage(item: JsonObject, maxTokens: number, images: ReadonlyMap<JsonObject, number>): JsonObject | undefined {
+  if (!Array.isArray(item.content)) return undefined;
+  const pending: unknown[] = [...item.content];
+  const reversed: unknown[] = [];
+  let remaining = maxTokens;
+  while (pending.length) {
+    const last = pending.length - 1;
+    const imageIndex = isInputImage(pending[last]) ? last
+      : isTag(pending[last], IMAGE_CLOSE_TAG) && last > 0 && isInputImage(pending[last - 1]) ? last - 1 : undefined;
+    if (imageIndex !== undefined) {
+      const start = imageIndex > 0 && isImageOpenTag(pending[imageIndex - 1]) ? imageIndex - 1 : imageIndex;
+      const tokens = pending.slice(start).reduce((sum: number, part: unknown) => sum + partTokenCount(part, images), 0);
+      const fits = tokens <= remaining;
+      remaining = fits ? remaining - tokens : 0;
+      if (fits) reversed.push(...pending.slice(start).reverse());
+      pending.length = start;
+      continue;
+    }
+    const part = pending.pop();
+    if (!isTextPart(part)) { reversed.push(part); continue; }
+    if (!remaining) continue;
+    const tokens = approximateTokenCount(part.text);
+    const text = tokens <= remaining ? part.text : truncateTextToTokenBudget(part.text, remaining);
+    remaining = Math.max(0, remaining - tokens);
+    if (text) reversed.push({ ...part, text });
+  }
+  return reversed.length ? { ...item, content: reversed.reverse() } : undefined;
+}
 
-/** Keep newest user message groups within the fixed Codex text budget, then append the opaque item. */
-export function buildReplacementHistory(input: readonly JsonObject[], compactionItem: JsonObject): JsonObject[] {
+/** Keep newest user groups within Codex's fixed budget, preserving image/label groups atomically. */
+export function buildReplacementHistory(input: readonly JsonObject[], compactionItem: JsonObject, images: ReadonlyMap<JsonObject, number>): JsonObject[] {
   const groups: HistoryGroup[] = [];
   for (let index = 0; index < input.length; index++) {
     const source = input[index];
     const next = input[index + 1];
     const notice = next && isResizeNotice(next) ? input[++index] : undefined;
-    if ((source.type === undefined || source.type === "message") && source.role === "user") {
-      groups.push({ source, notice });
-    }
+    if ((source.type === undefined || source.type === "message") && source.role === "user") groups.push({ source, notice });
   }
   let remaining = RETAINED_MESSAGE_TOKEN_BUDGET;
   const reversed: JsonObject[] = [];
   for (let index = groups.length - 1; index >= 0 && remaining > 0; index--) {
     const { source, notice } = groups[index];
     const noticeTokens = notice ? Math.max(1, textTokenCount(notice)) : 0;
-    const sourceTokens = Math.max(1, textTokenCount(source));
+    const sourceTokens = Math.max(1, Array.isArray(source.content)
+      ? source.content.reduce((sum: number, part: unknown) => sum + partTokenCount(part, images), 0) : 0);
+    const hasImages = Array.isArray(source.content) && source.content.some(isInputImage);
     if (sourceTokens + noticeTokens <= remaining) {
       if (notice) reversed.push(notice);
       reversed.push(source);
       remaining -= sourceTokens + noticeTokens;
     } else if (remaining > noticeTokens) {
-      const truncated = truncateMessage(source, remaining - noticeTokens);
+      const budget = remaining - noticeTokens;
+      if (hasImages) remaining = 0;
+      const truncated = hasImages ? truncateImageMessage(source, budget, images) : truncateTextMessage(source, budget);
       if (!truncated) continue;
       if (notice) reversed.push(notice);
       reversed.push(truncated);
       remaining = 0;
-    }
+    } else if (hasImages) remaining = 0;
   }
   return [...structuredClone(reversed.reverse()), validateCompactionItem(compactionItem)];
 }
