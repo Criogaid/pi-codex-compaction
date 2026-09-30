@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   createAssistantMessageEventStream,
+  getCurrentSystemMessage,
+  getSystemMessageText,
   type Context,
   type Tool,
   type Model,
@@ -12,6 +14,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import {
   SessionManager,
+  convertToLlm,
   type ContextEventResult,
   type ExtensionAPI,
   type ModelRegistry,
@@ -536,6 +539,8 @@ type SessionMessage = Parameters<SessionManager["appendMessage"]>[0];
 async function providerCompaction(messages: SessionMessage[], options: {
   settings?: TestSettings; tools?: TestTools; customInstructions?: string;
   adaptPayload?: (payload: JsonObject) => JsonObject;
+  ordinaryPrompt?: string;
+  afterOrdinary?: (session: SessionManager, mock: ReturnType<typeof mockPi>, current: Awaited<ReturnType<typeof context>>, requestModel: Model<"openai-responses">) => void | Promise<void>;
 } = {}) {
   const mock = mockPi("high", options.settings, options.tools);
   let payload: unknown;
@@ -566,10 +571,66 @@ async function providerCompaction(messages: SessionMessage[], options: {
     getApiKeyAndHeaders: registry.getApiKeyAndHeaders.bind(registry),
   };
   const requestModel: Model<"openai-responses"> = { ...model, input: ["text", "image"] };
-  const current = await context({ sessionManager, modelRegistry, model: requestModel });
+  let runtimePrompt = options.ordinaryPrompt ?? "system";
+  const current = await context({ sessionManager, modelRegistry, model: requestModel, getSystemPrompt: () => runtimePrompt });
+  let ordinaryPayload: JsonObject | undefined;
+  if (options.ordinaryPrompt !== undefined) {
+    const transcript = convertToLlm(sessionManager.buildSessionContext().messages);
+    const head = getCurrentSystemMessage(transcript);
+    assert.ok(head);
+    const ordinaryContext: Context = { messages: [
+      { role: "system", content: options.ordinaryPrompt, toolsAdded: head.toolsAdded, timestamp: head.timestamp },
+      ...transcript.filter((message) => message.role !== "system"),
+    ] };
+    for await (const _event of registry.streamSimple(requestModel, ordinaryContext, {
+      fetch: async () => sseResponse(), sessionId: sessionManager.getSessionId(),
+      onPayload: async (input) => {
+        assert.ok(isObject(input));
+        ordinaryPayload = structuredClone(input);
+        return await mock.events.get("before_provider_request")?.[0]?.({ type: "before_provider_request", payload: input }, current.ctx) ?? input;
+      },
+    })) {
+      // Drain the ordinary response before Pi clears its per-run prompt override.
+    }
+    runtimePrompt = getSystemMessageText(head);
+    await options.afterOrdinary?.(sessionManager, mock, current, requestModel);
+  }
   const details = await compactSession(mock, sessionManager, entries[firstUser], current, options.customInstructions);
   assert.ok(isObject(payload));
-  return { payload, contexts, details, notifications: current.notifications };
+  return { payload, ordinaryPayload, contexts, details, notifications: current.notifications };
+}
+
+test("compaction reuses the effective ordinary prompt after Pi clears its run override", async () => {
+  const tool: Tool = { name: "read", description: "Read", parameters: { type: "object", properties: {} } };
+  const messages: SessionMessage[] = [
+    { role: "system", content: "", sections: { preamble: "Preamble", tools: "<tools>\nread\n</tools>", docs: "<docs>\nDocs\n</docs>" }, toolsAdded: [tool], timestamp: 0 },
+    { role: "user", content: "request", timestamp: 1 },
+  ];
+  const saved = structuredClone(messages);
+  const result = await providerCompaction(messages, { ordinaryPrompt: "Preamble\n\n<docs>\nDocs\n</docs>\n\n<tools>\nread\n</tools>" });
+  assert.ok(result.ordinaryPayload && Array.isArray(result.ordinaryPayload.input) && Array.isArray(result.payload.input));
+  assert.deepEqual(result.payload.input[0], result.ordinaryPayload.input[0]);
+  assert.deepEqual(messages, saved);
+});
+
+for (const change of ["system", "session-start", "session-id", "model"] as const) {
+  test(`compaction discards an ordinary prompt override after ${change} changes`, async () => {
+    const messages: SessionMessage[] = [
+      { role: "system", content: "canonical prompt", timestamp: 0 },
+      { role: "user", content: "request", timestamp: 1 },
+    ];
+    const result = await providerCompaction(messages, { ordinaryPrompt: "per-run override",
+      async afterOrdinary(session, mock, current, requestModel) {
+        if (change === "system") session.appendMessage({ role: "system", content: "new instructions", timestamp: 2 });
+        if (change === "session-start") await mock.events.get("session_start")?.[0]?.({ type: "session_start" }, current.ctx);
+        if (change === "session-id") session.getSessionId = () => "replacement-session";
+        if (change === "model") requestModel.id = "other-model";
+      },
+    });
+    assert.ok(Array.isArray(result.payload.input));
+    const expected = change === "system" ? "canonical prompt\n\nnew instructions" : "canonical prompt";
+    assert.deepEqual(result.payload.input[0], { role: "developer", content: expected });
+  });
 }
 
 for (const withSystem of [true, false]) {

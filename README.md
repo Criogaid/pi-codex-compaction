@@ -25,7 +25,9 @@ Remote compaction captures the active session ID and current thinking level when
 
 Cache options use the same provider defaults and resolved `PI_CACHE_RETENTION` environment as normal requests. The extension passes the active session ID for cache keys and routing instead of forcing `cacheRetention: "none"`. Model sampling parameters, resolved authentication, and provider headers remain owned by Pi.
 
-压缩请求与普通请求使用同一份上下文：Pi 0.99 的 transcript 通过 system 消息声明提示词与工具，扩展直接沿用这些消息，仅在旧会话缺少 system 消息时回退到当前系统提示词和已激活工具。`images.blockImages`、`thinkingBudgets`、`websocketConnectTimeoutMs` 和 `retry.provider.maxRetryDelayMs` 按 Pi 设置生效；重试次数取 Pi 的 `retry.provider.maxRetries` 与 Codex 上限 2 中的较小值。其他扩展的 `context`、`before_provider_headers` 处理器以及 `prepareLoadout` 的隐藏声明不在扩展 API 可达范围内，不会作用于压缩请求。Remote Compaction V2 不接受 `/compact` 的自定义指令，提供时会显示 warning 并忽略。
+压缩请求沿用 Pi 0.99 transcript 中声明提示词与工具的 system 消息；旧会话缺少 system 消息时回退到当前系统提示词和已激活工具。若其他扩展在 `before_agent_start` 覆盖整个 prompt，本包在普通请求发出前通过 `ctx.getSystemPrompt()` 记录实际生效的覆盖。随后压缩仅在 session、模型、后端及来源 system 消息指纹仍匹配时沿用它。覆盖仅保存在当前进程中；重启后需要先发出一次普通请求。来源 system 消息变化时丢弃旧覆盖。
+
+`images.blockImages`、`thinkingBudgets`、`websocketConnectTimeoutMs` 和 `retry.provider.maxRetryDelayMs` 按 Pi 设置生效；重试次数取 Pi 的 `retry.provider.maxRetries` 与 Codex 上限 2 中的较小值。其他扩展的 `context`、`before_provider_headers` 处理器以及 `prepareLoadout` 的隐藏声明不在扩展 API 可达范围内，不会作用于压缩请求。Remote Compaction V2 不接受 `/compact` 的自定义指令，提供时会显示 warning 并忽略。
 
 The extension observes Responses events with `onProviderStreamEvent`, which works with Pi's HTTP and WebSocket adapters. It uses the configured transport for standard provider routes. An explicit nonstandard endpoint override uses HTTP because Pi exposes custom HTTP routing through `fetch`.
 
@@ -95,6 +97,8 @@ Checkpoint identity uses the resolved endpoint. A changed authentication endpoin
 [checkpoint.ts](extensions/checkpoint.ts) 使用 Pi 的 `buildSessionProjection()` 生成保留消息指纹，应用消息编辑和隐藏规则，忽略旧压缩记录，并按 `context` 事件约定排除 system 消息。
 
 保留消息被其他扩展或编辑改变、导致指纹不再匹配时，检查点不会重放，扩展会在当前会话中提示一次。
+
+同时使用会改写工具输出的 `context` 扩展时，在 Pi 的 `packages` 列表中将本包放在这些扩展之前。例如，SoL-Pi Observation Pack 会把已暴露的工具输出替换为占位文本；先投影 checkpoint，再处理近期消息，可避免这些占位文本改变受保护的保留历史。Pi 按扩展加载顺序执行处理器，本包不会跳过指纹校验。
 
 加载旧检查点时，扩展先按检查点创建时的分支验证旧算法生成的指纹，确认匹配后在内存中修正为标准投影的指纹。此过程不改写会话文件，也不改变 checkpoint 格式。原始记录缺失或旧指纹不匹配时不执行修正；检查点创建之后的消息编辑仍受重放校验约束。
 

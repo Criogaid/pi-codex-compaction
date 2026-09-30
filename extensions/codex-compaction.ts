@@ -1,7 +1,7 @@
 // Own Pi lifecycle integration, active-session ownership, and checkpoint replay hooks.
 import { prepareRetention, userItemOrigins } from "./retention-input.js";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Context, Message, Tool } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, getSystemMessageText, type Context, type Message, type Tool } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
   convertToLlm,
@@ -15,6 +15,7 @@ import {
   capableModel,
   sameBackend,
   sameProvider,
+  sameModel,
   type CapableModel,
   type ProviderIdentity,
 } from "./capability.js";
@@ -23,6 +24,7 @@ import {
   checkpointMarker,
   createCheckpointDetails,
   fallbackSummary,
+  fingerprintMessage,
   keptMessages,
   latestCheckpoint,
   parseCheckpointDetails,
@@ -43,6 +45,13 @@ interface CompletionEntryData {
   message: string;
   protocol: typeof REMOTE_COMPACTION_PROTOCOL;
   checkpointId: string;
+}
+
+interface EffectiveSystemPrompt {
+  readonly sessionId: string;
+  readonly identity: ProviderIdentity;
+  readonly sourceFingerprint: string;
+  readonly text: string;
 }
 
 
@@ -90,11 +99,31 @@ function withoutImages(messages: Message[]): Message[] {
 }
 
 // Pi 0.99 transcripts declare the prompt and tools through system messages, as ordinary requests do.
-function requestContext(pi: ExtensionAPI, ctx: ExtensionContext, messages: AgentMessage[], settings: PiSettings): Context {
+function requestContext(pi: ExtensionAPI, ctx: ExtensionContext, messages: AgentMessage[], settings: PiSettings, effectivePrompt?: EffectiveSystemPrompt): Context {
   const converted = convertToLlm(messages);
   const llmMessages = settings.images?.blockImages ? withoutImages(converted) : converted;
+  if (effectivePrompt) {
+    const head = getCurrentSystemMessage(llmMessages);
+    if (head && fingerprintMessage(head) === effectivePrompt.sourceFingerprint) {
+      // Pi applies per-run prompt overrides after context hooks and clears them when the run ends.
+      const { sections: _sections, ...declarations } = head;
+      return { messages: [{ ...declarations, content: effectivePrompt.text }, ...llmMessages.filter((message) => message.role !== "system")] };
+    }
+  }
   if (llmMessages.some((message) => message.role === "system")) return { messages: llmMessages };
   return { systemPrompt: ctx.getSystemPrompt(), messages: llmMessages, tools: activeTools(pi) };
+}
+
+function captureEffectiveSystemPrompt(ctx: ExtensionContext): EffectiveSystemPrompt | undefined {
+  const supported = capableModel(ctx.model);
+  if (!supported) return undefined;
+  const branch = ctx.sessionManager.getBranch();
+  const messages = buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
+  const head = getCurrentSystemMessage(convertToLlm(messages));
+  if (!head) return undefined;
+  const text = ctx.getSystemPrompt();
+  if (text === getSystemMessageText(head)) return undefined;
+  return { sessionId: ctx.sessionManager.getSessionId(), identity: supported.identity, sourceFingerprint: fingerprintMessage(head), text };
 }
 
 function websocketConnectTimeoutMs(value: unknown): number | undefined {
@@ -159,6 +188,7 @@ async function compactRemotely(
   ctx: ExtensionContext,
   fetch?: typeof globalThis.fetch,
   lastRequest?: CacheProbeRequest,
+  lastSystemPrompt?: EffectiveSystemPrompt,
 ) {
   const supported = capableModel(ctx.model);
   if (!supported) return undefined;
@@ -173,10 +203,13 @@ async function compactRemotely(
       ctx.ui.notify("Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", "warning");
     }
     const current = projectedCurrentMessages(event, supported.identity, sessionId);
+    const effectivePrompt = lastSystemPrompt?.sessionId === sessionId &&
+      sameModel(lastSystemPrompt.identity, supported.model) && sameBackend(lastSystemPrompt.identity, supported.identity)
+      ? lastSystemPrompt : undefined;
     const response = await requestRemoteCompaction({
       modelRegistry: ctx.modelRegistry,
       model: supported.model,
-      context: requestContext(pi, ctx, current.messages, settings),
+      context: requestContext(pi, ctx, current.messages, settings, effectivePrompt),
       userItemOrigins: userItemOrigins(current.messages),
       reasoning,
       sessionId,
@@ -251,6 +284,7 @@ export function createCodexCompactionExtension(
     const warnings = new Set<string>();
     let lastRequest: CacheProbeRequest | undefined;
     let lastSystems: { readonly sessionId: string; readonly systems: CacheProbeSystems } | undefined;
+    let lastSystemPrompt: EffectiveSystemPrompt | undefined;
 
     pi.registerEntryRenderer<CompletionEntryData>(
       COMPLETION_ENTRY_TYPE,
@@ -266,10 +300,11 @@ export function createCodexCompactionExtension(
       warnings.clear();
       lastRequest = undefined;
       lastSystems = undefined;
+      lastSystemPrompt = undefined;
     });
 
     pi.on("session_before_compact", (event, ctx) =>
-      compactRemotely(pi, event, ctx, options.fetch, lastRequest),
+      compactRemotely(pi, event, ctx, options.fetch, lastRequest, lastSystemPrompt),
     );
 
     pi.on("session_compact", (event) => {
@@ -309,6 +344,7 @@ export function createCodexCompactionExtension(
 
     pi.on("before_provider_request", async (event, ctx) => {
       const payload = await replayCheckpoint(event.payload, ctx);
+      lastSystemPrompt = captureEffectiveSystemPrompt(ctx);
       // The probe keeps the payload this extension hands on; later handlers may still change it.
       const observed = payload ?? event.payload;
       if (cacheProbeEnabled() && ctx.model && isObject(observed)) {
@@ -338,6 +374,7 @@ export function createCodexCompactionExtension(
       warnings.clear();
       lastRequest = undefined;
       lastSystems = undefined;
+      lastSystemPrompt = undefined;
       ctx.ui.setStatus(STATUS_KEY, undefined);
     });
   };
