@@ -10,7 +10,7 @@ export class CodexCompactionProtocolError extends Error {
   }
 }
 
-function isObject(value: unknown): value is JsonObject {
+export function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -134,15 +134,16 @@ export function appendCompactionTrigger(payload: unknown): JsonObject {
   return { ...payload, input: [...payload.input, { type: "compaction_trigger" }] };
 }
 
+/** Replay the checkpoint, let the caller adapt the history, then append the V2 trigger. */
 export function prepareRemoteCompactionPayload(
   payload: unknown,
   checkpoint?: { marker: string; replacementHistory: readonly unknown[] },
+  adaptHistory?: (history: JsonObject) => JsonObject,
 ): JsonObject {
-  return appendCompactionTrigger(
-    checkpoint
-      ? rewriteCheckpointMarker(payload, checkpoint.marker, checkpoint.replacementHistory)
-      : payload,
-  );
+  const history = checkpoint
+    ? rewriteCheckpointMarker(payload, checkpoint.marker, checkpoint.replacementHistory)
+    : payload;
+  return appendCompactionTrigger(adaptHistory && isObject(history) ? adaptHistory(history) : history);
 }
 
 export function hasCheckpointMarker(payload: unknown, marker: string): boolean {

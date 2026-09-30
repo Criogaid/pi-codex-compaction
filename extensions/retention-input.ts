@@ -1,7 +1,7 @@
 // Adapt Responses messages to Codex rust-v0.159.2's metadata-free retained groups.
 // Context markers mirror core/src/context; XML is parsed at this boundary, not by the budget core.
 import { SaxesParser } from "saxes";
-import { imageTokenCounts } from "./image-budget.js";
+import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import type { JsonObject } from "./protocol.js";
 import type { RetentionInput, HistoryGroup } from "./retention.js";
 
@@ -103,15 +103,24 @@ function isResizeNotice(item: JsonObject): boolean {
   return text !== undefined && marked(text, RESIZE_NOTICE_MARKERS);
 }
 
-export async function prepareRetention(input: readonly JsonObject[], signal: AbortSignal): Promise<RetentionInput> {
+/** Group each item with an immediately following resize notice, as Codex's history_item_groups does. */
+export function historyGroups(input: readonly JsonObject[]): HistoryGroup[] {
   const groups: HistoryGroup[] = [];
   for (let index = 0; index < input.length; index++) {
-    signal.throwIfAborted();
-    const source = input[index];
     const next = input[index + 1];
-    const notice = next && isResizeNotice(next) ? input[++index] : undefined;
-    if (isUserMessage(source)) groups.push({ source, notice });
+    groups.push({ source: input[index], notice: next && isResizeNotice(next) ? input[++index] : undefined });
   }
-  const images = await imageTokenCounts(groups.map((group) => group.source), signal);
-  return { groups, images };
+  return groups;
+}
+
+export async function prepareRetention(
+  input: readonly JsonObject[],
+  signal: AbortSignal,
+  images?: ImageEstimates,
+): Promise<RetentionInput> {
+  const groups = historyGroups(input).filter((group) => {
+    signal.throwIfAborted();
+    return isUserMessage(group.source);
+  });
+  return { groups, images: images ?? await estimateImages(groups.map((group) => group.source), signal) };
 }

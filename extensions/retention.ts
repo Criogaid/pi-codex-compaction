@@ -1,7 +1,8 @@
 // Own Codex V2 retention for Pi message items, including its enabled image-budget policy.
 // Reference: openai/codex rust-v0.159.2, compact_remote_v2.rs and compact_remote_v2_images.rs.
+import type { ImageEstimates } from "./image-budget.js";
 import { isInputImage, type JsonObject, validateCompactionItem } from "./protocol.js";
-import { approximateTokenCount, truncateTextToTokenBudget } from "./text-budget.js";
+import { approximateTokenCount, approximateTokensFromBytes, truncateTextToTokenBudget } from "./text-budget.js";
 
 export const RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
 const IMAGE_OPEN_TAG = "<image>";
@@ -15,7 +16,7 @@ export interface HistoryGroup {
 }
 export interface RetentionInput {
   readonly groups: readonly HistoryGroup[];
-  readonly images: ReadonlyMap<JsonObject, number>;
+  readonly images: ImageEstimates;
 }
 function isTextPart(part: unknown): part is TextPart {
   return typeof part === "object" && part !== null && "type" in part &&
@@ -29,12 +30,9 @@ function isImageOpenTag(part: unknown): boolean {
   return isTag(part, IMAGE_OPEN_TAG) || (isTextPart(part) && part.type === "input_text" &&
     part.text.startsWith(LOCAL_IMAGE_OPEN_PREFIX) && part.text.endsWith(">"));
 }
-function partTokenCount(part: unknown, images: ReadonlyMap<JsonObject, number>): number {
+function partTokenCount(part: unknown, images: ImageEstimates): number {
   if (isTextPart(part)) return approximateTokenCount(part.text);
-  if (!isInputImage(part)) return 0;
-  const tokens = images.get(part);
-  if (tokens === undefined) throw new Error("Input image is missing its token estimate");
-  return tokens;
+  return isInputImage(part) ? approximateTokensFromBytes(images.bytes(part)) : 0;
 }
 function textTokenCount(item: JsonObject): number {
   return Array.isArray(item.content)
@@ -55,7 +53,7 @@ function truncateTextMessage(item: JsonObject, maxTokens: number): JsonObject | 
   }
   return content.length ? { ...item, content } : undefined;
 }
-function truncateImageMessage(item: JsonObject, maxTokens: number, images: ReadonlyMap<JsonObject, number>): JsonObject | undefined {
+function truncateImageMessage(item: JsonObject, maxTokens: number, images: ImageEstimates): JsonObject | undefined {
   if (!Array.isArray(item.content)) return undefined;
   const pending: unknown[] = [...item.content];
   const reversed: unknown[] = [];

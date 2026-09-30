@@ -37,6 +37,8 @@ Tests compare ordinary and compaction requests through the real Pi Responses ada
 
 [retention.ts](extensions/retention.ts) 从最新消息开始，按 `RETAINED_MESSAGE_TOKEN_BUDGET` 保留消息组。[text-budget.ts](extensions/text-budget.ts) 按 UTF-8 字节估算 token，截断时保留文本首尾；[image-budget.ts](extensions/image-budget.ts) 实现官方默认启用的图片预算，原始图片尺寸通过 Pi 解码器读取。边界图片与标签整体保留；图片放不下时，不回填更旧的消息。
 
+发送压缩请求前，[context-window.ts](extensions/context-window.ts) 按官方 `trim_function_call_history_to_fit_context_window` 估算整份历史：超过模型 `contextWindow` 的 95% 时，从末尾起把连续的工具输出替换为固定截断提示，遇到非工具输出即停止。溢出恢复触发的压缩因此不必先超出上下文窗口。
+
 Opaque 项追加在保留消息之后，不占上述预算；旧 `compaction_summary` 项在接收或加载时规范化为 `compaction`。Pi 没有提供 Codex 的 harness 来源标记和 agent 消息类型，相关分支不在适配范围内。原始图片解码器及 XML 解析器不同，回归用例通过不代表所有格式与异常输入均已证明等价。
 
 ## 自定义 Provider

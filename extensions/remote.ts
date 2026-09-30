@@ -3,7 +3,9 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Context, Model, ProviderHeaders, ThinkingBudgets, Transport, Usage } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { capableModel, deriveEndpoint, normalizeUrl, sameIdentity, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
-import { CodexCompactionProtocolError, createCompactionCollector, type JsonObject, prepareRemoteCompactionPayload } from "./protocol.js";
+import { trimToolOutputsToContextWindow } from "./context-window.js";
+import { estimateImages, type ImageEstimates } from "./image-budget.js";
+import { CodexCompactionProtocolError, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload } from "./protocol.js";
 
 const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 const REQUEST_TIMEOUT_MS = 300_000;
@@ -33,6 +35,7 @@ export interface RemoteCompactionResponse {
   promptInput: JsonObject[];
   identity: ProviderIdentity;
   usage: Usage;
+  images: ImageEstimates;
 }
 
 export function mergeRemoteCompactionHeader(headers: ProviderHeaders): ProviderHeaders {
@@ -46,6 +49,13 @@ export function mergeRemoteCompactionHeader(headers: ProviderHeaders): ProviderH
   return merged;
 }
 
+function objectItems(input: unknown): JsonObject[] {
+  if (!Array.isArray(input) || !input.every(isObject)) {
+    throw new CodexCompactionProtocolError("Prepared compaction payload has invalid input items");
+  }
+  return input;
+}
+
 export async function requestRemoteCompaction(request: RemoteCompactionRequest): Promise<RemoteCompactionResponse> {
   request.signal.throwIfAborted();
   const configured = capableModel(request.model);
@@ -55,6 +65,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   let sentInput: JsonObject[] | undefined;
   let identity: ProviderIdentity | undefined;
   let usage: Usage | undefined;
+  let images: ImageEstimates | undefined;
   const baseFetch = request.fetch ?? globalThis.fetch;
   const routedFetch: typeof globalThis.fetch = async (input, init) => {
     if (!identity) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
@@ -88,7 +99,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     maxRetryDelayMs: request.maxRetryDelayMs,
     transformHeaders: mergeRemoteCompactionHeader,
     fetch: routedFetch,
-    onPayload: (payload, preparedModel) => {
+    onPayload: async (payload, preparedModel) => {
       if (preparedModel.api !== request.model.api || preparedModel.provider !== request.model.provider || preparedModel.id !== request.model.id) {
         throw new CodexCompactionProtocolError("Provider resolved an unexpected compaction model");
       }
@@ -99,12 +110,15 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       if (prior && !sameIdentity(prior, identity)) {
         throw new CodexCompactionProtocolError("The active opaque checkpoint belongs to a different resolved provider identity");
       }
-      const prepared = prepareRemoteCompactionPayload(payload, request.priorCheckpoint);
+      const payloadItems = isObject(payload) && Array.isArray(payload.input) ? payload.input.filter(isObject) : [];
+      const estimates = await estimateImages([...payloadItems, ...request.priorCheckpoint?.replacementHistory ?? []], request.signal);
+      const prepared = prepareRemoteCompactionPayload(payload, request.priorCheckpoint, (history) => ({
+        ...history,
+        input: trimToolOutputsToContextWindow(objectItems(history.input), history.instructions, request.model.contextWindow, estimates),
+      }));
       if (prepared.model !== request.model.id) throw new CodexCompactionProtocolError("Provider payload used an unexpected model");
-      if (!Array.isArray(prepared.input) || !prepared.input.every((item: unknown): item is JsonObject => typeof item === "object" && item !== null && !Array.isArray(item))) {
-        throw new CodexCompactionProtocolError("Prepared compaction payload has invalid input items");
-      }
-      sentInput = structuredClone(prepared.input.slice(0, -1));
+      sentInput = structuredClone(objectItems(prepared.input).slice(0, -1));
+      images = estimates;
       request.onPrepared?.();
       return prepared;
     },
@@ -119,7 +133,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     if (event.type === "done") usage = event.message.usage;
   }
   request.signal.throwIfAborted();
-  if (!sentInput || !identity) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
+  if (!sentInput || !identity || !images) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
   if (!usage) throw new CodexCompactionProtocolError("Provider stream ended without a completed message");
-  return { item: collector.finish(), promptInput: sentInput, identity, usage };
+  return { item: collector.finish(), promptInput: sentInput, identity, usage, images };
 }

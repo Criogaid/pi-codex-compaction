@@ -2,7 +2,10 @@
 const APPROX_BYTES_PER_TOKEN = 4;
 
 export function approximateTokensFromBytes(bytes: number): number {
-  return Math.ceil(bytes / APPROX_BYTES_PER_TOKEN);
+  return bytes <= 0 ? 0 : Math.ceil(bytes / APPROX_BYTES_PER_TOKEN);
+}
+export function approximateBytesForTokens(tokens: number): number {
+  return tokens * APPROX_BYTES_PER_TOKEN;
 }
 export function approximateTokenCount(text: string): number {
   return approximateTokensFromBytes(Buffer.byteLength(text, "utf8"));
