@@ -29,7 +29,8 @@ import {
   projectCheckpointContext,
   projectCheckpointRequest,
 } from "./checkpoint.js";
-import { hasCheckpointMarker, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
+import { hasCheckpointMarker, isObject, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
+import { cacheProbeEnabled, describeCachePrefix } from "./cache-probe.js";
 import { requestRemoteCompaction } from "./remote.js";
 
 const STATUS_KEY = "codex-compaction";
@@ -119,6 +120,17 @@ function projectedCurrentMessages(
   return { messages: projected, prior };
 }
 
+async function replayCheckpoint(payload: unknown, ctx: ExtensionContext): Promise<JsonObject | undefined> {
+  const checkpoint = activeCheckpoint(ctx);
+  if (!checkpoint) return undefined;
+  const marker = checkpointMarker(checkpoint.details.checkpointId);
+  if (!hasCheckpointMarker(payload, marker)) return undefined;
+  if (!await compatibleIdentity(checkpoint.details, ctx)) {
+    throw new Error("The active opaque checkpoint no longer matches the resolved provider endpoint");
+  }
+  return rewriteCheckpointMarker(payload, marker, checkpoint.details.replacementHistory);
+}
+
 function notifyFailure(ctx: ExtensionContext, error: unknown): void {
   if (!ctx.hasUI) return;
   const message = error instanceof Error ? error.message : String(error);
@@ -134,6 +146,7 @@ async function compactRemotely(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
   fetch?: typeof globalThis.fetch,
+  lastRequest?: JsonObject,
 ) {
   const supported = capableModel(ctx.model);
   if (!supported) return undefined;
@@ -161,11 +174,12 @@ async function compactRemotely(
       maxRetryDelayMs: settings.retry?.provider?.maxRetryDelayMs,
       websocketConnectTimeoutMs: websocketConnectTimeoutMs(settings.websocketConnectTimeoutMs),
       signal: event.signal,
-      onPrepared: () => {
+      onPrepared: (payload) => {
         if (!sessionStillOwned(ctx, sessionId, event.signal)) throw new Error("Compaction session ownership changed");
         // Provider retries prepare the payload again; announce the compaction once.
         if (announced) return;
         announced = true;
+        if (lastRequest && ctx.hasUI) ctx.ui.notify(describeCachePrefix(lastRequest, payload), "info");
         if (ctx.hasUI) ctx.ui.notify(
           `Starting Codex Remote Compaction V2 for ${supported.identity.provider}/${supported.identity.modelId}.`,
           "info",
@@ -219,6 +233,7 @@ export function createCodexCompactionExtension(
 ): (pi: ExtensionAPI) => void {
   return (pi) => {
     const warnings = new Set<string>();
+    let lastRequest: JsonObject | undefined;
 
     pi.registerEntryRenderer<CompletionEntryData>(
       COMPLETION_ENTRY_TYPE,
@@ -232,10 +247,11 @@ export function createCodexCompactionExtension(
 
     pi.on("session_start", () => {
       warnings.clear();
+      lastRequest = undefined;
     });
 
     pi.on("session_before_compact", (event, ctx) =>
-      compactRemotely(pi, event, ctx, options.fetch),
+      compactRemotely(pi, event, ctx, options.fetch, lastRequest),
     );
 
     pi.on("session_compact", (event) => {
@@ -268,18 +284,10 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("before_provider_request", async (event, ctx) => {
-      const checkpoint = activeCheckpoint(ctx);
-      if (!checkpoint) return undefined;
-      const marker = checkpointMarker(checkpoint.details.checkpointId);
-      if (!hasCheckpointMarker(event.payload, marker)) return undefined;
-      if (!await compatibleIdentity(checkpoint.details, ctx)) {
-        throw new Error("The active opaque checkpoint no longer matches the resolved provider endpoint");
-      }
-      return rewriteCheckpointMarker(
-        event.payload,
-        marker,
-        checkpoint.details.replacementHistory,
-      );
+      const payload = await replayCheckpoint(event.payload, ctx);
+      // The probe keeps the payload this extension hands on; later handlers may still change it.
+      if (cacheProbeEnabled() && isObject(payload ?? event.payload)) lastRequest = structuredClone(payload ?? event.payload) as JsonObject;
+      return payload;
     });
 
     pi.on("model_select", async (event, ctx) => {
