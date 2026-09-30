@@ -27,6 +27,7 @@ import {
   latestCheckpoint,
   parseCheckpointDetails,
   projectCheckpointContext,
+  projectCheckpointRequest,
 } from "./checkpoint.js";
 import { hasCheckpointMarker, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
@@ -113,7 +114,7 @@ function projectedCurrentMessages(
   if (!sameModel(prior, { provider: identity.provider, api: identity.api, id: identity.modelId })) {
     throw new Error("The active opaque checkpoint belongs to a different provider identity");
   }
-  const projected = projectCheckpointContext(session.messages, prior);
+  const projected = projectCheckpointRequest(session.messages, prior);
   if (!projected) throw new Error("The previous opaque checkpoint could not be projected safely");
   return { messages: projected, prior };
 }
