@@ -25,6 +25,8 @@ Remote compaction captures the active session ID and current thinking level when
 
 Cache options use the same provider defaults and resolved `PI_CACHE_RETENTION` environment as normal requests. The extension passes the active session ID for cache keys and routing instead of forcing `cacheRetention: "none"`. Model sampling parameters, resolved authentication, and provider headers remain owned by Pi.
 
+压缩请求与普通请求使用同一份上下文：Pi 0.99 的 transcript 通过 system 消息声明提示词与工具，扩展直接沿用这些消息，仅在旧会话缺少 system 消息时回退到当前系统提示词和已激活工具。`images.blockImages`、`thinkingBudgets`、`websocketConnectTimeoutMs` 和 `retry.provider.maxRetryDelayMs` 按 Pi 设置生效；重试次数取 Pi 的 `retry.provider.maxRetries` 与 Codex 上限 2 中的较小值。其他扩展的 `context`、`before_provider_headers` 处理器以及 `prepareLoadout` 的隐藏声明不在扩展 API 可达范围内，不会作用于压缩请求。Remote Compaction V2 不接受 `/compact` 的自定义指令，提供时会显示 warning 并忽略。
+
 The extension observes Responses events with `onProviderStreamEvent`, which works with Pi's HTTP and WebSocket adapters. It uses the configured transport for standard provider routes. An explicit nonstandard endpoint override uses HTTP because Pi exposes custom HTTP routing through `fetch`.
 
 Tests compare ordinary and compaction requests through the real Pi Responses adapters using simulated HTTP responses. Matching parameters do not guarantee a cache hit or a billing reduction; those depend on the backend and request prefix.

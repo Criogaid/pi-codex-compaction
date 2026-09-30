@@ -1,7 +1,7 @@
 // Own Pi lifecycle integration, active-session ownership, and checkpoint replay hooks.
 import { prepareRetention } from "./retention-input.js";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Context, Tool } from "@earendil-works/pi-ai";
+import type { Context, Message, Tool } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
   convertToLlm,
@@ -32,6 +32,9 @@ import { requestRemoteCompaction } from "./remote.js";
 
 const STATUS_KEY = "codex-compaction";
 const COMPLETION_ENTRY_TYPE = "pi-codex-compaction-completed";
+const BLOCKED_IMAGE_TEXT = "Image reading is disabled.";
+
+type PiSettings = ReturnType<ExtensionAPI["getSettings"]>;
 
 interface CompletionEntryData {
   message: string;
@@ -70,6 +73,34 @@ function activeTools(pi: ExtensionAPI): Tool[] {
     }));
 }
 
+// Mirror Pi's request-time image blocking, including its deduplicated placeholders.
+function withoutImages(messages: Message[]): Message[] {
+  return messages.map((message) => {
+    if ((message.role !== "user" && message.role !== "toolResult") || !Array.isArray(message.content) ||
+        !message.content.some((part) => part.type === "image")) return message;
+    const content = message.content
+      .map((part) => part.type === "image" ? { type: "text" as const, text: BLOCKED_IMAGE_TEXT } : part)
+      .filter((part, index, parts) => !(part.type === "text" && part.text === BLOCKED_IMAGE_TEXT && index > 0 &&
+        parts[index - 1].type === "text" && (parts[index - 1] as { text: string }).text === BLOCKED_IMAGE_TEXT));
+    return { ...message, content } as Message;
+  });
+}
+
+// Pi 0.99 transcripts declare the prompt and tools through system messages, as ordinary requests do.
+function requestContext(pi: ExtensionAPI, ctx: ExtensionContext, messages: AgentMessage[], settings: PiSettings): Context {
+  const converted = convertToLlm(messages);
+  const llmMessages = settings.images?.blockImages ? withoutImages(converted) : converted;
+  if (llmMessages.some((message) => message.role === "system")) return { messages: llmMessages };
+  return { systemPrompt: ctx.getSystemPrompt(), messages: llmMessages, tools: activeTools(pi) };
+}
+
+function websocketConnectTimeoutMs(value: unknown): number | undefined {
+  const parsed = typeof value === "string"
+    ? value.trim().toLowerCase() === "disabled" ? 0 : value.trim() ? Number(value.trim()) : undefined
+    : value;
+  return typeof parsed === "number" && Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : undefined;
+}
+
 function projectedCurrentMessages(
   event: SessionBeforeCompactEvent,
   identity: ProviderIdentity,
@@ -106,22 +137,25 @@ async function compactRemotely(
   if (!supported) return undefined;
   const sessionId = ctx.sessionManager.getSessionId();
   const reasoning = pi.getThinkingLevel();
+  const settings = pi.getSettings();
   ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction...");
   try {
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+    if (event.customInstructions?.trim() && ctx.hasUI) {
+      ctx.ui.notify("Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", "warning");
+    }
     const current = projectedCurrentMessages(event, supported.identity);
-    const context: Context = {
-      systemPrompt: ctx.getSystemPrompt(),
-      messages: convertToLlm(current.messages),
-      tools: activeTools(pi),
-    };
     const response = await requestRemoteCompaction({
       modelRegistry: ctx.modelRegistry,
       model: supported.model,
-      context,
+      context: requestContext(pi, ctx, current.messages, settings),
       reasoning,
       sessionId,
-      transport: pi.getSettings().transport,
+      transport: settings.transport,
+      thinkingBudgets: settings.thinkingBudgets,
+      maxRetries: settings.retry?.provider?.maxRetries,
+      maxRetryDelayMs: settings.retry?.provider?.maxRetryDelayMs,
+      websocketConnectTimeoutMs: websocketConnectTimeoutMs(settings.websocketConnectTimeoutMs),
       signal: event.signal,
       onPrepared: () => {
         if (!sessionStillOwned(ctx, sessionId, event.signal)) throw new Error("Compaction session ownership changed");

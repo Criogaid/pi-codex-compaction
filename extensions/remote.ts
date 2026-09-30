@@ -1,6 +1,6 @@
 // Own V2 request adaptation; Pi's model registry owns authentication and provider dispatch.
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Context, Model, ProviderHeaders, Transport, Usage } from "@earendil-works/pi-ai";
+import type { Context, Model, ProviderHeaders, ThinkingBudgets, Transport, Usage } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { capableModel, deriveEndpoint, normalizeUrl, sameIdentity, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
 import { CodexCompactionProtocolError, createCompactionCollector, type JsonObject, prepareRemoteCompactionPayload } from "./protocol.js";
@@ -17,6 +17,11 @@ export interface RemoteCompactionRequest {
   reasoning: ThinkingLevel;
   sessionId: string;
   transport?: Transport;
+  thinkingBudgets?: ThinkingBudgets;
+  /** Pi's provider retry setting; Codex caps compaction retries below it. */
+  maxRetries?: number;
+  maxRetryDelayMs?: number;
+  websocketConnectTimeoutMs?: number;
   signal: AbortSignal;
   priorCheckpoint?: { identity: ProviderIdentity; marker: string; replacementHistory: readonly JsonObject[] };
   onPrepared?: () => void;
@@ -75,9 +80,12 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     signal: request.signal,
     transport: overridesEndpoint ? "sse" : request.transport,
     reasoning: request.reasoning === "off" ? undefined : request.reasoning,
+    thinkingBudgets: request.thinkingBudgets,
     sessionId: request.sessionId,
     timeoutMs: REQUEST_TIMEOUT_MS,
-    maxRetries: MAX_RETRIES,
+    websocketConnectTimeoutMs: request.websocketConnectTimeoutMs,
+    maxRetries: Math.min(request.maxRetries ?? MAX_RETRIES, MAX_RETRIES),
+    maxRetryDelayMs: request.maxRetryDelayMs,
     transformHeaders: mergeRemoteCompactionHeader,
     fetch: routedFetch,
     onPayload: (payload, preparedModel) => {
