@@ -30,7 +30,7 @@ import {
   projectCheckpointRequest,
 } from "./checkpoint.js";
 import { hasCheckpointMarker, isObject, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
-import { cacheProbeEnabled, describeCachePrefix } from "./cache-probe.js";
+import { CACHE_PROBE_LOG, cacheProbeEnabled, describeCachePrefix, recordCacheProbe } from "./cache-probe.js";
 import { requestRemoteCompaction } from "./remote.js";
 
 const STATUS_KEY = "codex-compaction";
@@ -179,7 +179,13 @@ async function compactRemotely(
         // Provider retries prepare the payload again; announce the compaction once.
         if (announced) return;
         announced = true;
-        if (lastRequest && ctx.hasUI) ctx.ui.notify(describeCachePrefix(lastRequest, payload), "info");
+        if (cacheProbeEnabled()) {
+          const probe = lastRequest
+            ? describeCachePrefix(lastRequest, payload)
+            : "Cache probe: no ordinary request was observed in this Pi process before compaction.";
+          recordCacheProbe(probe);
+          if (ctx.hasUI) ctx.ui.notify(`${probe}\n(${CACHE_PROBE_LOG})`, "info");
+        }
         if (ctx.hasUI) ctx.ui.notify(
           `Starting Codex Remote Compaction V2 for ${supported.identity.provider}/${supported.identity.modelId}.`,
           "info",

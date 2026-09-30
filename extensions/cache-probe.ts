@@ -1,6 +1,11 @@
 // Own the opt-in diagnostic that compares a compaction payload with the last ordinary request.
 // Prompt caching matches an exact prefix, so the first differing field or input item explains a miss.
+import { appendFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { JsonObject } from "./protocol.js";
+
+export const CACHE_PROBE_LOG = join(tmpdir(), "pi-codex-compaction-cache-probe.log");
 
 // Temporary: enabled by default while diagnosing cache misses. Remove this module afterwards.
 const SUMMARY_CHARS = 160;
@@ -35,4 +40,13 @@ export function describeCachePrefix(previous: JsonObject, current: JsonObject): 
     lines.push(`input[${matched}] compaction: ${summarize(currentInput[matched])}`);
   }
   return lines.join("\n");
+}
+
+/** Keep each probe result after the notification disappears. */
+export function recordCacheProbe(text: string): void {
+  try {
+    appendFileSync(CACHE_PROBE_LOG, `[${new Date().toISOString()}]\n${text}\n\n`);
+  } catch {
+    // The notification still carries the result.
+  }
 }
