@@ -2,14 +2,19 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   createAssistantMessageEventStream,
+  type Context,
+  type Tool,
   type Model,
   type Provider,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import {
   SessionManager,
   type ContextEventResult,
+  type ExtensionAPI,
+  type ModelRegistry,
   type SessionBeforeCompactEvent,
   type SessionBeforeCompactResult,
   type SessionEntry,
@@ -17,6 +22,7 @@ import {
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, parseCheckpointDetails } from "./checkpoint.js";
 import { createCodexCompactionExtension } from "./codex-compaction.js";
 import { testRegistry } from "./test-registry.test.js";
+import { isObject, type JsonObject } from "./protocol.js";
 
 const capability = {
   provider: "custom-codex",
@@ -53,7 +59,11 @@ const usage = {
 
 type Handler = (...args: any[]) => unknown;
 
-function mockPi(thinkingLevel: ThinkingLevel = "high") {
+// Persisted timeout strings exercise the runtime boundary beyond Settings' numeric type.
+type TestSettings = Omit<ReturnType<ExtensionAPI["getSettings"]>, "websocketConnectTimeoutMs"> & { websocketConnectTimeoutMs?: unknown };
+interface TestTools { active: string[]; all: Tool[] }
+
+function mockPi(thinkingLevel: ThinkingLevel = "high", settings: TestSettings = { transport: "sse" }, tools: TestTools = { active: [], all: [] }) {
   const events = new Map<string, Handler[]>();
   const appendedEntries: Array<{ customType: string; data: unknown }> = [];
   const entryRenderers = new Map<string, Handler>();
@@ -68,14 +78,14 @@ function mockPi(thinkingLevel: ThinkingLevel = "high") {
       appendedEntries.push({ customType, data });
     },
     getThinkingLevel: () => thinkingLevel,
-    getSettings: () => ({ transport: "sse" as const }),
-    getActiveTools: () => [],
-    getAllTools: () => [],
+    getSettings: () => settings,
+    getActiveTools: () => tools.active,
+    getAllTools: () => tools.all,
   };
   return { pi: pi as never, events, appendedEntries, entryRenderers };
 }
 
-function fakeProvider(observe?: (options: SimpleStreamOptions | undefined) => void): Provider {
+function fakeProvider(observe?: (options: SimpleStreamOptions | undefined) => void, payloadPreparations = 1): Provider {
   return {
     id: capability.provider,
     name: "Custom Codex",
@@ -92,7 +102,9 @@ function fakeProvider(observe?: (options: SimpleStreamOptions | undefined) => vo
             const text = typeof content === "string" ? content : "text" in content ? content.text : "image";
             return { role: "user", content: [{ type: "input_text", text }] };
           });
-          await options?.onPayload?.({ model: model.id, input }, model);
+          for (let attempt = 0; attempt < payloadPreparations; attempt++) {
+            await options?.onPayload?.({ model: model.id, input }, model);
+          }
           const response = await options?.fetch?.(capability.endpoint, {
             method: "POST",
             headers: options.headers as HeadersInit,
@@ -208,7 +220,8 @@ async function context(overrides: Record<string, unknown> = {}) {
 function sseResponse() {
   const item = { type: "compaction", encrypted_content: "opaque" };
   return new Response(
-    `data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\ndata: ${JSON.stringify({ type: "response.completed", response: { output: [item] } })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "response-fixture", status: "completed", output: [item], usage: { input_tokens: 20, output_tokens: 1 } } })}\n\n`,
+    { headers: { "content-type": "text/event-stream" } },
   );
 }
 
@@ -219,8 +232,10 @@ async function compactSession(
   sessionManager: SessionManager,
   firstKeptEntryId: string,
   current: Awaited<ReturnType<typeof context>>,
+  customInstructions?: string,
 ) {
   const event = compactEvent();
+  event.customInstructions = customInstructions;
   event.branchEntries = sessionManager.getBranch();
   event.preparation.firstKeptEntryId = firstKeptEntryId;
   // The mock event bus erases Pi's event/result pairing.
@@ -513,5 +528,268 @@ test("inherits the runtime thinking level and active session for every compactio
     const result = await events.get("session_before_compact")?.[0]?.(compactEvent(), fixture.ctx);
     assert.ok(result && observed);
     assert.deepEqual(fixture.notifications.filter((notice) => notice.level === "warning"), []);
+  }
+});
+
+type SessionMessage = Parameters<SessionManager["appendMessage"]>[0];
+
+async function providerCompaction(messages: SessionMessage[], options: {
+  settings?: TestSettings; tools?: TestTools; customInstructions?: string;
+  adaptPayload?: (payload: JsonObject) => JsonObject;
+} = {}) {
+  const mock = mockPi("high", options.settings, options.tools);
+  let payload: unknown;
+  createCodexCompactionExtension({ fetch: async (input, init) => {
+    payload = await new Request(input, init).json();
+    return sseResponse();
+  } })(mock.pi);
+  const sessionManager = SessionManager.inMemory();
+  const entries = messages.map((message) => sessionManager.appendMessage(message));
+  const firstUser = messages.findIndex((message) => message.role === "user");
+  assert.ok(firstUser >= 0);
+  const native = openaiProvider();
+  const provider: Provider<"openai-responses"> = { ...native, id: model.provider,
+    streamSimple(currentModel, transcript, streamOptions) {
+      return native.streamSimple(currentModel, transcript, { ...streamOptions, onPayload: (input, preparedModel) => {
+        assert.ok(isObject(input));
+        return streamOptions?.onPayload?.(options.adaptPayload?.(input) ?? input, preparedModel);
+      } });
+    },
+  };
+  const registry = await testRegistry(provider);
+  const contexts: Context[] = [];
+  const modelRegistry: Pick<ModelRegistry, "streamSimple" | "getApiKeyAndHeaders"> = {
+    streamSimple(currentModel, currentContext, streamOptions) {
+      contexts.push(currentContext);
+      return registry.streamSimple(currentModel, currentContext, streamOptions);
+    },
+    getApiKeyAndHeaders: registry.getApiKeyAndHeaders.bind(registry),
+  };
+  const requestModel: Model<"openai-responses"> = { ...model, input: ["text", "image"] };
+  const current = await context({ sessionManager, modelRegistry, model: requestModel });
+  const details = await compactSession(mock, sessionManager, entries[firstUser], current, options.customInstructions);
+  assert.ok(isObject(payload));
+  return { payload, contexts, details, notifications: current.notifications };
+}
+
+for (const withSystem of [true, false]) {
+  test(`sends one system prompt to the provider with transcript system messages ${withSystem}`, async () => {
+    const tool: Tool = { name: "transcript_tool", description: "Transcript tool", parameters: { type: "object", properties: {} } };
+    const inactive = { ...tool, name: "inactive_tool" };
+    const messages: SessionMessage[] = [
+      ...(withSystem ? [{ role: "system" as const, content: "system", toolsAdded: [tool], timestamp: 0 }] : []),
+      { role: "user", content: "request", timestamp: 1 },
+    ];
+    const result = await providerCompaction(messages, { tools: { active: [tool.name], all: [tool, inactive] } });
+    assert.equal(result.contexts.length, 1);
+    if (withSystem) {
+      assert.deepEqual(Object.keys(result.contexts[0]), ["messages"]);
+    } else {
+      assert.equal(result.contexts[0].systemPrompt, "system");
+      assert.deepEqual(result.contexts[0].tools, [tool]);
+    }
+    assert.ok(Array.isArray(result.payload.input));
+    const instructions = result.payload.input.filter(isObject).filter((item) => item.role === "system" || item.role === "developer");
+    assert.deepEqual(instructions, [{ role: "developer", content: "system" }]);
+    assert.ok(Array.isArray(result.payload.tools));
+    assert.deepEqual(result.payload.tools.filter(isObject).map((item) => item.name), [tool.name]);
+    assert.equal(result.payload.instructions, undefined);
+    assert.deepEqual(result.notifications.filter((notice) => notice.level === "warning"), []);
+  });
+}
+
+test("uses transcript tools and system updates instead of the current fallback context", async () => {
+  const tool: Tool = { name: "transcript_tool", description: "Transcript tool", parameters: { type: "object", properties: {} } };
+  const result = await providerCompaction([
+    { role: "system", content: "initial instructions", toolsAdded: [tool], timestamp: 0 },
+    { role: "user", content: "request", timestamp: 1 },
+    { role: "system", content: "updated instructions", timestamp: 2 },
+  ], { tools: { active: ["fallback_tool"], all: [{ ...tool, name: "fallback_tool" }] } });
+  const wire = JSON.stringify(result.payload);
+  assert.equal(wire.split("initial instructions").length - 1, 1);
+  assert.equal(wire.split("updated instructions").length - 1, 1);
+  assert.doesNotMatch(wire, /fallback_tool/);
+  assert.deepEqual(Object.keys(result.contexts[0]), ["messages"]);
+});
+
+for (const blockImages of [true, false]) {
+  test(`applies blockImages=${blockImages} to user and tool-result payloads without changing history`, async () => {
+    const image = { type: "image" as const, data: "fixture-image", mimeType: "image/png" };
+    const placeholder = { type: "text" as const, text: "Image reading is disabled." };
+    const separator = { type: "text" as const, text: "separator" };
+    const content = [image, image, placeholder, separator, image, image];
+    const messages: SessionMessage[] = [
+      { role: "user", content, timestamp: 1 },
+      { role: "assistant", content: [{ type: "toolCall", id: "call", name: "read", arguments: {} }],
+        api: model.api, provider: model.provider, model: model.id, usage, stopReason: "toolUse", timestamp: 2 },
+      { role: "toolResult", toolCallId: "call", toolName: "read", content, isError: false, timestamp: 3 },
+    ];
+    const saved = structuredClone(messages);
+    const result = await providerCompaction(messages, { settings: { transport: "sse", images: { blockImages } } });
+    const converted = result.contexts[0].messages.filter((message) => message.role === "user" || message.role === "toolResult");
+    assert.equal(converted.length, 2);
+    for (const message of converted) {
+      assert.deepEqual(message.content, blockImages ? [placeholder, separator, placeholder] : content);
+    }
+    const wire = JSON.stringify(result.payload);
+    if (blockImages) {
+      assert.doesNotMatch(wire, /input_image|fixture-image/);
+      assert.equal(wire.split(placeholder.text).length - 1, 4);
+    } else {
+      assert.match(wire, /input_image/);
+      assert.match(wire, /fixture-image/);
+    }
+    assert.deepEqual(messages, saved);
+  });
+}
+
+test("passes effective runtime settings from Pi to the provider on every compaction", async () => {
+  const settings: TestSettings = { transport: "websocket", thinkingBudgets: { minimal: 16, low: 32, medium: 64, high: 128 },
+    retry: { maxRetries: 17, provider: { maxRetries: 9, maxRetryDelayMs: 321 } }, websocketConnectTimeoutMs: "disabled" };
+  const observed: SimpleStreamOptions[] = [];
+  const provider = fakeProvider((options) => { assert.ok(options); observed.push(options); });
+  const mock = mockPi("high", settings);
+  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  const current = await context({ modelRegistry: await testRegistry(provider) });
+  const compact = mock.events.get("session_before_compact")?.[0];
+  assert.ok(compact);
+  assert.ok(await compact(compactEvent(), current.ctx));
+  assert.equal(observed[0].transport, "websocket");
+  assert.deepEqual(observed[0].thinkingBudgets, settings.thinkingBudgets);
+  assert.equal(observed[0].maxRetries, 2);
+  assert.equal(observed[0].maxRetryDelayMs, 321);
+  assert.equal(observed[0].websocketConnectTimeoutMs, 0);
+  settings.transport = "sse";
+  settings.retry = { provider: { maxRetries: 0, maxRetryDelayMs: 123 } };
+  settings.websocketConnectTimeoutMs = 45;
+  assert.ok(await compact(compactEvent(), current.ctx));
+  assert.equal(observed[1].transport, "sse");
+  assert.equal(observed[1].maxRetries, 0);
+  assert.equal(observed[1].maxRetryDelayMs, 123);
+  assert.equal(observed[1].websocketConnectTimeoutMs, 45);
+});
+
+test("normalizes websocket timeout strings and rejects invalid runtime values", async () => {
+  for (const [configured, expected] of [[undefined, undefined], [0, 0], [12.9, 12], [" 25.9 ", 25], [" DISABLED ", 0],
+    ["", undefined], ["  ", undefined], [-1, undefined], ["-1", undefined], [NaN, undefined], [Infinity, undefined], ["invalid", undefined]] as const) {
+    let observed: SimpleStreamOptions | undefined;
+    const mock = mockPi("high", { transport: "sse", websocketConnectTimeoutMs: configured });
+    createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+    const current = await context({ modelRegistry: await testRegistry(fakeProvider((options) => { observed = options; })) });
+    const result = await mock.events.get("session_before_compact")?.[0]?.(compactEvent(), current.ctx);
+    assert.ok(result && observed);
+    assert.equal(observed.websocketConnectTimeoutMs, expected, String(configured));
+  }
+});
+
+test("warns for nonempty custom instructions and leaves provider instructions unchanged", async () => {
+  for (const customInstructions of [undefined, "", " \n\t", "Summarize only security issues."]) {
+    const result = await providerCompaction([{ role: "user", content: "request", timestamp: 1 }], { customInstructions });
+    const warnings = result.notifications.filter((notice) => notice.level === "warning");
+    assert.deepEqual(warnings, customInstructions?.trim() ? [{
+      message: "Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", level: "warning",
+    }] : []);
+    assert.doesNotMatch(JSON.stringify(result.payload), /Summarize only security issues/);
+  }
+});
+
+test("announces once when a provider prepares multiple retry payloads and again for the next compaction", async () => {
+  const mock = mockPi();
+  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  const current = await context({ modelRegistry: await testRegistry(fakeProvider(undefined, 3)) });
+  const compact = mock.events.get("session_before_compact")?.[0];
+  assert.ok(compact);
+  assert.ok(await compact(compactEvent(), current.ctx));
+  assert.equal(current.notifications.filter((notice) => notice.level === "info").length, 1);
+  assert.ok(await compact(compactEvent(), current.ctx));
+  assert.equal(current.notifications.filter((notice) => notice.level === "info").length, 2);
+  assert.deepEqual(current.notifications.filter((notice) => notice.level === "warning"), []);
+});
+
+test("keeps visible custom and skill user text while excluding bash, hidden custom and skill-only content", async () => {
+  const skill = '<skill name="fixture" location="E:/skills/fixture/SKILL.md">\nSkill instructions.\n</skill>';
+  const result = await providerCompaction([
+    { role: "user", content: [], timestamp: 0 },
+    { role: "bashExecution", command: "echo fixture", output: "shell context", exitCode: 0, cancelled: false, truncated: false, timestamp: 1 },
+    { role: "custom", customType: "fixture", content: "hidden context", display: false, timestamp: 2 },
+    { role: "custom", customType: "fixture", content: "visible notice", display: true, timestamp: 3 },
+    { role: "user", content: `${skill}\n\nUser request.`, timestamp: 4 },
+    { role: "user", content: skill, timestamp: 5 },
+  ]);
+  assert.match(JSON.stringify(result.payload), /shell context/);
+  assert.match(JSON.stringify(result.payload), /hidden context/);
+  assert.deepEqual(result.details.replacementHistory, [
+    { role: "user", content: [{ type: "input_text", text: "visible notice" }] },
+    { role: "user", content: [{ type: "input_text", text: "User request." }] },
+    { type: "compaction", encrypted_content: "opaque" },
+  ]);
+});
+
+test("falls back to text classification when a provider inserts an extra user item", async () => {
+  const result = await providerCompaction([
+    { role: "user", content: "request", timestamp: 1 },
+    { role: "custom", customType: "fixture", content: "hidden without marker", display: false, timestamp: 2 },
+  ], { adaptPayload(payload) {
+    assert.ok(Array.isArray(payload.input));
+    return { ...payload, input: [...payload.input, { role: "user", content: [{ type: "input_text", text: "<environment_context>injected</environment_context>" }] }] };
+  } });
+  assert.deepEqual(result.details.replacementHistory, [
+    { role: "user", content: [{ type: "input_text", text: "request" }] },
+    { role: "user", content: [{ type: "input_text", text: "hidden without marker" }] },
+    { type: "compaction", encrypted_content: "opaque" },
+  ]);
+});
+
+test("warns about failed projection once per session and checkpoint and resets on session start", async () => {
+  const mock = mockPi();
+  createCodexCompactionExtension()(mock.pi);
+  const session = SessionManager.inMemory();
+  const message: AgentMessage = { role: "user", content: "kept", timestamp: 1 };
+  const firstKept = session.appendMessage(message);
+  const append = () => {
+    const details = createCheckpointDetails({ identity: { ...capability, modelId: model.id },
+      replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }], keptMessages: [message] });
+    session.appendCompaction(fallbackSummary(details.checkpointId), firstKept, 100, details);
+  };
+  append();
+  let sessionId = "first-session";
+  const current = await context({ sessionManager: { getSessionId: () => sessionId, getBranch: () => session.getBranch() } });
+  const project = mock.events.get("context")?.[0];
+  assert.ok(project);
+  const failProjection = async () => {
+    const messages = session.buildSessionProjection().messages.filter((message) => message.role !== "system")
+      .map((message) => message.role === "user" ? { ...message, content: "changed by another context hook" } : message);
+    assert.equal(await project({ type: "context", messages }, current.ctx), undefined);
+  };
+  await failProjection();
+  await failProjection();
+  assert.equal(current.notifications.length, 1);
+  assert.deepEqual(current.notifications[0], { level: "warning",
+    message: "The active Codex checkpoint no longer matches the retained messages, so its opaque history is not replayed." });
+  sessionId = "second-session";
+  await failProjection();
+  assert.equal(current.notifications.length, 2);
+  append();
+  await failProjection();
+  await failProjection();
+  assert.equal(current.notifications.length, 3);
+  await mock.events.get("session_start")?.[0]?.({ type: "session_start" }, current.ctx);
+  await failProjection();
+  assert.equal(current.notifications.length, 4);
+});
+
+test("keeps projection failures silent without a UI or a compatible model identity", async () => {
+  const session = SessionManager.inMemory();
+  const message: AgentMessage = { role: "user", content: "kept", timestamp: 1 };
+  const firstKept = session.appendMessage(message);
+  const details = createCheckpointDetails({ identity: { ...capability, modelId: model.id },
+    replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }], keptMessages: [message] });
+  session.appendCompaction(fallbackSummary(details.checkpointId), firstKept, 100, details);
+  for (const overrides of [{ hasUI: false }, { model: { ...model, provider: "other" } }, { model: { ...model, id: "other" } }]) {
+    const mock = mockPi();
+    createCodexCompactionExtension()(mock.pi);
+    const current = await context({ sessionManager: session, ...overrides });
+    assert.equal(await mock.events.get("context")?.[0]?.({ type: "context", messages: [] }, current.ctx), undefined);
+    assert.deepEqual(current.notifications, []);
   }
 });

@@ -173,3 +173,31 @@ test("matches hook XML results checked against the actual upstream quick-xml par
   assert.deepEqual(await retain([{ role: "user", content: [hook, { type: "input_text", text: "ordinary" }] }]), [opaque]);
   assert.deepEqual(await retain([{ role: "user", content: [hook, { type: "input_image", file_id: "image" }] }]), [opaque]);
 });
+
+test("rounds image bytes upward to tokens at the retention boundary", async () => {
+  const image = { type: "input_image", image_url: "already estimated" };
+  const boundary = { role: "user", content: [image] };
+  for (const [bytes, tokens] of [[4, 1], [5, 2], [7_373, 1_844]]) {
+    for (const available of [tokens - 1, tokens]) {
+      const newest = user("x".repeat((RETAINED_MESSAGE_TOKEN_BUDGET - available) * 4));
+      const prepared = await prepareRetention([boundary, newest], new AbortController().signal, { images: { bytes: () => bytes } });
+      assert.deepEqual(buildReplacementHistory(prepared, opaque), available === tokens ? [boundary, newest, opaque] : [newest, opaque]);
+    }
+  }
+});
+
+test("clones and appends compaction items without validating or normalizing them", async () => {
+  const source = user("retained");
+  const prepared = await prepareRetention([source], new AbortController().signal);
+  for (const item of [
+    { type: "compaction_summary", encrypted_content: "opaque", metadata: { tag: "preserve" } },
+    { type: "compaction", encrypted_content: "", metadata: { tag: "validation belongs upstream" } },
+  ]) {
+    const result = buildReplacementHistory(prepared, item);
+    assert.deepEqual(result, [source, item]);
+    assert.notEqual(result[0], source);
+    assert.notEqual(result[0].content, source.content);
+    assert.notEqual(result[1], item);
+    assert.notEqual(result[1].metadata, item.metadata);
+  }
+});

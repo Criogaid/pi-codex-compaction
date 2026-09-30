@@ -198,3 +198,53 @@ test("repairs only the selected checkpoint branch after navigating back", () => 
   assert.ok(active);
   assert.ok(projectCheckpointContext(session.buildSessionProjection().messages, active.details));
 });
+
+test("caches a fingerprint per immutable message object without conflating equal copies", () => {
+  let reads = 0;
+  const message: UserMessage = { role: "user", timestamp: 1, get content() { reads++; return "unchanged"; } };
+  const fingerprint = fingerprintMessage(message);
+  const firstReads = reads;
+  assert.ok(firstReads > 0);
+  assert.equal(fingerprintMessage(message), fingerprint);
+  assert.equal(reads, firstReads, "the same message is not serialized twice");
+  assert.equal(fingerprintMessage({ timestamp: 1, content: "unchanged", role: "user" }), fingerprint);
+  assert.notEqual(fingerprintMessage({ role: "user", content: "changed", timestamp: 1 }), fingerprint);
+  assert.notEqual(fingerprintMessage({ role: "user", content: "unchanged", timestamp: 2 }), fingerprint);
+});
+
+test("caches normalized legacy details by entry object across branch array snapshots", () => {
+  const { session, entryId } = legacySession("replacement");
+  const original = session.getEntry(entryId);
+  assert.ok(original?.type === "compaction");
+  let reads = 0;
+  const entry: CompactionEntry = { ...original, get details() { reads++; return original.details; } };
+  const entries = session.getBranch().map((item) => item.id === entryId ? entry : item);
+  const first = latestCheckpoint(entries);
+  assert.ok(first);
+  const firstReads = reads;
+  assert.ok(firstReads > 0);
+  const second = latestCheckpoint([...entries]);
+  assert.equal(second?.details, first.details);
+  assert.equal(reads, firstReads, "parsing and legacy normalization run only once per entry");
+  const copy = latestCheckpoint(entries.map((item) => item === entry ? { ...entry } : item));
+  assert.deepEqual(copy?.details, first.details);
+  assert.notEqual(copy?.details, first.details, "the cache is not keyed by persisted entry ID");
+});
+
+test("caches invalid compaction entries without reviving an older checkpoint", () => {
+  let reads = 0;
+  const details = checkpoint([]);
+  const valid: CompactionEntry = { type: "compaction", id: "valid", parentId: null,
+    timestamp: "2026-01-01T00:00:00.000Z", summary: fallbackSummary(details.checkpointId),
+    firstKeptEntryId: "kept", tokensBefore: 10, details };
+  const invalid: CompactionEntry = { ...valid, id: "invalid", parentId: valid.id,
+    get details() { reads++; return { kind: "invalid" }; } };
+  assert.equal(latestCheckpoint([valid, invalid]), undefined);
+  const firstReads = reads;
+  assert.ok(firstReads > 0);
+  assert.equal(latestCheckpoint([valid, invalid]), undefined);
+  assert.equal(reads, firstReads);
+  assert.equal(latestCheckpoint([valid])?.details.checkpointId, details.checkpointId);
+  const reloaded: CompactionEntry = { ...invalid, details };
+  assert.equal(latestCheckpoint([valid, reloaded])?.details.checkpointId, details.checkpointId);
+});

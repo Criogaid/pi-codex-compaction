@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { capableModel, deriveEndpoint, normalizeUrl } from "./capability.js";
+import { capableModel, deriveEndpoint, normalizeUrl, sameIdentity, sameModel } from "./capability.js";
 
 function model(overrides: Record<string, unknown> = {}): Model<Api> {
   return {
@@ -157,4 +157,17 @@ test("normalizes safe URLs and rejects ambiguous endpoint identities", () => {
   assert.equal(normalizeUrl("https://example.test/v1/"), "https://example.test/v1");
   assert.throws(() => normalizeUrl("https://user:pass@example.test/v1"), /credentials/);
   assert.throws(() => normalizeUrl("https://example.test/v1?route=a"), /query/);
+});
+
+test("compares provider, API and model ID independently of endpoint identity", () => {
+  const identity = { provider: "custom-codex", api: "openai-responses" as const, modelId: "fixture",
+    baseUrl: "https://configured.example/v1", endpoint: "https://configured.example/v1/responses" };
+  const prepared = { provider: identity.provider, api: identity.api, id: identity.modelId, baseUrl: "https://resolved.example/v1" };
+  assert.equal(sameModel(identity, prepared), true);
+  assert.equal(sameModel(identity, { ...prepared, provider: "other" }), false);
+  assert.equal(sameModel(identity, { ...prepared, api: "openai-codex-responses" }), false);
+  assert.equal(sameModel(identity, { ...prepared, id: "other" }), false);
+  assert.equal(sameIdentity(identity, { ...identity }), true);
+  assert.equal(sameIdentity(identity, { ...identity, baseUrl: prepared.baseUrl }), false);
+  assert.equal(sameIdentity(identity, { ...identity, endpoint: "https://configured.example/other" }), false);
 });

@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createAssistantMessageEventStream, type AssistantMessage, type Model, type Provider } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, type Model, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { mergeRemoteCompactionHeader, requestRemoteCompaction } from "./remote.js";
 import { testRegistry } from "./test-registry.test.js";
+import { isObject, type JsonObject } from "./protocol.js";
+import { prepareRetention } from "./retention-input.js";
+import { buildReplacementHistory } from "./retention.js";
 
 const provider = openaiProvider();
 const model: Model<"openai-responses"> = {
@@ -13,6 +16,8 @@ const model: Model<"openai-responses"> = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   compat: { supportsLongCacheRetention: true, ...{ remoteCompaction: { protocol: "v2" } } },
 };
+const originalImage = { type: "input_image", detail: "original",
+  image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" };
 function response() {
   const item = { type: "compaction", encrypted_content: "opaque" };
   return new Response([
@@ -132,7 +137,9 @@ test("accepts header-only auth and raw WebSocket events without requiring an HTT
 });
 
 for (const fault of ["endpoint", "method", "feature-header", "model"] as const) {
-  test(`rejects provider ${fault} substitution before sending a request`, async () => {
+  const title = fault === "feature-header" ? "accepts a provider request without the beta header"
+    : `rejects provider ${fault} substitution before sending a request`;
+  test(title, async () => {
     const faultyProvider: Provider<"openai-responses"> = {
       ...provider,
       streamSimple(preparedModel, transcript, options) {
@@ -157,9 +164,120 @@ for (const fault of ["endpoint", "method", "feature-header", "model"] as const) 
     };
     const registry = await testRegistry(faultyProvider);
     let sent = false;
-    await assert.rejects(requestRemoteCompaction({ ...request(registry),
+    const pending = requestRemoteCompaction({ ...request(registry), maxRetries: 0,
       fetch: async () => { sent = true; return response(); },
-    }));
-    assert.equal(sent, false);
+    });
+    if (fault === "feature-header") {
+      assert.equal((await pending).item.encrypted_content, "opaque");
+      assert.equal(sent, true);
+    } else {
+      // Pi's OpenAI adapter wraps fetch failures as connection errors.
+      await assert.rejects(pending, fault === "model" ? /unexpected model/ : /Connection error/);
+      assert.equal(sent, false);
+    }
   });
 }
+
+for (const [configured, retries] of [[undefined, 2], [0, 0], [1, 1], [2, 2], [9, 2]] as const) {
+  test(`caps provider retries at ${retries} when configured as ${configured}`, async () => {
+    let observed: SimpleStreamOptions | undefined;
+    const observedProvider: Provider<"openai-responses"> = { ...provider, streamSimple(preparedModel, transcript, options) {
+      observed = options;
+      return provider.streamSimple(preparedModel, transcript, options);
+    } };
+    const registry = await testRegistry(observedProvider);
+    let attempts = 0;
+    await assert.rejects(requestRemoteCompaction({ ...request(registry), maxRetries: configured, maxRetryDelayMs: 1,
+      fetch: async () => {
+        attempts++;
+        return new Response(JSON.stringify({ error: { message: "fixture unavailable" } }), {
+          status: 503, headers: { "content-type": "application/json", "retry-after-ms": "1" },
+        });
+      },
+    }), /fixture unavailable/);
+    assert.equal(observed?.maxRetries, retries);
+    assert.equal(observed?.maxRetryDelayMs, 1);
+    assert.equal(attempts, retries + 1);
+  });
+}
+
+function providerInput(input: readonly JsonObject[]): Provider<"openai-responses"> {
+  return { ...provider, streamSimple(preparedModel, transcript, options) {
+    return provider.streamSimple(preparedModel, transcript, { ...options, onPayload: (payload, currentModel) => {
+      assert.ok(isObject(payload));
+      return options?.onPayload?.({ ...payload, input }, currentModel);
+    } });
+  } };
+}
+
+test("returns trimmed promptInput and contextual flags matching the actual provider payload", async () => {
+  const hidden = { role: "user", content: [{ type: "input_text", text: "hidden" }] };
+  const visible = { role: "user", content: [{ type: "input_text", text: "visible" }] };
+  const notice = { role: "developer", content: [{ type: "input_text", text: "<image_resize_notice>resized</image_resize_notice>" }] };
+  const output = { type: "function_call_output", call_id: "call", output: "x".repeat(400) };
+  const input = [hidden, notice, visible, output, notice];
+  const saved = structuredClone(input);
+  const registry = await testRegistry(providerInput(input));
+  let sent: unknown;
+  const result = await requestRemoteCompaction({ ...request(registry), model: { ...model, contextWindow: 80 },
+    userItemOrigins: ["context", "user"],
+    fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
+  });
+  const expected = [hidden, notice, visible, { ...output, output: "Output exceeded the available model context and was truncated" }];
+  assert.deepEqual(result.promptInput, expected);
+  assert.ok(isObject(sent));
+  assert.deepEqual(sent.input, [...expected, { type: "compaction_trigger" }]);
+  assert.deepEqual(result.contextual, [true, false, false, false]);
+  const retention = await prepareRetention(result.promptInput, new AbortController().signal, result);
+  assert.deepEqual(buildReplacementHistory(retention, result.item), [visible, result.item]);
+  assert.deepEqual(input, saved);
+  assert.notEqual(result.promptInput[0], hidden);
+});
+
+test("awaits original image estimates before trimming and returns lookups usable after cloning", async () => {
+  const image = originalImage;
+  const output = { type: "custom_tool_call_output", call_id: "c", output: [image] };
+  const registry = await testRegistry(providerInput([output]));
+  let sent: unknown;
+  const result = await requestRemoteCompaction({ ...request(registry), model: { ...model, contextWindow: 10 },
+    fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
+  });
+  assert.equal(result.images.bytes(structuredClone(image)), 4);
+  assert.deepEqual(result.promptInput, [output], "the original image fits when measured as one patch");
+  assert.ok(isObject(sent));
+  assert.deepEqual(sent.input, [output, { type: "compaction_trigger" }]);
+  assert.deepEqual(result.contextual, [false]);
+});
+
+test("estimates prior checkpoint images and trims expanded history before the trigger", async () => {
+  const marker = "checkpoint marker";
+  const image = originalImage;
+  const output = { type: "function_call_output", output: [{ type: "input_text", text: "x".repeat(800) }, image] };
+  const opaque = { type: "compaction", encrypted_content: "prior" };
+  const registry = await testRegistry(provider);
+  let sent: unknown;
+  const result = await requestRemoteCompaction({ ...request(registry), model: { ...model, contextWindow: 100 },
+    context: { messages: [{ role: "user", content: marker, timestamp: 1 }] },
+    priorCheckpoint: { identity: { provider: model.provider, api: model.api, modelId: model.id,
+      baseUrl: model.baseUrl, endpoint: `${model.baseUrl}/responses` },
+      marker, replacementHistory: [opaque, output] },
+    fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
+  });
+  assert.deepEqual(result.promptInput, [opaque, { ...output, output: "Output exceeded the available model context and was truncated" }]);
+  assert.equal(result.images.bytes(image), 4);
+  assert.ok(isObject(sent));
+  assert.deepEqual(sent.input, [...result.promptInput, { type: "compaction_trigger" }]);
+  assert.deepEqual(result.contextual, [false, false]);
+});
+
+test("falls back to text classification when provider user counts differ from Pi origins", async () => {
+  const hidden = { role: "user", content: [{ type: "input_text", text: "hidden without a marker" }] };
+  const marked = { role: "user", content: [{ type: "input_text", text: "<environment_context>injected</environment_context>" }] };
+  const registry = await testRegistry(providerInput([hidden, marked]));
+  const result = await requestRemoteCompaction({ ...request(registry), userItemOrigins: ["context"],
+    fetch: async () => response(),
+  });
+  assert.deepEqual(result.contextual, [false, false]);
+  const prepared = await prepareRetention(result.promptInput, new AbortController().signal, result);
+  assert.deepEqual(buildReplacementHistory(prepared, result.item), [hidden, result.item]);
+});

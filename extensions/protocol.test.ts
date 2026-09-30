@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendCompactionTrigger, createCompactionCollector, prepareRemoteCompactionPayload, rewriteCheckpointMarker } from "./protocol.js";
+import { appendCompactionTrigger, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker } from "./protocol.js";
 
 const item = { type: "compaction", encrypted_content: "opaque" };
 const done = { type: "response.output_item.done", item };
@@ -61,4 +61,53 @@ test("replays one marker and appends one final trigger", () => {
   assert.equal(payload.input.length, 2);
   assert.throws(() => rewriteCheckpointMarker({ input: [] }, marker, replacement), /0 checkpoint markers/);
   assert.throws(() => appendCompactionTrigger({ input: [{ type: "compaction_trigger" }] }), /already contains/);
+});
+
+test("recognizes non-null objects while rejecting arrays and primitives", () => {
+  for (const value of [undefined, null, [], ["item"], "text", 1, false, () => ({})]) {
+    assert.equal(isObject(value), false);
+  }
+  assert.equal(isObject({}), true);
+  assert.equal(isObject({ input: [] }), true);
+});
+
+test("adapts expanded checkpoint history before appending the final trigger", () => {
+  const replacement = [{ type: "compaction", encrypted_content: "prior" }];
+  const later = { role: "user", content: [{ type: "input_text", text: "later" }] };
+  const payload = { model: "gpt", instructions: "original", input: [
+    { role: "user", content: [{ type: "input_text", text: "marker" }] }, later,
+  ] };
+  const saved = structuredClone(payload);
+  let adaptations = 0;
+  const prepared = prepareRemoteCompactionPayload(payload, { marker: "marker", replacementHistory: replacement }, (history) => {
+    adaptations++;
+    assert.deepEqual(history.input, [...replacement, later]);
+    assert.equal(history.instructions, "original");
+    return { ...history, instructions: "adapted", input: [later] };
+  });
+  assert.equal(adaptations, 1);
+  assert.deepEqual(prepared, { model: "gpt", instructions: "adapted", input: [later, { type: "compaction_trigger" }] });
+  assert.deepEqual(payload, saved);
+  assert.deepEqual(replacement, [{ type: "compaction", encrypted_content: "prior" }]);
+});
+
+test("adapts history without a checkpoint and validates the resulting trigger sequence", () => {
+  const payload = { model: "gpt", input: [] };
+  let adaptations = 0;
+  assert.deepEqual(prepareRemoteCompactionPayload(payload, undefined, (history) => {
+    adaptations++;
+    assert.deepEqual(history, payload);
+    return { ...history, instructions: "adapted" };
+  }), { ...payload, instructions: "adapted", input: [{ type: "compaction_trigger" }] });
+  assert.equal(adaptations, 1);
+  assert.throws(() => prepareRemoteCompactionPayload(payload, undefined, () => ({ input: [{ type: "compaction_trigger" }] })), /already contains/);
+  assert.throws(() => prepareRemoteCompactionPayload(payload, undefined, () => ({ input: "invalid" })), /missing an input array/);
+});
+
+test("does not adapt malformed payloads or failed marker substitutions", () => {
+  const adapt = () => assert.fail("invalid history must not reach the adapter");
+  assert.throws(() => prepareRemoteCompactionPayload(null, undefined, adapt), /missing an input array/);
+  assert.throws(() => prepareRemoteCompactionPayload({ input: [] }, { marker: "missing", replacementHistory: [] }, adapt), /0 checkpoint markers/);
+  const reason = new Error("adaptation failed");
+  assert.throws(() => prepareRemoteCompactionPayload({ input: [] }, undefined, () => { throw reason; }), (error) => error === reason);
 });
