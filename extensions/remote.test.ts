@@ -4,7 +4,7 @@ import {
   type Context,
   createAssistantMessageEventStream,
   type Model,
-  type OpenAICodexResponsesOptions,
+  type SimpleStreamOptions,
   type Provider,
 } from "@earendil-works/pi-ai";
 import { mergeRemoteCompactionHeader, requestRemoteCompaction } from "./remote.js";
@@ -44,7 +44,7 @@ const fetchSse = (async () => responseSse()) as unknown as typeof globalThis.fet
 function fakeProvider(
   observe: (
     payload: unknown,
-    options: OpenAICodexResponsesOptions,
+    options: SimpleStreamOptions,
     requestModel: Model<"openai-codex-responses" | "openai-responses">,
   ) => void,
   inputText = "current",
@@ -61,7 +61,7 @@ function fakeProvider(
     baseUrl: model.baseUrl,
     auth: {} as Provider["auth"],
     getModels: () => [model],
-    stream(_model, _context, options) {
+    streamSimple(_model, _context, options) {
       const stream = createAssistantMessageEventStream();
       void (async () => {
         try {
@@ -74,7 +74,7 @@ function fakeProvider(
           );
           observe(
             payload,
-            options as OpenAICodexResponsesOptions,
+            options as SimpleStreamOptions,
             _model as Model<"openai-codex-responses" | "openai-responses">,
           );
           const response = await options?.fetch?.(requestEndpoint, {
@@ -112,7 +112,7 @@ function fakeProvider(
       })();
       return stream;
     },
-    streamSimple() {
+    stream() {
       throw new Error("not used");
     },
   };
@@ -130,7 +130,9 @@ test("uses a custom provider endpoint and validates request parameters", async (
   const provider = fakeProvider((payload, options) => {
     sent = payload;
     assert.equal(options.transport, "sse");
-    assert.equal(options.cacheRetention, "none");
+    assert.equal(options.cacheRetention, undefined);
+    assert.equal(options.reasoning, "high");
+    assert.equal(options.sessionId, "session");
     assert.equal(options.timeoutMs, 300_000);
     assert.equal(options.maxRetries, 2);
     assert.match(options.headers?.["x-codex-beta-features"] ?? "", /remote_compaction_v2/);
@@ -140,6 +142,8 @@ test("uses a custom provider endpoint and validates request parameters", async (
     model,
     context: { messages: [] } satisfies Context,
     endpoint,
+    reasoning: "high",
+    sessionId: "session",
     apiKey: "gateway-key",
     headers: { "x-codex-beta-features": "existing" },
     signal: new AbortController().signal,
@@ -174,6 +178,8 @@ test("uses the final endpoint as the OpenAI Responses transport base URL", async
       model: responsesModel,
       context: { messages: [] },
       endpoint: requestEndpoint,
+      reasoning: "high",
+      sessionId: "session",
       apiKey: "key",
       signal: new AbortController().signal,
       fetch: fetchSse,
@@ -192,6 +198,8 @@ test("expands the previous checkpoint for repeated compaction", async () => {
     model,
     context: { messages: [] },
     endpoint,
+    reasoning: "high",
+    sessionId: "session",
     apiKey: "key",
     signal: new AbortController().signal,
     priorCheckpoint: {
@@ -212,6 +220,8 @@ test("rejects endpoint substitution and falls through as an error", async () => 
       model,
       context: { messages: [] },
       endpoint,
+      reasoning: "high",
+      sessionId: "session",
       apiKey: "key",
       signal: new AbortController().signal,
       fetch: fetchSse,
@@ -233,6 +243,8 @@ test("rejects method, feature header, and model identity substitutions", async (
         model,
         context: { messages: [] },
         endpoint,
+        reasoning: "high",
+        sessionId: "session",
         apiKey: "key",
         signal: new AbortController().signal,
         fetch: fetchSse,

@@ -1,4 +1,14 @@
-import type { Context, Model, Provider, Usage } from "@earendil-works/pi-ai";
+// Own the V2 transport; Pi's simple provider adapter resolves thinking and cache options.
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+  normalizeContext,
+  type Context,
+  type Model,
+  type Provider,
+  type ProviderEnv,
+  type ProviderHeaders,
+  type Usage,
+} from "@earendil-works/pi-ai";
 import {
   CodexCompactionProtocolError,
   type CollectedCompaction,
@@ -24,9 +34,11 @@ export interface RemoteCompactionRequest {
   model: Model<RemoteCompactionApi>;
   context: Context;
   endpoint: string;
+  reasoning: ThinkingLevel;
+  sessionId: string;
   apiKey?: string;
-  headers?: Record<string, string>;
-  env?: Record<string, string>;
+  headers?: ProviderHeaders;
+  env?: ProviderEnv;
   signal: AbortSignal;
   priorCheckpoint?: PriorCheckpointPayload;
   requestTimeoutMs?: number;
@@ -58,14 +70,14 @@ function abortError(): DOMException {
 }
 
 export function mergeRemoteCompactionHeader(
-  headers: Record<string, string> | undefined,
-): Record<string, string> {
+  headers: ProviderHeaders | undefined,
+): ProviderHeaders {
   const merged = { ...headers };
   const existingKey = Object.keys(merged).find(
     (key) => key.toLowerCase() === "x-codex-beta-features",
   );
   const features = new Set(
-    (existingKey ? merged[existingKey] : "")
+    ((existingKey ? merged[existingKey] : "") ?? "")
       .split(",")
       .map((feature) => feature.trim())
       .filter(Boolean),
@@ -155,13 +167,14 @@ export async function requestRemoteCompaction(
     });
   }) as typeof globalThis.fetch;
 
-  const stream = request.provider.stream(providerModel, request.context, {
+  const stream = request.provider.streamSimple(providerModel, normalizeContext(request.context), {
     apiKey: request.apiKey,
     headers: mergeRemoteCompactionHeader(request.headers),
     env: request.env,
     signal: request.signal,
     transport: "sse",
-    cacheRetention: "none",
+    reasoning: request.reasoning === "off" ? undefined : request.reasoning,
+    sessionId: request.sessionId,
     timeoutMs: request.requestTimeoutMs ?? 5 * 60 * 1000,
     maxRetries: request.maxRetries ?? 2,
     fetch: inspectedFetch,

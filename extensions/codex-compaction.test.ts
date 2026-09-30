@@ -4,7 +4,9 @@ import {
   createAssistantMessageEventStream,
   type Model,
   type Provider,
+  type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { SessionBeforeCompactEvent, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { parseCheckpointDetails } from "./checkpoint.js";
 import { createCodexCompactionExtension } from "./codex-compaction.js";
@@ -44,7 +46,7 @@ const usage = {
 
 type Handler = (...args: any[]) => unknown;
 
-function mockPi() {
+function mockPi(thinkingLevel: ThinkingLevel = "high") {
   const events = new Map<string, Handler[]>();
   const appendedEntries: Array<{ customType: string; data: unknown }> = [];
   const entryRenderers = new Map<string, Handler>();
@@ -58,20 +60,22 @@ function mockPi() {
     appendEntry(customType: string, data: unknown) {
       appendedEntries.push({ customType, data });
     },
+    getThinkingLevel: () => thinkingLevel,
     getActiveTools: () => [],
     getAllTools: () => [],
   };
   return { pi: pi as never, events, appendedEntries, entryRenderers };
 }
 
-function fakeProvider(): Provider {
+function fakeProvider(observe?: (options: SimpleStreamOptions | undefined) => void): Provider {
   return {
     id: capability.provider,
     name: "Custom Codex",
     baseUrl: capability.baseUrl,
     auth: {} as Provider["auth"],
     getModels: () => [model],
-    stream(_model, context, options) {
+    streamSimple(_model, context, options) {
+      observe?.(options);
       const stream = createAssistantMessageEventStream();
       void (async () => {
         try {
@@ -116,7 +120,7 @@ function fakeProvider(): Provider {
       })();
       return stream;
     },
-    streamSimple() {
+    stream() {
       throw new Error("not used");
     },
   };
@@ -397,4 +401,27 @@ test("unsupported and unconfigured models use Pi compaction silently", async () 
   const unconfigured = context({ model: { ...model, compat: undefined } });
   assert.equal(await compact?.(compactEvent(), unconfigured.ctx), undefined);
   assert.deepEqual(unconfigured.notifications, []);
+});
+
+test("inherits the runtime thinking level and active session for every compaction", async () => {
+  for (const thinkingLevel of ["off", "high", "max"] as const) {
+    const { pi, events } = mockPi(thinkingLevel);
+    let observed = false;
+    const provider = fakeProvider((options) => {
+      observed = true;
+      assert.equal(options?.reasoning, thinkingLevel === "off" ? undefined : thinkingLevel);
+      assert.equal(options?.sessionId, "session");
+      assert.equal(options?.cacheRetention, undefined);
+    });
+    createCodexCompactionExtension({ fetch: fetchSse })(pi);
+    const fixture = context({
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fixture-key" }),
+        getProvider: () => provider,
+      },
+    });
+    const result = await events.get("session_before_compact")?.[0]?.(compactEvent(), fixture.ctx);
+    assert.ok(result && observed);
+    assert.deepEqual(fixture.notifications.filter((notice) => notice.level === "warning"), []);
+  }
 });

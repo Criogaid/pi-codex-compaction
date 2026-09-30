@@ -7,8 +7,10 @@
 
 ## 安装
 
+This fork requires Pi 0.99.1 or newer. Run the following command from the cloned repository root to load the maintained package. The npm package under `@oipsanthony` contains the upstream implementation.
+
 ```bash
-pi install npm:@oipsanthony/pi-codex-compaction
+pi install ./packages/pi-codex-compaction
 ```
 
 ## 使用
@@ -16,6 +18,14 @@ pi install npm:@oipsanthony/pi-codex-compaction
 安装后无需配置。使用 Pi 官方 `openai-codex` 模型时，手动执行 `/compact` 或触发 Pi 自动压缩，扩展会优先尝试 remote compaction。
 
 压缩开始和完成时会显示提示。remote compaction 失败时，扩展会显示 warning，并由 Pi 继续执行原生 compaction。切换到不支持的模型时，Pi 直接使用原生 compaction。
+
+### Runtime parameters
+
+Remote compaction captures the active session ID and current thinking level when it starts. It uses Pi's `streamSimple()` adapter to apply the selected model's thinking-level mapping, including `off`.
+
+Cache options use the same provider defaults and resolved `PI_CACHE_RETENTION` environment as normal requests. The extension passes the active session ID for cache keys and routing instead of forcing `cacheRetention: "none"`. Model sampling parameters, resolved authentication, and provider headers remain owned by Pi.
+
+Tests compare ordinary and compaction requests through the real Pi Responses adapters using simulated HTTP responses. Matching parameters do not guarantee a cache hit or a billing reduction; those depend on the backend and request prefix.
 
 ## 自定义 Provider
 
@@ -65,3 +75,15 @@ pi install npm:@oipsanthony/pi-codex-compaction
 切换 Provider、API、模型、`baseUrl` 或 endpoint 后，已有 checkpoint 不会重放。近期未压缩消息仍可继续使用，但 opaque 历史不会转换为文本摘要。
 
 实现基于 `@narumitw/pi-codex-compact`，许可证与 attribution 见 [LICENSE](LICENSE)。
+
+## Verification
+
+From the repository root, run these npm scripts with Node 24 or newer:
+
+```bash
+npm run test --workspace @oipsanthony/pi-codex-compaction
+npm run typecheck --workspace @oipsanthony/pi-codex-compaction
+npm run pack:check
+```
+
+The test script compiles TypeScript into the ignored `dist/` directory and runs Node's test runner. It does not invoke Bun. Other upstream packages retain their existing test runtimes.

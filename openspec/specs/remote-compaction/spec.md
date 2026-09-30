@@ -53,6 +53,22 @@
 - **WHEN** Provider 生成的 payload 已含 `compaction_trigger`
 - **THEN** 系统拒绝重复 trigger，不发送未经验证的远程压缩请求
 
+### Requirement: Runtime thinking and cache inheritance
+The extension SHALL capture the active Pi session ID and current thinking level before resolving authentication. It SHALL use the selected provider's simple stream adapter so Pi owns thinking-level mapping and provider cache defaults. It SHALL pass the resolved provider environment and SHALL NOT force caching off.
+
+#### Scenario: Runtime thinking differs from the default
+- **WHEN** compaction starts with a thinking level changed during the session
+- **THEN** the compaction request uses the current level through the same adapter mapping as an ordinary request, including disabled thinking
+
+#### Scenario: Provider uses session caching
+- **WHEN** an ordinary request uses provider cache defaults or `PI_CACHE_RETENTION`
+- **THEN** compaction uses the same session ID and resolved environment for cache keys, retention, and routing
+
+#### Scenario: Provider maps a thinking level
+- **WHEN** the model maps a Pi thinking level to a provider effort value
+- **THEN** the provider adapter applies that mapping; the extension does not serialize effort values itself
+
+
 ### Requirement: Remote response validation
 系统 SHALL 仅接受完整 SSE 流中带有 `response.completed` 且恰好包含一个有效 `compaction` item 的响应。该 item MUST 包含非空 `encrypted_content`，并满足流和单 item 的大小限制。
 

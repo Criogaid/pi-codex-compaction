@@ -143,6 +143,7 @@ async function compactRemotely(
   const supported = supportedIdentity(ctx.model);
   if (!supported) return undefined;
   const sessionId = ctx.sessionManager.getSessionId();
+  const reasoning = pi.getThinkingLevel();
   ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction...");
   try {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(supported.model);
@@ -172,6 +173,8 @@ async function compactRemotely(
       model: supported.model,
       context,
       endpoint: supported.identity.endpoint,
+      reasoning,
+      sessionId,
       apiKey: auth.apiKey,
       headers: auth.headers,
       env: auth.env,
