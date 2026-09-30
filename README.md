@@ -86,6 +86,10 @@ Opaque 项追加在保留消息之后，不占上述预算；旧 `compaction_sum
 
 Checkpoint identity uses the resolved endpoint. A changed authentication endpoint rejects replay before opaque history is sent. 扩展不再对响应事件、opaque 项或保留历史施加额外的序列化字节上限；历史选择使用官方 token 预算。Pi 负责传输，扩展继续传递取消信号，并使用 [remote.ts](extensions/remote.ts) 的请求超时和重试设置。事件收集器只保存当前压缩项，不积累完整事件流。
 
+[checkpoint.ts](extensions/checkpoint.ts) 使用 Pi 的 `buildSessionProjection()` 生成保留消息指纹，应用消息编辑和隐藏规则，忽略旧压缩记录，并按 `context` 事件约定排除 system 消息。
+
+加载旧检查点时，扩展先按检查点创建时的分支验证旧算法生成的指纹，确认匹配后在内存中修正为标准投影的指纹。此过程不改写会话文件，也不改变 checkpoint 格式。原始记录缺失或旧指纹不匹配时不执行修正；检查点创建之后的消息编辑仍受重放校验约束。
+
 实现基于 `@narumitw/pi-codex-compact`，许可证与 attribution 见 [LICENSE](LICENSE)。
 
 ## Verification

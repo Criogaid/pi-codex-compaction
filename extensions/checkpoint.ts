@@ -1,7 +1,14 @@
 // Own the versioned checkpoint format, endpoint binding, and exact Pi session projection.
+// Normalize legacy fingerprints from their creation-time branch without rewriting session entries.
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
+  buildSessionProjection,
+  sessionEntryToContextMessages,
+  type CompactionEntry,
+  type ProjectedSessionEntry,
+  type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { type JsonObject, REMOTE_COMPACTION_PROTOCOL, validateCompactionItem } from "./protocol.js";
 import {
   CODEX_API,
@@ -116,6 +123,43 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
   }
 }
 
+function retainedEntries(
+  branchEntries: readonly SessionEntry[],
+  leafId: string | null,
+  firstKeptEntryId: string,
+): ProjectedSessionEntry[] | undefined {
+  const projection = buildSessionProjection([...branchEntries], leafId);
+  const keptIndex = projection.entries.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId);
+  return keptIndex < 0 ? undefined : projection.entries.slice(keptIndex);
+}
+
+function conversationMessages(entries: readonly ProjectedSessionEntry[]): AgentMessage[] {
+  // Pi's context hook excludes system messages; appendCompaction snapshots them separately.
+  return entries.flatMap((entry) => entry.messages).filter((message) => message.role !== "system");
+}
+
+export function keptMessages(branchEntries: readonly SessionEntry[], firstKeptEntryId: string): AgentMessage[] {
+  const retained = retainedEntries(branchEntries, branchEntries.at(-1)?.id ?? null, firstKeptEntryId);
+  if (!retained) throw new Error("Pi compaction cut point is not present in the active context");
+  return conversationMessages(retained);
+}
+
+function normalizeLegacyFingerprints(
+  entries: readonly SessionEntry[],
+  entry: CompactionEntry,
+  details: CodexCheckpointDetails,
+): CodexCheckpointDetails {
+  // Match the old writer at the checkpoint's parent, never against later context edits.
+  const retained = retainedEntries(entries, entry.parentId, entry.firstKeptEntryId);
+  if (!retained) return details;
+  const legacyMessages = retained.flatMap((item) => sessionEntryToContextMessages(item.sourceEntry));
+  if (legacyMessages.length !== details.keptMessageFingerprints.length ||
+    legacyMessages.some((message, index) => fingerprintMessage(message) !== details.keptMessageFingerprints[index])) {
+    return details;
+  }
+  return { ...details, keptMessageFingerprints: conversationMessages(retained).map(fingerprintMessage) };
+}
+
 export function latestCheckpoint(
   entries: readonly SessionEntry[],
 ): { entry: CompactionEntry<CodexCheckpointDetails>; details: CodexCheckpointDetails } | undefined {
@@ -124,7 +168,7 @@ export function latestCheckpoint(
     if (entry.type !== "compaction") continue;
     const details = parseCheckpointDetails(entry.details);
     return details
-      ? { entry: entry as CompactionEntry<CodexCheckpointDetails>, details }
+      ? { entry: entry as CompactionEntry<CodexCheckpointDetails>, details: normalizeLegacyFingerprints(entries, entry, details) }
       : undefined;
   }
   return undefined;

@@ -7,8 +7,14 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { SessionBeforeCompactEvent, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { parseCheckpointDetails } from "./checkpoint.js";
+import {
+  SessionManager,
+  type ContextEventResult,
+  type SessionBeforeCompactEvent,
+  type SessionBeforeCompactResult,
+  type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
+import { checkpointMarker, createCheckpointDetails, fallbackSummary, parseCheckpointDetails } from "./checkpoint.js";
 import { createCodexCompactionExtension } from "./codex-compaction.js";
 import { testRegistry } from "./test-registry.test.js";
 
@@ -207,6 +213,98 @@ function sseResponse() {
 }
 
 const fetchSse = (async () => sseResponse()) as unknown as typeof globalThis.fetch;
+
+async function compactSession(
+  mock: ReturnType<typeof mockPi>,
+  sessionManager: SessionManager,
+  firstKeptEntryId: string,
+  current: Awaited<ReturnType<typeof context>>,
+) {
+  const event = compactEvent();
+  event.branchEntries = sessionManager.getBranch();
+  event.preparation.firstKeptEntryId = firstKeptEntryId;
+  // The mock event bus erases Pi's event/result pairing.
+  const result = await mock.events.get("session_before_compact")?.[0]?.(event, current.ctx) as SessionBeforeCompactResult | undefined;
+  assert.ok(result?.compaction, "remote compaction must succeed");
+  const { summary, tokensBefore, details, usage: compactionUsage } = result.compaction;
+  sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, true, compactionUsage);
+  const checkpoint = parseCheckpointDetails(details);
+  assert.ok(checkpoint);
+  return checkpoint;
+}
+
+async function assertSessionReplay(
+  mock: ReturnType<typeof mockPi>,
+  sessionManager: SessionManager,
+  current: Awaited<ReturnType<typeof context>>,
+  details: NonNullable<ReturnType<typeof parseCheckpointDetails>>,
+) {
+  const messages = sessionManager.buildSessionProjection().messages.filter((message) => message.role !== "system");
+  const projected = await mock.events.get("context")?.[0]?.({ type: "context", messages }, current.ctx) as ContextEventResult | undefined;
+  assert.ok(projected?.messages, "checkpoint must replay through Pi's canonical context");
+  assert.equal(projected.messages.length, 1, "retained messages must be replaced exactly once");
+  const marker = checkpointMarker(details.checkpointId);
+  const markerMessage = projected.messages[0];
+  assert.ok(markerMessage.role === "user");
+  assert.deepEqual(markerMessage.content, [{ type: "text", text: marker }]);
+  const rewritten = await mock.events.get("before_provider_request")?.[0]?.({
+    type: "before_provider_request",
+    payload: { model: model.id, input: [{ role: "user", content: [{ type: "input_text", text: marker }] }] },
+  }, current.ctx);
+  assert.deepEqual(rewritten, { model: model.id, input: details.replacementHistory });
+}
+
+for (const scenario of ["replacement", "omission", "older checkpoints", "system update"] as const) {
+  test(`replays newly created checkpoints with ${scenario} in Pi's retained context`, async () => {
+    const mock = mockPi();
+    createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+    const sessionManager = SessionManager.inMemory();
+    sessionManager.appendMessage({ role: "user", content: "older", timestamp: 0 });
+    const firstKeptEntryId = sessionManager.appendMessage({ role: "user", content: "kept start", timestamp: 1 });
+    const targetId = sessionManager.appendMessage({ role: "user", content: "kept end", timestamp: 2 });
+    if (scenario === "replacement") sessionManager.appendContextEdit(targetId, { content: "edited end" });
+    if (scenario === "omission") sessionManager.appendContextEdit(targetId, null);
+    if (scenario === "older checkpoints") {
+      sessionManager.appendCompaction("first summary", firstKeptEntryId, 100);
+      sessionManager.appendMessage({ role: "user", content: "between compactions", timestamp: 3 });
+      sessionManager.appendCompaction("second summary", firstKeptEntryId, 100);
+    }
+    if (scenario === "system update") {
+      sessionManager.appendMessage({ role: "system", content: "updated instructions", timestamp: 3 });
+    }
+    const current = await context({ sessionManager });
+    const details = await compactSession(mock, sessionManager, firstKeptEntryId, current);
+    await assertSessionReplay(mock, sessionManager, current, details);
+    assert.deepEqual(current.notifications.filter((notice) => notice.level === "warning"), []);
+  });
+}
+
+test("replays and recompacts legacy checkpoints through Pi lifecycle hooks", async () => {
+  const mock = mockPi();
+  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  const sessionManager = SessionManager.inMemory();
+  sessionManager.appendMessage({ role: "user", content: "older", timestamp: 0 });
+  const original = { role: "user" as const, content: "original retained message", timestamp: 1 };
+  const firstKeptEntryId = sessionManager.appendMessage(original);
+  sessionManager.appendContextEdit(firstKeptEntryId, { content: "edited retained message" });
+  const legacy = createCheckpointDetails({
+    identity: { ...capability, modelId: model.id },
+    replacementHistory: [
+      { role: "user", content: [{ type: "input_text", text: "edited retained message" }] },
+      { type: "compaction", encrypted_content: "legacy opaque" },
+    ],
+    keptMessages: [original],
+  });
+  const legacyEntryId = sessionManager.appendCompaction(fallbackSummary(legacy.checkpointId), firstKeptEntryId, 100, legacy);
+  const savedLegacyEntry = structuredClone(sessionManager.getEntry(legacyEntryId));
+  const current = await context({ sessionManager });
+  await assertSessionReplay(mock, sessionManager, current, legacy);
+  const next = await compactSession(mock, sessionManager, firstKeptEntryId, current);
+  assert.notEqual(next.checkpointId, legacy.checkpointId);
+  await assertSessionReplay(mock, sessionManager, current, next);
+  assert.deepEqual(sessionManager.getEntry(legacyEntryId), savedLegacyEntry);
+  assert.deepEqual(current.notifications.filter((notice) => notice.level === "warning"), []);
+});
 
 test("does not notify when a session starts", async () => {
   const mock = mockPi();

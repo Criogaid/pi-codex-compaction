@@ -3,13 +3,11 @@ import { prepareRetention } from "./retention-input.js";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Context, Tool } from "@earendil-works/pi-ai";
 import {
-  buildContextEntries,
   buildSessionContext,
   convertToLlm,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
-  sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { buildReplacementHistory } from "./retention.js";
@@ -24,6 +22,7 @@ import {
   checkpointMarker,
   createCheckpointDetails,
   fallbackSummary,
+  keptMessages,
   latestCheckpoint,
   parseCheckpointDetails,
   projectCheckpointContext,
@@ -57,18 +56,6 @@ async function compatibleIdentity(
   if (!auth.ok) return undefined;
   const supported = capableModel(model, auth.baseUrl);
   return supported && sameIdentity(details, supported.identity) ? supported : undefined;
-}
-
-function keptMessages(event: SessionBeforeCompactEvent): AgentMessage[] {
-  const leafId = event.branchEntries.at(-1)?.id ?? null;
-  const contextEntries = buildContextEntries(event.branchEntries, leafId);
-  const keptIndex = contextEntries.findIndex(
-    (entry) => entry.id === event.preparation.firstKeptEntryId,
-  );
-  if (keptIndex < 0) {
-    throw new Error("Pi compaction cut point is not present in the active context");
-  }
-  return contextEntries.slice(keptIndex).flatMap(sessionEntryToContextMessages);
 }
 
 function activeTools(pi: ExtensionAPI): Tool[] {
@@ -159,7 +146,7 @@ async function compactRemotely(
     const details = createCheckpointDetails({
       identity: response.identity,
       replacementHistory,
-      keptMessages: keptMessages(event),
+      keptMessages: keptMessages(event.branchEntries, event.preparation.firstKeptEntryId),
     });
     return {
       compaction: {
