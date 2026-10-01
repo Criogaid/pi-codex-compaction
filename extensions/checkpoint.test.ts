@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { UserMessage } from "@earendil-works/pi-ai";
+import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import {
   SessionManager,
+  buildSessionProjection,
   sessionEntryToContextMessages,
   type CompactionEntry,
   type SessionEntry,
@@ -13,6 +14,7 @@ import {
   createCheckpointDetails,
   fallbackSummary,
   fingerprintMessage,
+  keptMessages,
   latestCheckpoint,
   parseCheckpointDetails,
   projectCheckpointContext,
@@ -247,4 +249,79 @@ test("caches invalid compaction entries without reviving an older checkpoint", (
   assert.equal(latestCheckpoint([valid])?.details.checkpointId, details.checkpointId);
   const reloaded: CompactionEntry = { ...invalid, details };
   assert.equal(latestCheckpoint([valid, reloaded])?.details.checkpointId, details.checkpointId);
+});
+
+function localizedToolMessage(): ToolResultMessage {
+  return { role: "toolResult", toolCallId: "call", toolName: "fixture",
+    content: [{ type: "text", text: "original output" }],
+    details: { z: 1, ä: 2, Case: 3, case: 4 }, isError: false, timestamp: 2 };
+}
+
+test("new checkpoints replay unchanged across default collation changes", (t) => {
+  let compare = new Intl.Collator("en-US").compare;
+  t.mock.method(String.prototype, "localeCompare", function(this: string, other: string) { return compare(String(this), other); });
+  const session = SessionManager.inMemory();
+  const firstKept = session.appendMessage(localizedToolMessage());
+  const details = checkpoint(keptMessages(session.getBranch(), firstKept));
+  session.appendCompaction(fallbackSummary(details.checkpointId), firstKept, 100, details);
+  const saved = JSON.stringify(session.getBranch());
+  compare = new Intl.Collator("sv-SE").compare;
+  const entries: SessionEntry[] = JSON.parse(saved);
+  const restored = latestCheckpoint(entries);
+  assert.ok(restored);
+  assert.ok(projectCheckpointContext(buildSessionProjection(entries).messages, restored.details));
+  assert.equal(fingerprintMessage(localizedToolMessage()), details.keptMessageFingerprints[0]);
+  assert.equal(JSON.stringify(entries), saved);
+});
+
+// Golden hashes produced by the locale-sorted v1 writer, including its raw-entry predecessor.
+const localeFingerprints = [
+  { locale: "en-US", original: "f4805842843b412c0530ed203b067c63e8a91e805e48001db7f465638def5d1f",
+    edited: "13ad52f731c97891aeac5e7113dcfdd24b2da7806872f8caa8e12ad9a5c6fee5" },
+  { locale: "sv-SE", original: "f431c01890641c90d21522b23c5a1993911c94c4257a5d181debe0481060e47c",
+    edited: "6bb925063d760fd715f71378f4fb9b4a267d0dbb2a7ff2ad7614ee6ede138723" },
+];
+
+for (const fixture of localeFingerprints) {
+  for (const shape of ["canonical", "raw"] as const) {
+    for (const editedAfterCheckpoint of [false, true]) {
+      test(`loads ${fixture.locale} ${shape} legacy hashes and ${editedAfterCheckpoint ? "rejects later edits" : "preserves replay"}`, (t) => {
+        const compare = new Intl.Collator(fixture.locale).compare;
+        t.mock.method(String.prototype, "localeCompare", function(this: string, other: string) { return compare(String(this), other); });
+        const session = SessionManager.inMemory();
+        const targetId = session.appendMessage(localizedToolMessage());
+        session.appendContextEdit(targetId, { content: [{ type: "text", text: "edited output" }] });
+        const details = checkpoint(keptMessages(session.getBranch(), targetId));
+        details.keptMessageFingerprints = [shape === "raw" ? fixture.original : fixture.edited];
+        session.appendCompaction(fallbackSummary(details.checkpointId), targetId, 100, details);
+        if (editedAfterCheckpoint) {
+          session.appendContextEdit(targetId, { content: [{ type: "text", text: "original output" }] });
+        }
+        const saved = structuredClone(session.getEntries());
+        const active = latestCheckpoint(session.getBranch());
+        assert.ok(active);
+        assert.notEqual(active.details.keptMessageFingerprints[0], fixture.edited, "normalize to locale-independent hashes");
+        const projected = projectCheckpointContext(session.buildSessionProjection().messages, active.details);
+        assert.equal(projected !== undefined, !editedAfterCheckpoint);
+        assert.deepEqual(session.getEntries(), saved);
+        assert.equal(active.details.version, 1);
+      });
+    }
+  }
+}
+
+test("does not guess an unverifiable legacy locale or rewrite its checkpoint", (t) => {
+  const compare = new Intl.Collator("en-US").compare;
+  t.mock.method(String.prototype, "localeCompare", function(this: string, other: string) { return compare(String(this), other); });
+  const session = SessionManager.inMemory();
+  const firstKept = session.appendMessage(localizedToolMessage());
+  const details = checkpoint([localizedToolMessage()]);
+  details.keptMessageFingerprints = [localeFingerprints[1].original];
+  session.appendCompaction(fallbackSummary(details.checkpointId), firstKept, 100, details);
+  const saved = structuredClone(session.getEntries());
+  const active = latestCheckpoint(session.getBranch());
+  assert.ok(active);
+  assert.deepEqual(active.details.keptMessageFingerprints, details.keptMessageFingerprints);
+  assert.equal(projectCheckpointContext(session.buildSessionProjection().messages, active.details), undefined);
+  assert.deepEqual(session.getEntries(), saved);
 });

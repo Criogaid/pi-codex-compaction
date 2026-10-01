@@ -31,14 +31,18 @@ export interface CodexCheckpointDetails extends ProviderIdentity {
   createdAt: string;
 }
 
-function stableValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stableValue);
+function orderedValue(value: unknown, compareKeys: (left: string, right: string) => number): unknown {
+  if (Array.isArray(value)) return value.map((item) => orderedValue(item, compareKeys));
   if (!isObject(value)) return value;
   return Object.fromEntries(
     Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => [key, stableValue(child)]),
+      .sort(([left], [right]) => compareKeys(left, right))
+      .map(([key, child]) => [key, orderedValue(child, compareKeys)]),
   );
+}
+
+function digestMessage(message: AgentMessage, compareKeys: (left: string, right: string) => number): string {
+  return createHash("sha256").update(JSON.stringify(orderedValue(message, compareKeys))).digest("hex");
 }
 
 // Session and context messages are replaced rather than mutated, so object identity keys both caches.
@@ -48,7 +52,8 @@ const checkpoints = new WeakMap<SessionEntry, CodexCheckpointDetails | null>();
 export function fingerprintMessage(message: AgentMessage): string {
   let fingerprint = fingerprints.get(message);
   if (fingerprint === undefined) {
-    fingerprint = createHash("sha256").update(JSON.stringify(stableValue(message))).digest("hex");
+    // Compare UTF-16 code units; persisted hashes must not depend on the process locale or ICU collation.
+    fingerprint = digestMessage(message, (left, right) => left < right ? -1 : left > right ? 1 : 0);
     fingerprints.set(message, fingerprint);
   }
   return fingerprint;
@@ -155,15 +160,19 @@ function normalizeLegacyFingerprints(
   entry: CompactionEntry,
   details: CodexCheckpointDetails,
 ): CodexCheckpointDetails {
-  // Match the old writer at the checkpoint's parent, never against later context edits.
+  // Validate at the checkpoint's parent, never against later context edits.
   const retained = retainedEntries(entries, entry.parentId, entry.firstKeptEntryId);
   if (!retained) return details;
-  const legacyMessages = retained.flatMap((item) => sessionEntryToContextMessages(item.sourceEntry));
-  if (legacyMessages.length !== details.keptMessageFingerprints.length ||
-    legacyMessages.some((message, index) => fingerprintMessage(message) !== details.keptMessageFingerprints[index])) {
-    return details;
-  }
-  return { ...details, keptMessageFingerprints: conversationMessages(retained).map(fingerprintMessage) };
+  const canonical = conversationMessages(retained);
+  const matches = (messages: readonly AgentMessage[], fingerprint: (message: AgentMessage) => string) =>
+    messages.length === details.keptMessageFingerprints.length &&
+    messages.every((message, index) => fingerprint(message) === details.keptMessageFingerprints[index]);
+  if (matches(canonical, fingerprintMessage)) return details;
+  // V1 did not record its locale. Only normalize old hashes when the old ordering proves an exact match.
+  const legacyFingerprint = (message: AgentMessage) => digestMessage(message, (left, right) => left.localeCompare(right));
+  const raw = retained.flatMap((item) => sessionEntryToContextMessages(item.sourceEntry));
+  if (!matches(canonical, legacyFingerprint) && !matches(raw, legacyFingerprint)) return details;
+  return { ...details, keptMessageFingerprints: canonical.map(fingerprintMessage) };
 }
 
 export function latestCheckpoint(
