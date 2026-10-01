@@ -500,7 +500,7 @@ for (const mode of ["rpc", "tui"] as const) {
   });
 }
 
-test("TUI invalid fallback model row describes the settings validation error", async () => {
+test("TUI invalid fallback model row explains how to replace the invalid settings", async () => {
   await writeSettings(invalidFallbackSettings);
   const current = await fixture([]);
   let selectedFrame: readonly string[] = [];
@@ -508,8 +508,9 @@ test("TUI invalid fallback model row describes the settings validation error", a
   await current.run();
   const lines = selectedFrame.map(stripVTControlCharacters);
   assert.match(lines.join("\n"), /Model and thinking level\s+Invalid/);
-  assert.ok(lines.some((line) => line.trim() === invalidFallbackError),
-    `Expected the model row to describe: ${invalidFallbackError}\nRendered menu:\n${lines.join("\n")}`);
+  const description = "Choose a model to replace the invalid fallback settings.";
+  assert.ok(lines.some((line) => line.trim() === description),
+    `Expected the model row to describe: ${description}\nRendered menu:\n${lines.join("\n")}`);
   assert.deepEqual(current.notices, []);
   assert.equal(await readFile(settingsPath, "utf8"), invalidFallbackSettings);
 });
