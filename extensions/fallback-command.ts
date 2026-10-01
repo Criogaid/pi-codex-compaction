@@ -22,10 +22,14 @@ function readFallback(read: () => FallbackConfiguration | undefined): FallbackSt
   }
 }
 
+function fallbackModelLabel(selection: FallbackConfiguration | undefined): string | undefined {
+  return selection?.model === undefined ? undefined : `${selection.provider}/${selection.model} (${selection.thinkingLevel})`;
+}
+
 function describeFallback(selection: FallbackConfiguration | undefined): string {
-  if (selection?.model === undefined) return "No fallback model configured; inactive. Pi uses the chat model.";
-  const model = `${selection.provider}/${selection.model} (${selection.thinkingLevel})`;
-  return selection.enabled ? `Fallback text compaction will use ${model}. The chat model is unchanged.`
+  const model = fallbackModelLabel(selection);
+  if (model === undefined) return "No fallback model configured; inactive. Pi uses the chat model.";
+  return selection?.enabled ? `Fallback text compaction will use ${model}. The chat model is unchanged.`
     : `Fallback model is Off. Pi will use the chat model for text compaction. Saved model: ${model}.`;
 }
 
@@ -36,9 +40,10 @@ async function chooseAction(
   selected: SettingsAction,
 ): Promise<SettingsAction | undefined> {
   const current = fallback.value;
+  const invalid = fallback.error !== undefined;
   const description = fallback.error ?? describeFallback(current);
   const remoteValue = remoteCompactionEnabled ? "On" : "Off";
-  const switchValue = fallback.error !== undefined ? "Invalid" : current?.enabled ? "On" : "Off";
+  const switchValue = invalid ? "Invalid" : current?.enabled ? "On" : "Off";
   if (ctx.mode !== "tui") {
     const switchLabel = `Fallback model: ${switchValue}`;
     const remoteLabel = `Remote Compaction V2: ${remoteValue}`;
@@ -52,8 +57,8 @@ async function chooseAction(
   return ctx.ui.custom<SettingsAction | undefined>((tui, _theme, _keys, done) => {
     const list = new SettingsList([
       { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When Off, use the configured fallback or Pi's chat-model text compaction. Existing checkpoints still replay." },
-      { id: "toggle", label: "Fallback model", currentValue: switchValue, values: fallback.error !== undefined ? ["Invalid"] : ["Off", "On"], description },
-      { id: "model", label: "Model and thinking level", currentValue: fallback.error !== undefined ? "Invalid" : current?.model === undefined ? "Not configured" : `${current.provider}/${current.model} (${current.thinkingLevel})`, values: ["Choose"], description: fallback.error !== undefined ? "Choose a model to replace the invalid fallback settings." : "Choose a model; this does not change the switch." },
+      { id: "toggle", label: "Fallback model", currentValue: switchValue, values: invalid ? ["Invalid"] : ["Off", "On"], description },
+      { id: "model", label: "Model and thinking level", currentValue: invalid ? "Invalid" : fallbackModelLabel(current) ?? "Not configured", values: ["Choose"], description: invalid ? "Choose a model to replace the invalid fallback settings." : "Choose a model; this does not change the switch." },
     ], 3, getSettingsListTheme(), (id) => done(id === "toggle" ? "toggle" : id === "remote" ? "remote" : "model"), () => done(undefined));
     list.selectItem(selected);
     return {
