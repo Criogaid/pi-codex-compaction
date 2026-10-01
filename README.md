@@ -172,7 +172,7 @@ npm test
 npm run pack:check
 ```
 
-测试脚本将 TypeScript 编译到 Git 忽略的 `dist/` 目录，再使用 Node 的测试运行器执行。打包检查使用 npm dry run，验证入口和全部运行时模块已包含，测试及迁移记录未进入发布包。CI 在 Linux 和 Windows 上运行相同命令。
+测试脚本将 TypeScript 编译到 Git 忽略的 `dist/` 目录，再使用 Node 的测试运行器执行。打包检查使用 npm dry run，验证入口和全部运行时模块已包含，测试及迁移记录未进入发布包。CI 在 Ubuntu 24.04 和 Windows 上运行相同命令，配置见 [ci.yml](.github/workflows/ci.yml)。
 
 版本变更使用 Changesets：`npm run changeset` 添加记录，`npm run version-packages` 应用版本变更。本次迁移没有发布 npm 包；仓库不自动发布。
 
