@@ -23,6 +23,10 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 
 ### 指定降级压缩模型
 
+在 Pi 中执行 `/codex-compaction`，可以查看当前降级设置、选择已认证的压缩模型和该模型支持的思考等级，或关闭指定模型降级。终端和 RPC 模式共用 Pi 的选择框；任一步按 ESC 都不保存，当前对话模型和思考等级不变。保存后下次降级即生效。
+
+命令写入下述配置文件，保存前检查文件是否在菜单打开后发生变化，并通过 Pi 的文件写入队列原子替换。该队列只协调当前进程，不提供跨进程锁或断电后的持久性保证。配置无效时保留原文件并显示错误；配置文件是符号链接时继续支持读取，但需要直接编辑链接目标。非交互模式也可以直接编辑配置文件。
+
 在 `~/.pi/agent/extensions/pi-codex-compaction/` 目录新建 `config.json`，目录不存在时先创建。设置了 `PI_CODING_AGENT_DIR` 时，配置路径为该目录下的 `extensions/pi-codex-compaction/config.json`。配置使用 UTF-8 JSON：
 
 ```json
@@ -46,7 +50,7 @@ Remote Compaction V2 成功时继续使用当前模型的 opaque 检查点。远
 
 已有 Codex opaque 检查点中的加密历史不能被另一个 Provider 解读，也不会自动还原成文本。指定模型的降级压缩沿用 Pi 原生准备中可用的摘要和消息范围；本功能不改变 Codex 检查点格式。
 
-配置读取、模型选择与原生摘要请求由 [fallback.ts](extensions/fallback.ts) 负责；生命周期与降级决定保留在 [codex-compaction.ts](extensions/codex-compaction.ts)。
+配置格式、读取与菜单保存由 [fallback-settings.ts](extensions/fallback-settings.ts) 负责，命令交互由 [fallback-command.ts](extensions/fallback-command.ts) 负责。模型选择与原生摘要请求保留在 [fallback.ts](extensions/fallback.ts)；生命周期与降级决定保留在 [codex-compaction.ts](extensions/codex-compaction.ts)。
 
 ### Runtime parameters
 

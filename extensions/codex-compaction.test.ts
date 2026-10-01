@@ -81,6 +81,7 @@ function mockPi(thinkingLevel: ThinkingLevel = "high", settings: TestSettings = 
     on(name: string, handler: Handler) {
       events.set(name, [...(events.get(name) ?? []), handler]);
     },
+    registerCommand() {},
     registerEntryRenderer(customType: string, renderer: Handler) {
       entryRenderers.set(customType, renderer);
     },
