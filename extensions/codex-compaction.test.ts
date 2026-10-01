@@ -1,5 +1,7 @@
+import { writeFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import {
   createAssistantMessageEventStream,
   getCurrentSystemMessage,
@@ -17,6 +19,7 @@ import {
   convertToLlm,
   type ContextEventResult,
   type ExtensionAPI,
+  type ExtensionContext,
   type ModelRegistry,
   type SessionBeforeCompactEvent,
   type SessionBeforeCompactResult,
@@ -24,8 +27,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, parseCheckpointDetails } from "./checkpoint.js";
 import { createCodexCompactionExtension } from "./codex-compaction.js";
-import { testRegistry } from "./test-registry.test.js";
+import { isolateAgentConfig, testRegistry } from "./test-registry.test.js";
+import { FALLBACK_SETTINGS_FILENAME } from "./fallback.js";
 import { isObject, type JsonObject } from "./protocol.js";
+
+const fallbackSettingsPath = join(isolateAgentConfig(), FALLBACK_SETTINGS_FILENAME);
+afterEach(() => rm(fallbackSettingsPath, { force: true }));
 
 const capability = {
   provider: "custom-codex",
@@ -85,7 +92,7 @@ function mockPi(thinkingLevel: ThinkingLevel = "high", settings: TestSettings = 
     getActiveTools: () => tools.active,
     getAllTools: () => tools.all,
   };
-  return { pi: pi as never, events, appendedEntries, entryRenderers };
+  return { pi: pi as unknown as ExtensionAPI, events, appendedEntries, entryRenderers };
 }
 
 function fakeProvider(observe?: (options: SimpleStreamOptions | undefined) => void, payloadPreparations = 1): Provider {
@@ -217,7 +224,7 @@ async function context(overrides: Record<string, unknown> = {}) {
     modelRegistry: await testRegistry(fakeProvider()),
     ...overrides,
   };
-  return { ctx: ctx as never, notifications, statuses };
+  return { ctx: ctx as unknown as ExtensionContext, notifications, statuses };
 }
 
 function sseResponse() {
@@ -936,4 +943,323 @@ test("keeps projection failures silent without a UI or a compatible model identi
     assert.equal(await mock.events.get("context")?.[0]?.({ type: "context", messages: [] }, current.ctx), undefined);
     assert.deepEqual(current.notifications, []);
   }
+});
+
+const fallbackModel: Model<"openai-responses"> = {
+  ...model, provider: "cheap-provider", id: "gpt-6.1-sol", name: "Cheap summary", compat: undefined,
+};
+const astraModel: Model<"openai-responses"> = { ...model, id: "astra", compat: undefined };
+
+async function configureFallback(thinkingLevel = "high") {
+  await writeFile(fallbackSettingsPath, JSON.stringify({
+    version: 1, fallback: { provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel },
+  }));
+}
+
+async function fallbackFixture(options: {
+  currentModel?: Model<"openai-responses">;
+  stopReason?: "stop" | "length" | "error" | "aborted";
+  text?: string;
+  onRequest?: () => void;
+  auth?: boolean;
+  thinkingLevelMap?: Model<"openai-responses">["thinkingLevelMap"];
+} = {}) {
+  const calls: Array<{ model: Model<"openai-responses">; context: Context; options?: SimpleStreamOptions }> = [];
+  let remoteRequests = 0;
+  const registry = await testRegistry(fakeProvider(() => { remoteRequests++; }));
+  const configured = { ...fallbackModel, thinkingLevelMap: options.thinkingLevelMap };
+  registry.registerProvider({
+    id: fallbackModel.provider, name: "Cheap provider", baseUrl: fallbackModel.baseUrl,
+    auth: { apiKey: { name: "Fixture", resolve: async () => options.auth === false ? undefined : { auth: { apiKey: "cheap-fixture-key" } } } },
+    getModels: () => [configured],
+    streamSimple(requestModel, requestContext, streamOptions) {
+      const stream = createAssistantMessageEventStream();
+      void (async () => {
+        let stopReason = options.stopReason ?? "stop";
+        let errorMessage;
+        try {
+          await streamOptions?.onPayload?.({ model: requestModel.id, input: [] }, requestModel);
+          calls.push({ model: configured, context: requestContext, options: streamOptions });
+          options.onRequest?.();
+        } catch (error) {
+          stopReason = "error";
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
+        const response = {
+          role: "assistant" as const, content: [{ type: "text" as const, text: options.text ?? "Keep working on the cache fix." }],
+          api: fallbackModel.api, provider: fallbackModel.provider, model: fallbackModel.id, usage, stopReason,
+          errorMessage: errorMessage ?? (stopReason === "error" ? "fixture request failed" : undefined), timestamp: 1,
+        };
+        if (stopReason === "error" || stopReason === "aborted") {
+          stream.push({ type: "error", reason: stopReason, error: response });
+        } else {
+          stream.push({ type: "done", reason: stopReason, message: response });
+        }
+        stream.end(response);
+      })();
+      return stream;
+    },
+    stream() { throw new Error("not used"); },
+  });
+  const sessionManager = SessionManager.inMemory();
+  sessionManager.appendMessage({ role: "user", content: "older task", timestamp: 1 });
+  const firstKeptEntryId = sessionManager.appendMessage({ role: "user", content: "recent task", timestamp: 2 });
+  const current = await context({ model: options.currentModel ?? astraModel, modelRegistry: registry, sessionManager });
+  const event = compactEvent();
+  event.branchEntries = sessionManager.getBranch();
+  event.preparation.firstKeptEntryId = firstKeptEntryId;
+  event.preparation.messagesToSummarize = [{ role: "user", content: "older task", timestamp: 1 }];
+  const mock = mockPi("low", { transport: "sse", retry: { enabled: false } });
+  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  const run = () => mock.events.get("session_before_compact")?.[0]?.(event, current.ctx) as Promise<SessionBeforeCompactResult | undefined>;
+  return { ...current, mock, event, sessionManager, calls, run, remoteRequests: () => remoteRequests };
+}
+
+for (const reason of ["manual", "threshold", "overflow"] as const) {
+  test(`uses the configured native summary model for ${reason} compaction without changing the chat model`, async () => {
+    await configureFallback();
+    const fixture = await fallbackFixture();
+    fixture.event.reason = reason;
+    fixture.event.willRetry = reason === "overflow";
+    fixture.event.customInstructions = "Preserve the failing cache test.";
+    fixture.event.preparation.previousSummary = "Previously investigated request prefixes.";
+    fixture.event.preparation.fileOps.read.add("extensions/fallback.ts");
+    const result = await fixture.run();
+    assert.ok(result?.compaction);
+    const compacted = result.compaction;
+    assert.match(compacted.summary, /Keep working on the cache fix/);
+    assert.match(compacted.summary, /<read-files>\nextensions\/fallback.ts\n<\/read-files>/);
+    assert.equal(compacted.firstKeptEntryId, fixture.event.preparation.firstKeptEntryId);
+    assert.equal(compacted.tokensBefore, 123);
+    assert.deepEqual(compacted.usage, usage);
+    assert.equal(parseCheckpointDetails(compacted.details), undefined);
+    assert.equal(fixture.remoteRequests(), 0);
+    assert.equal(fixture.calls.length, 1);
+    const call = fixture.calls[0];
+    assert.equal(call.model.id, fallbackModel.id);
+    assert.equal(call.options?.reasoning, "high");
+    assert.equal(call.options?.sessionId, fixture.sessionManager.getSessionId());
+    assert.equal(call.options?.cacheRetention, "none");
+    assert.equal(call.options?.signal, fixture.event.signal);
+    assert.equal(call.options?.apiKey, "cheap-fixture-key");
+    const prompt = JSON.stringify(call.context);
+    assert.match(prompt, /older task/);
+    assert.match(prompt, /Previously investigated request prefixes/);
+    assert.match(prompt, /Preserve the failing cache test/);
+    assert.doesNotMatch(prompt, /recent task/);
+    fixture.sessionManager.appendCompaction(compacted.summary, compacted.firstKeptEntryId, compacted.tokensBefore, compacted.details, true, compacted.usage);
+    await fixture.mock.events.get("session_compact")?.[0]?.({ type: "session_compact", fromExtension: true, compactionEntry: { details: compacted.details } }, fixture.ctx);
+    assert.deepEqual(fixture.mock.appendedEntries, []);
+    const projection = fixture.sessionManager.buildSessionProjection();
+    assert.match(JSON.stringify(projection.messages), /Keep working on the cache fix/);
+    assert.match(JSON.stringify(projection.messages), /recent task/);
+    assert.equal(fixture.ctx.model, astraModel);
+    assert.equal(fixture.mock.pi.getThinkingLevel(), "low");
+    assert.equal(fixture.statuses.get("codex-compaction"), undefined);
+  });
+}
+
+test("uses the configured fallback after a remote failure and preserves legacy behavior without configuration", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture({ currentModel: model });
+  // Returning no compaction item makes the remote protocol fail after payload preparation.
+  const failedRemote = createCodexCompactionExtension({ fetch: async () => new Response("", { headers: { "content-type": "text/event-stream" } }) });
+  fixture.mock.events.clear();
+  failedRemote(fixture.mock.pi);
+  const result = await fixture.run();
+  assert.ok(result?.compaction);
+  assert.equal(fixture.remoteRequests(), 1);
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(fixture.ctx.model, model);
+  assert.ok(fixture.notifications.some((item) => item.message.includes("configured fallback model")));
+  await rm(fallbackSettingsPath);
+  const legacy = await fixture.run();
+  assert.equal(legacy, undefined);
+  assert.equal(fixture.calls.length, 1);
+  assert.ok(fixture.notifications.some((item) => item.message.includes("using Pi compaction")));
+});
+
+test("successful remote compaction does not read malformed fallback settings", async () => {
+  await writeFile(fallbackSettingsPath, "invalid JSON");
+  const fixture = await fallbackFixture({ currentModel: model });
+  const result = await fixture.run();
+  assert.ok(result?.compaction);
+  assert.ok(parseCheckpointDetails(result.compaction.details));
+  assert.equal(fixture.calls.length, 0);
+});
+
+test("disabled fallback delegates unsupported models to Pi", async () => {
+  const fixture = await fallbackFixture();
+  assert.equal(await fixture.run(), undefined);
+  await writeFile(fallbackSettingsPath, "{}");
+  assert.equal(await fixture.run(), undefined);
+  assert.equal(fixture.calls.length, 0);
+});
+
+for (const content of [
+  "invalid JSON",
+  "[]",
+  JSON.stringify({ version: 2, fallback: { provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "high" } }),
+  JSON.stringify({ fallback: { provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "high" } }),
+  JSON.stringify({ version: 1, fallback: null }),
+  JSON.stringify({ version: 1, fallback: { provider: fallbackModel.provider, model: fallbackModel.id } }),
+  JSON.stringify({ version: 1, fallback: { provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "typo" } }),
+  JSON.stringify({ version: 1, fallback: { provider: "missing", model: fallbackModel.id, thinkingLevel: "high" } }),
+  JSON.stringify({ version: 1, fallback: { provider: fallbackModel.provider, model: "missing", thinkingLevel: "high" } }),
+  JSON.stringify({ version: 1, fallback: { provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "high", unexpected: true } }),
+  JSON.stringify({ unexpected: true }),
+  " ".repeat(16 * 1024 + 1),
+]) {
+  test(`invalid fallback settings stop compaction before a provider request (${content.slice(0, 45).trim() || "oversized"})`, async () => {
+    await writeFile(fallbackSettingsPath, content);
+    const fixture = await fallbackFixture();
+    assert.deepEqual(await fixture.run(), { cancel: true });
+    assert.equal(fixture.calls.length, 0);
+    assert.equal(fixture.remoteRequests(), 0);
+    assert.ok(fixture.notifications.some((item) => item.level === "error" && item.message.includes("compaction stopped")));
+    assert.equal(fixture.sessionManager.getBranch().filter((item) => item.type === "compaction").length, 0);
+  });
+}
+
+for (const stopReason of ["length", "error"] as const) {
+  test(`a fallback ${stopReason} response stops compaction without delegating to the chat model`, async () => {
+    await configureFallback();
+    const fixture = await fallbackFixture({ stopReason });
+    assert.deepEqual(await fixture.run(), { cancel: true });
+    assert.equal(fixture.calls.length, 1);
+    assert.equal(fixture.remoteRequests(), 0);
+    assert.equal(fixture.ctx.model, astraModel);
+    assert.equal(fixture.statuses.get("codex-compaction"), undefined);
+  });
+}
+
+test("missing fallback authentication stops compaction", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture({ auth: false });
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.calls.length, 0);
+});
+
+test("empty fallback summaries stop compaction", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture({ text: " " });
+  fixture.event.preparation.fileOps.read.add("tracked.ts");
+  assert.deepEqual(await fixture.run(), { cancel: true });
+});
+
+test("cancellation before fallback preparation sends no request", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture();
+  fixture.event.signal = AbortSignal.abort();
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.calls.length, 0);
+  assert.deepEqual(fixture.notifications, []);
+});
+
+test("cancellation during fallback discards its result", async () => {
+  await configureFallback();
+  const controller = new AbortController();
+  const fixture = await fallbackFixture({ onRequest: () => controller.abort() });
+  fixture.event.signal = controller.signal;
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.calls.length, 1);
+  assert.ok(!fixture.notifications.some((item) => item.level === "error"));
+});
+
+test("a session switch during fallback discards its result", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture({ onRequest: () => { fixture.ctx.sessionManager.getSessionId = () => "other-session"; } });
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.calls.length, 1);
+  assert.ok(!fixture.notifications.some((item) => item.level === "error"));
+});
+
+test("unsupported model thinking levels stop compaction instead of silently reducing effort", async () => {
+  await configureFallback("high");
+  const fixture = await fallbackFixture({ thinkingLevelMap: { high: null } });
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.calls.length, 0);
+});
+
+test("fallback off disables reasoning and forwards Pi provider runtime settings", async () => {
+  await configureFallback("off");
+  const fixture = await fallbackFixture();
+  const mock = mockPi("high", {
+    transport: "sse", thinkingBudgets: { high: 1234 }, websocketConnectTimeoutMs: 4567,
+    retry: { enabled: false, provider: { timeoutMs: 7890, maxRetries: 1, maxRetryDelayMs: 2345 } },
+  });
+  createCodexCompactionExtension()(mock.pi);
+  const result = await mock.events.get("session_before_compact")?.[0]?.(fixture.event, fixture.ctx) as SessionBeforeCompactResult;
+  assert.ok(result.compaction);
+  const options = fixture.calls[0].options;
+  assert.equal(options?.reasoning, undefined);
+  assert.equal(options?.transport, "sse");
+  assert.deepEqual(options?.thinkingBudgets, { high: 1234 });
+  assert.equal(options?.websocketConnectTimeoutMs, 4567);
+  assert.equal(options?.timeoutMs, 7890);
+  assert.equal(options?.maxRetries, 1);
+  assert.equal(options?.maxRetryDelayMs, 2345);
+});
+
+test("split-turn fallback uses Pi's two summary requests and combines usage", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture();
+  fixture.event.preparation.isSplitTurn = true;
+  fixture.event.preparation.turnPrefixMessages = [{ role: "user", content: "unfinished turn", timestamp: 3 }];
+  const result = await fixture.run();
+  assert.ok(result?.compaction);
+  assert.match(result.compaction.summary, /Turn Context \(split turn\)/);
+  assert.equal(fixture.calls.length, 2);
+  assert.equal(result.compaction.usage?.input, usage.input * 2);
+  assert.equal(result.compaction.usage?.output, usage.output * 2);
+  assert.ok(fixture.calls.every((call) => call.options?.reasoning === "high"));
+});
+
+test("a provider abort without a cancelled signal does not become a fallback summary", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture({ stopReason: "aborted" });
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.calls.length, 1);
+});
+
+test("native Responses fallback authenticates and retries with the configured effort, then preserves provider usage", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture();
+  const native = openaiProvider();
+  const payloads: JsonObject[] = [];
+  const provider: Provider<"openai-responses"> = {
+    ...native, id: fallbackModel.provider, getModels: () => [fallbackModel],
+    streamSimple(requestModel, requestContext, options) {
+      return native.streamSimple(requestModel, requestContext, { ...options, fetch: async (input, init) => {
+        const request = new Request(input, init);
+        assert.equal(request.headers.get("authorization"), "Bearer native-fixture-key");
+        const payload: unknown = await request.json();
+        assert.ok(isObject(payload));
+        payloads.push(payload);
+        if (payloads.length === 1) return new Response("Service unavailable", { status: 503 });
+        const item = { type: "message", id: "msg-summary", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Native HTTP summary.", annotations: [] }] };
+        const events = [
+          { type: "response.output_item.done", output_index: 0, item },
+          { type: "response.completed", response: { id: "summary-response", status: "completed", output: [item], usage: { input_tokens: 321, output_tokens: 7 } } },
+        ];
+        return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+      } });
+    },
+  };
+  const registry = await testRegistry(provider, async () => ({ auth: { apiKey: "native-fixture-key" } }));
+  fixture.ctx.modelRegistry = registry;
+  const mock = mockPi("low", { transport: "sse", retry: { enabled: true, maxRetries: 1, baseDelayMs: 0, provider: { maxRetries: 0 } } });
+  createCodexCompactionExtension()(mock.pi);
+  const result = await mock.events.get("session_before_compact")?.[0]?.(fixture.event, fixture.ctx) as SessionBeforeCompactResult;
+  assert.ok(result.compaction);
+  assert.equal(result.compaction.summary, "Native HTTP summary.");
+  assert.equal(result.compaction.usage?.input, 321);
+  assert.equal(result.compaction.usage?.output, 7);
+  assert.equal(payloads.length, 2);
+  assert.equal(payloads[1].model, fallbackModel.id);
+  assert.ok(isObject(payloads[1].reasoning));
+  assert.equal(payloads[1].reasoning.effort, "high");
+  assert.doesNotMatch(JSON.stringify(payloads[1]), /compaction_trigger/);
+  assert.match(JSON.stringify(payloads[1]), /older task/);
+  assert.equal(fixture.ctx.model, astraModel);
 });

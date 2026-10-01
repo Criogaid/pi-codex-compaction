@@ -19,7 +19,34 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 
 安装后无需配置。使用 Pi 官方 `openai-codex` 模型时，手动执行 `/compact` 或触发 Pi 自动压缩，扩展会优先尝试 remote compaction。
 
-压缩开始和完成时会显示提示。remote compaction 失败时，扩展会显示 warning，并由 Pi 继续执行原生 compaction。切换到不支持的模型时，Pi 直接使用原生 compaction。
+压缩开始和完成时会显示提示。默认情况下，remote compaction 失败时显示 warning，并由 Pi 使用当前对话模型执行原生 compaction；当前模型不支持 remote compaction 时也由 Pi 原生处理。可以按下面的配置为这两种情况指定独立的压缩模型。
+
+### 指定降级压缩模型
+
+在 Pi 配置目录新建 `pi-codex-compaction.json`。默认路径为 `~/.pi/agent/pi-codex-compaction.json`；设置了 `PI_CODING_AGENT_DIR` 时使用该目录。配置使用 UTF-8 JSON：
+
+```json
+{
+  "version": 1,
+  "fallback": {
+    "provider": "your-provider",
+    "model": "gpt-6.1-sol",
+    "thinkingLevel": "high"
+  }
+}
+```
+
+将 `provider` 和 `model` 替换为 Pi 中已配置的实际 ID；显示名称不能代替 ID。模型必须支持指定的 `thinkingLevel`，例如 `high` 或 `off`。扩展通过 Pi 的模型注册表使用该模型的认证、Provider 配置与思考等级映射，不需要额外配置 API key。
+
+Remote Compaction V2 成功时继续使用当前模型的 opaque 检查点。远程请求失败，或当前模型不支持该协议时，扩展使用指定模型调用 Pi 原生文本压缩。手动 `/compact`、自动阈值压缩和上下文溢出恢复共用此规则。例如，使用 Astra 对话时可以把文本压缩交给 `gpt-6.1-sol` 的 `high`，摘要生成后仍由 Astra 继续对话，当前模型和对话思考等级不会被修改。
+
+文本压缩复用 Pi 准备的消息范围、已有文本摘要、最近消息保留点、文件操作记录及 `/compact` 自定义指令。摘要用量由实际压缩模型报告并写入 Pi 的压缩记录；需要切分一轮对话时，Pi 可能生成两份摘要并合计用量。Provider 的传输、思考预算、超时与重试沿用 Pi 设置；未设置请求超时时默认使用五分钟。原生摘要请求按 Pi 的规则使用 `cacheRetention: "none"`。选择更低价格的模型可以减少压缩费用，实际费用还取决于输入范围、输出和思考用量。
+
+每次需要降级时重新读取配置，修改后下次降级即生效。文件不存在，或移除 `fallback` 字段时关闭此功能；关闭后恢复 Pi 使用当前对话模型压缩的默认行为。已配置时，配置错误、模型不可用、认证失败、请求失败、空摘要或达到输出长度上限都会停止此次压缩，避免再次转交当前对话模型。取消或切换会话时不保存结果。
+
+已有 Codex opaque 检查点中的加密历史不能被另一个 Provider 解读，也不会自动还原成文本。指定模型的降级压缩沿用 Pi 原生准备中可用的摘要和消息范围；本功能不改变 Codex 检查点格式。
+
+配置读取、模型选择与原生摘要请求由 [fallback.ts](extensions/fallback.ts) 负责；生命周期与降级决定保留在 [codex-compaction.ts](extensions/codex-compaction.ts)。
 
 ### Runtime parameters
 

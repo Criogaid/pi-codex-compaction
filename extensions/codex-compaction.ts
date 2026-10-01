@@ -1,10 +1,12 @@
 // Own Pi lifecycle integration, active-session ownership, checkpoint replay hooks, and ordinary-request snapshot state.
+import { resolve } from "node:path";
 import { prepareRetention, userItemOrigins } from "./retention-input.js";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Context, Message, Tool } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
   convertToLlm,
+  getAgentDir,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
@@ -32,6 +34,7 @@ import {
 } from "./checkpoint.js";
 import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
+import { FALLBACK_SETTINGS_FILENAME, requestFallbackCompaction } from "./fallback.js";
 import {
   applyPromptOverride,
   captureContextSnapshot,
@@ -171,16 +174,65 @@ function sessionStillOwned(ctx: ExtensionContext, sessionId: string, signal: Abo
   return !signal.aborted && ctx.sessionManager.getSessionId() === sessionId;
 }
 
+async function compactFallback(
+  pi: ExtensionAPI,
+  event: SessionBeforeCompactEvent,
+  ctx: ExtensionContext,
+  sessionId: string,
+  settingsPath: string,
+  remoteError?: unknown,
+) {
+  let announced = false;
+  try {
+    if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+    const result = await requestFallbackCompaction({
+      settingsPath,
+      modelRegistry: ctx.modelRegistry,
+      preparation: event.preparation,
+      settings: pi.getSettings(),
+      customInstructions: event.customInstructions,
+      signal: event.signal,
+      sessionId,
+      onPrepared: ({ model, thinkingLevel }) => {
+        if (!sessionStillOwned(ctx, sessionId, event.signal)) throw new Error("Compaction session ownership changed");
+        if (announced) return;
+        announced = true;
+        ctx.ui.setStatus(STATUS_KEY, "Pi fallback compaction...");
+        if (ctx.hasUI) {
+          if (remoteError !== undefined) {
+            const message = remoteError instanceof Error ? remoteError.message : String(remoteError);
+            ctx.ui.notify(`Codex remote compaction failed; using the configured fallback model. ${message}`, "warning");
+          }
+          ctx.ui.notify(`Using Pi text compaction with ${model.provider}/${model.id} (${thinkingLevel}).`, "info");
+        }
+      },
+    });
+    if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+    if (!result && remoteError !== undefined) notifyFailure(ctx, remoteError);
+    return result;
+  } catch (error) {
+    if (sessionStillOwned(ctx, sessionId, event.signal) && ctx.hasUI) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Configured fallback compaction failed; compaction stopped. ${message}`, "error");
+    }
+    // Returning undefined would make Pi send the same context to the active chat model.
+    return { cancel: true };
+  } finally {
+    if (ctx.sessionManager.getSessionId() === sessionId) ctx.ui.setStatus(STATUS_KEY, undefined);
+  }
+}
+
 async function compactRemotely(
   pi: ExtensionAPI,
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
+  fallbackSettingsPath: string,
   fetch?: typeof globalThis.fetch,
   snapshots: Readonly<RequestSnapshots> = {},
 ) {
   const supported = capableModel(ctx.model);
-  if (!supported) return undefined;
   const sessionId = ctx.sessionManager.getSessionId();
+  if (!supported) return compactFallback(pi, event, ctx, sessionId, fallbackSettingsPath);
   const reasoning = pi.getThinkingLevel();
   const settings = pi.getSettings();
   let announced = false;
@@ -250,8 +302,7 @@ async function compactRemotely(
     if (event.signal.aborted || ctx.sessionManager.getSessionId() !== sessionId) {
       return { cancel: true };
     }
-    notifyFailure(ctx, error);
-    return undefined;
+    return await compactFallback(pi, event, ctx, sessionId, fallbackSettingsPath, error);
   } finally {
     if (ctx.sessionManager.getSessionId() === sessionId) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -263,6 +314,7 @@ export function createCodexCompactionExtension(
   options: { fetch?: typeof globalThis.fetch } = {},
 ): (pi: ExtensionAPI) => void {
   return (pi) => {
+    const fallbackSettingsPath = resolve(getAgentDir(), FALLBACK_SETTINGS_FILENAME);
     const warnings = new Set<string>();
     let snapshots: RequestSnapshots = {};
 
@@ -282,7 +334,7 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("session_before_compact", (event, ctx) =>
-      compactRemotely(pi, event, ctx, options.fetch, snapshots),
+      compactRemotely(pi, event, ctx, fallbackSettingsPath, options.fetch, snapshots),
     );
 
     pi.on("session_compact", (event) => {
