@@ -88,7 +88,7 @@ Tests compare ordinary and compaction requests through the real Pi Responses ada
 
 ### History retention
 
-[retention-input.ts](extensions/retention-input.ts) 按 [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs) 的默认规则筛选普通 Responses 消息：排除环境、技能、内部上下文及旧版提示片段，识别可见 hook 提示，并把图片缩放通知与来源消息一起处理。Hook XML 使用固定版本的 `saxes` 解析，边界用例与官方 `quick-xml` 实际运行结果对照。
+[retention-input.ts](extensions/retention-input.ts) 按 [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs) 的默认规则筛选普通 Responses 消息：排除环境、技能、内部上下文及旧版提示片段，识别可见 hook 提示；图片缩放通知与来源消息的分组由 [history-groups.ts](extensions/history-groups.ts) 负责。Hook XML 使用固定版本的 `saxes` 解析，边界用例与官方 `quick-xml` 实际运行结果对照。
 
 Pi 会把 `!cmd` 的执行结果、扩展消息和展开后的技能都作为 user 消息发送，而 Codex 将对应内容作为独立的上下文消息处理。扩展按 Pi 消息来源对齐这些 user 条目：`bashExecution` 与隐藏的扩展消息（`display: false`）视为上下文不保留，显示的扩展消息与 Codex 的可见 hook 提示一致予以保留；技能块只保留用户在技能之后输入的文字。来源序列与 Provider 实际发送的 user 条目数量不一致时，退回纯文本分类。
 

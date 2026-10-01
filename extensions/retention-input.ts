@@ -4,9 +4,10 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertToLlm, parseSkillBlock } from "@earendil-works/pi-coding-agent";
 import { SaxesParser } from "saxes";
+import { historyGroups, inputText, matchesMarkedText, trimWhiteSpace } from "./history-groups.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { isObject, type JsonObject } from "./protocol.js";
-import type { RetentionInput, HistoryGroup } from "./retention.js";
+import type { RetentionInput } from "./retention.js";
 
 const CONTEXT_MARKERS: readonly (readonly [string, string])[] = [
   ["# AGENTS.md instructions", "</INSTRUCTIONS>"],
@@ -18,20 +19,10 @@ const CONTEXT_MARKERS: readonly (readonly [string, string])[] = [
   ["<subagent_notification>", "</subagent_notification>"],
   ["<recommended_plugins>", "</recommended_plugins>"],
 ];
-const RESIZE_NOTICE_MARKERS = ["<image_resize_notice>", "</image_resize_notice>"] as const;
 const EXTERNAL_PREFIX = "<external_";
 
-// Rust str::trim uses Unicode White_Space; JS trim additionally removes the BOM.
-function trim(text: string): string {
-  return text.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
-}
-function marked(text: string, [open, close]: readonly [string, string]): boolean {
-  const asciiLower = (value: string) => value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
-  return asciiLower(text.slice(0, open.length)) === asciiLower(open) &&
-    asciiLower(text.slice(-close.length)) === asciiLower(close);
-}
 function contextual(text: string): boolean {
-  if (CONTEXT_MARKERS.some((markers) => marked(text, markers))) return true;
+  if (CONTEXT_MARKERS.some((markers) => matchesMarkedText(text, markers))) return true;
   if (text.startsWith(EXTERNAL_PREFIX)) {
     const delimiter = text.indexOf(">", EXTERNAL_PREFIX.length);
     if (delimiter >= 0 && text.endsWith(`</external_${text.slice(EXTERNAL_PREFIX.length, delimiter)}>`)) return true;
@@ -77,11 +68,7 @@ function hookPrompt(text: string): boolean {
     if (!finished && --depth === 0) { finished = true; rootEnd = parser.position; }
   });
   parser.write(text).close();
-  return finished && !invalid && trim(hookRunId).length > 0 && textFields === 1;
-}
-function inputText(value: unknown): string | undefined {
-  return typeof value === "object" && value !== null && "type" in value && value.type === "input_text" &&
-    "text" in value && typeof value.text === "string" ? trim(value.text) : undefined;
+  return finished && !invalid && trimWhiteSpace(hookRunId).length > 0 && textFields === 1;
 }
 function isUserMessage(item: JsonObject): boolean {
   if ((item.type !== undefined && item.type !== "message") || item.role !== "user" || !Array.isArray(item.content)) return false;
@@ -99,23 +86,6 @@ function isUserMessage(item: JsonObject): boolean {
   }
   return (hasHook && allHookOrContext) || !hasContext;
 }
-function isResizeNotice(item: JsonObject): boolean {
-  if ((item.type !== undefined && item.type !== "message") || item.role !== "developer" ||
-    !Array.isArray(item.content) || item.content.length !== 1) return false;
-  const text = inputText(item.content[0]);
-  return text !== undefined && marked(text, RESIZE_NOTICE_MARKERS);
-}
-
-/** Group each item with an immediately following resize notice, as Codex's history_item_groups does. */
-export function historyGroups(input: readonly JsonObject[]): HistoryGroup[] {
-  const groups: HistoryGroup[] = [];
-  for (let index = 0; index < input.length; index++) {
-    const next = input[index + 1];
-    groups.push({ source: input[index], notice: next && isResizeNotice(next) ? input[++index] : undefined });
-  }
-  return groups;
-}
-
 /** Pi sends user shell commands and hidden extension messages as user items; Codex treats them as context. */
 export type UserItemOrigin = "user" | "context";
 

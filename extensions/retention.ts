@@ -1,5 +1,6 @@
 // Own Codex V2 retention for Pi message items, including its enabled image-budget policy.
 // Reference: openai/codex rust-v0.159.2, compact_remote_v2.rs and compact_remote_v2_images.rs.
+import type { HistoryGroup } from "./history-groups.js";
 import type { ImageEstimates } from "./image-budget.js";
 import { isInputImage, type JsonObject } from "./protocol.js";
 import { approximateTokenCount, approximateTokensFromBytes, truncateTextToTokenBudget } from "./text-budget.js";
@@ -10,10 +11,6 @@ const IMAGE_CLOSE_TAG = "</image>";
 const LOCAL_IMAGE_OPEN_PREFIX = "<image name=";
 
 type TextPart = JsonObject & { type: "input_text" | "output_text"; text: string };
-export interface HistoryGroup {
-  readonly source: JsonObject;
-  readonly notice?: JsonObject;
-}
 export interface RetentionInput {
   readonly groups: readonly HistoryGroup[];
   readonly images: ImageEstimates;

@@ -2,8 +2,7 @@
 // Reference: openai/codex rust-v0.159.2, compact_remote_history.rs and context_manager/history.rs.
 import { type ImageEstimates, RESIZED_IMAGE_BYTES_ESTIMATE } from "./image-budget.js";
 import { isInputImage, isObject, type JsonObject } from "./protocol.js";
-import { historyGroups } from "./retention-input.js";
-import type { HistoryGroup } from "./retention.js";
+import { historyGroups, type HistoryGroup } from "./history-groups.js";
 import { approximateTokenCount, approximateTokensFromBytes } from "./text-budget.js";
 
 const EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95;
