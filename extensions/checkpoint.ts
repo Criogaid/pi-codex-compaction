@@ -144,9 +144,14 @@ function retainedEntries(
   return keptIndex < 0 ? undefined : projection.entries.slice(keptIndex);
 }
 
+/** Pi's context handlers see only non-system messages; Pi carries system messages separately. */
+export function withoutSystemMessages<T extends { readonly role: string }>(messages: readonly T[]): T[] {
+  return messages.filter((message) => message.role !== "system");
+}
+
 function conversationMessages(entries: readonly ProjectedSessionEntry[]): AgentMessage[] {
-  // Pi's context hook excludes system messages; appendCompaction snapshots them separately.
-  return entries.flatMap((entry) => entry.messages).filter((message) => message.role !== "system");
+  // appendCompaction snapshots system messages separately from the retained conversation.
+  return withoutSystemMessages(entries.flatMap((entry) => entry.messages));
 }
 
 export function keptMessages(branchEntries: readonly SessionEntry[], firstKeptEntryId: string): AgentMessage[] {
@@ -227,7 +232,7 @@ export function projectCheckpointRequest(
   messages: readonly AgentMessage[],
   details: CodexCheckpointDetails,
 ): AgentMessage[] | undefined {
-  const projected = projectCheckpointContext(messages.filter((message) => message.role !== "system"), details);
+  const projected = projectCheckpointContext(withoutSystemMessages(messages), details);
   if (!projected) return undefined;
   const head = getCurrentSystemMessage(messages.filter((message): message is Message => message.role === "system"));
   return head ? [head, ...projected] : projected;

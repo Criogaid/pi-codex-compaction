@@ -30,6 +30,7 @@ export function normalizeUrl(value: string): string {
   url.pathname = url.pathname.replace(/\/+$/, "") || "/";
   return url.toString().replace(/\/$/, "");
 }
+/** Mirror Pi 0.99's resolveCodexUrl and the OpenAI SDK's `/responses` route for a normalized base URL. */
 export function deriveEndpoint(baseUrl: string, api: RemoteCompactionApi): string {
   if (api === OPENAI_RESPONSES_API) return `${baseUrl}/responses`;
   if (baseUrl.endsWith("/codex/responses")) return baseUrl;

@@ -8,7 +8,7 @@
 
 ## Ownership
 
-- Keep lifecycle hooks and in-memory snapshot state in `extensions/codex-compaction.ts`; keep snapshot capture, matching, and reuse in `extensions/request-snapshot.ts`.
+- Keep lifecycle hooks and compaction orchestration in `extensions/codex-compaction.ts`; keep the in-memory request snapshot tracker, snapshot capture, matching, and reuse, and compaction's Pi-equivalent request context in `extensions/request-snapshot.ts`.
 - Capture ordinary context through `context_with_system` and the effective prompt through `ctx.getSystemPrompt()` before ordinary provider requests. Bind reuse to the session, model, backend, and unchanged canonical source prefix.
 - Keep checkpoint persistence, canonical Pi projection, and legacy fingerprint normalization in `extensions/checkpoint.ts`. Preserve checkpoint version 1, legacy markers, summary wording, and completion entry identifiers across the package rename. Hash keys in UTF-16 code-unit order; normalize locale-sorted legacy fingerprints only after exact validation against the creation-time branch.
 - Keep provider identity in `extensions/capability.ts`, Responses wire rules in `extensions/protocol.ts`, and provider adaptation and transport defaults in `extensions/remote.ts`. Dispatch through Pi's `ModelRegistry.streamSimple()` with SSE so each V2 request sends its feature header and checks its endpoint.
