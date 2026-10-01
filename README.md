@@ -62,7 +62,7 @@ Remote Compaction V2 成功时继续使用当前模型的 opaque 检查点。V2 
 
 文本压缩复用 Pi 准备的消息范围、已有文本摘要、最近消息保留点、文件操作记录及 `/compact` 自定义指令。摘要用量由实际压缩模型报告并写入 Pi 的压缩记录；需要切分一轮对话时，Pi 可能生成两份摘要并合计用量。Provider 的传输、思考预算、超时与重试沿用 Pi 设置；未设置请求超时时默认使用五分钟。原生摘要请求按 Pi 的规则使用 `cacheRetention: "none"`。选择更低价格的模型可以减少压缩费用，实际费用还取决于输入范围、输出和思考用量。
 
-`remoteCompaction.enabled` 接受布尔值 `true` 或 `false`，省略 `remoteCompaction` 时默认启用 V2；菜单保存时省略默认开启值。`fallback.enabled` 接受布尔值 `true` 或 `false`；旧配置省略该字段时视为 `true`。允许只保存开关，例如 `{"version":1,"fallback":{"enabled":true}}`；模型的 `provider`、`model`、`thinkingLevel` 三个字段必须同时提供或同时省略。模型未配置、fallback 开关为 `false`、文件不存在或移除 `fallback` 字段时，文本压缩使用 Pi 当前对话模型，不查找降级模型或调用其 Provider。需要降级时，fallback 配置错误会停止压缩；启用且已配置模型后，模型不可用、认证失败、请求失败、空摘要或达到输出长度上限也会停止此次压缩，避免再次转交当前对话模型。取消或切换会话时不保存压缩结果。
+`remoteCompaction.enabled` 接受布尔值 `true` 或 `false`，省略 `remoteCompaction` 时默认启用 V2；菜单保存时始终明确写入 `enabled: true` 或 `enabled: false`。`fallback.enabled` 接受布尔值 `true` 或 `false`；旧配置省略该字段时视为 `true`。允许只保存开关，例如 `{"version":1,"fallback":{"enabled":true}}`；模型的 `provider`、`model`、`thinkingLevel` 三个字段必须同时提供或同时省略。模型未配置、fallback 开关为 `false`、文件不存在或移除 `fallback` 字段时，文本压缩使用 Pi 当前对话模型，不查找降级模型或调用其 Provider。需要降级时，fallback 配置错误会停止压缩；启用且已配置模型后，模型不可用、认证失败、请求失败、空摘要或达到输出长度上限也会停止此次压缩，避免再次转交当前对话模型。取消或切换会话时不保存压缩结果。
 
 已有 Codex opaque 检查点中的加密历史不能被另一个 Provider 解读，也不会自动还原成文本。指定模型的降级压缩沿用 Pi 原生准备中可用的摘要和消息范围；本功能不改变 Codex 检查点格式。
 

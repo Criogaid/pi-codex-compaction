@@ -71,7 +71,7 @@ test("the command saves an available model and its supported thinking level with
   const chatModel = current.ctx.model;
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
   assert.equal(current.ctx.model, chatModel);
   assert.equal(current.ctx.thinkingLevel, "off");
@@ -104,21 +104,21 @@ test("fallback can be switched off and back on without losing the saved model or
   assert.equal(disabled.dialogs[0].options[1], "Fallback model: On");
   assert.equal(disabled.dialogs.length, 1);
   const selection = { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "low" };
-  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, fallback: selection });
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, remoteCompaction: { enabled: true }, fallback: selection });
   assert.match(disabled.notices[0].message, /Pi will use the chat model/);
 
   const enabled = await fixture([switchChoice]);
   await enabled.run();
   assert.equal(enabled.dialogs[0].options[1], "Fallback model: Off");
   assert.equal(enabled.dialogs.length, 1);
-  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, fallback: { ...selection, enabled: true } });
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, remoteCompaction: { enabled: true }, fallback: { ...selection, enabled: true } });
   assert.match(enabled.notices[0].message, /cheap\/cheap\/model \(low\)/);
 });
 
 test("enabling without a model saves only the switch and remains inactive", async () => {
   const current = await fixture([switchChoice]);
   await current.run();
-  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, fallback: { enabled: true } });
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true } });
   assert.equal(current.dialogs.length, 1);
   assert.match(current.notices[0].message, /No fallback model configured; inactive/);
 });
@@ -128,7 +128,7 @@ test("configuring a model after enabling the switch preserves the on state", asy
   const current = await fixture([firstChoice, firstChoice, "high"]);
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
 });
 
@@ -137,7 +137,7 @@ test("changing the model or thinking level while disabled preserves the off stat
   const current = await fixture([firstChoice, firstChoice, "high"]);
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
   assert.match(current.notices[0].message, /Off/);
 });
@@ -286,7 +286,7 @@ test("TUI Enter toggles twice on the same settings row without a secondary scree
   assert.equal(current.notices.length, 2);
   assert.equal(current.dialogs.length, 0);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
   });
   assert.match(rendered.join("\n"), /Fallback model/);
 });
@@ -296,7 +296,7 @@ test("TUI fuzzy search filters models by name while keeping the switch off", asy
   const rendered = driveTui(current, [["\u001b[B", "\r"], ["CheapModel", "\r"], ["\u001b"]]);
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
   assert.match(rendered.join("\n"), /type to search/);
 });
@@ -328,6 +328,13 @@ test("RPC V2 toggle saves the switch and preserves the fallback selection", asyn
     fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
   });
   assert.match(current.notices[0].message, /Remote Compaction V2 is Off/);
+  const enabled = await fixture([async (options) => options[2]]);
+  await enabled.run();
+  assert.equal(enabled.dialogs[0].options[2], "Remote Compaction V2: Off");
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 1, remoteCompaction: { enabled: true },
+    fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+  });
 });
 
 test("TUI V2 Enter toggles twice on the same row without opening a secondary screen", async () => {
@@ -340,7 +347,7 @@ test("TUI V2 Enter toggles twice on the same row without opening a secondary scr
   assert.match(current.notices[1].message, /V2 is On/);
   assert.equal(current.dialogs.length, 0);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
   });
   assert.match(rendered.join("\n"), /Remote Compaction V2/);
 });

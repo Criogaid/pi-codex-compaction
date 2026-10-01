@@ -127,7 +127,7 @@ export async function loadCompactionSettings(path: string) {
         const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
         const bytes = Buffer.from(`${JSON.stringify({
           version: SETTINGS_VERSION,
-          ...(selection.remoteCompactionEnabled === DEFAULT_REMOTE_COMPACTION_ENABLED ? {} : { remoteCompaction: { enabled: selection.remoteCompactionEnabled } }),
+          remoteCompaction: { enabled: selection.remoteCompactionEnabled },
           ...(selection.fallback === undefined ? {} : { fallback: selection.fallback }),
         }, null, 2)}\n`);
         if (bytes.length > MAX_SETTINGS_BYTES) throw new Error(`Compaction settings must not exceed ${MAX_SETTINGS_BYTES} bytes`);
