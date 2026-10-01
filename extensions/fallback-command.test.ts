@@ -253,7 +253,7 @@ test("an atomic settings update does not replace a symbolic link", async (t) => 
 
 type CustomFactory = Parameters<ExtensionCommandContext["ui"]["custom"]>[0];
 
-function driveTui(current: Awaited<ReturnType<typeof fixture>>, screens: readonly (readonly string[])[]) {
+function driveTui(current: Awaited<ReturnType<typeof fixture>>, screens: readonly (readonly string[])[], observeFrame?: (lines: readonly string[]) => void) {
   initTheme("dark", false);
   current.ctx.mode = "tui";
   const remaining = [...screens];
@@ -271,7 +271,9 @@ function driveTui(current: Awaited<ReturnType<typeof fixture>>, screens: readonl
     assert.ok(keys, "Unexpected extra screen");
     for (const key of keys) {
       rendered.push(...component.render(80));
-      rendered.push(...component.render(1_000));
+      const frame = component.render(1_000);
+      rendered.push(...frame);
+      observeFrame?.(frame);
       component.handleInput?.(key);
     }
     rendered.push(...component.render(32));
@@ -497,3 +499,17 @@ for (const mode of ["rpc", "tui"] as const) {
     assert.equal(current.notices[0].level, "info");
   });
 }
+
+test("TUI invalid fallback model row describes the settings validation error", async () => {
+  await writeSettings(invalidFallbackSettings);
+  const current = await fixture([]);
+  let selectedFrame: readonly string[] = [];
+  driveTui(current, [["\u001b[B", "\u001b[B", "\u001b"]], (frame) => { selectedFrame = frame; });
+  await current.run();
+  const lines = selectedFrame.map(stripVTControlCharacters);
+  assert.match(lines.join("\n"), /Model and thinking level\s+Invalid/);
+  assert.ok(lines.some((line) => line.trim() === invalidFallbackError),
+    `Expected the model row to describe: ${invalidFallbackError}\nRendered menu:\n${lines.join("\n")}`);
+  assert.deepEqual(current.notices, []);
+  assert.equal(await readFile(settingsPath, "utf8"), invalidFallbackSettings);
+});

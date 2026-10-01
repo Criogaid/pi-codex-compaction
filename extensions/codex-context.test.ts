@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   SessionManager,
+  type BeforeProviderRequestEvent,
   type ContextEvent,
   type ContextWithSystemEvent,
   type ExtensionAPI,
@@ -18,8 +19,10 @@ const childTimeoutMs = 30_000;
 const maxChildOutputBytes = 1024 * 1024;
 if (!process.execArgv.includes(mockFlag)) {
   test("context hooks fingerprint and capture only V2-capable requests", () => {
+    const childEnv = { ...process.env };
+    delete childEnv.NODE_TEST_CONTEXT;
     const child = spawnSync(process.execPath, [mockFlag, "--test", fileURLToPath(import.meta.url)], {
-      encoding: "utf8", timeout: childTimeoutMs, maxBuffer: maxChildOutputBytes,
+      encoding: "utf8", timeout: childTimeoutMs, maxBuffer: maxChildOutputBytes, env: childEnv,
     });
     assert.ifError(child.error);
     assert.equal(child.status, 0, `${child.stdout}\n${child.stderr}`);
@@ -28,14 +31,17 @@ if (!process.execArgv.includes(mockFlag)) {
   isolateAgentConfig();
   test("context hook capability gating preserves supported snapshots and clears unsupported requests", async (t) => {
     const checkpoint = await import("./checkpoint.js");
-    const snapshots = await import("./request-snapshot.js");
     const fingerprint = t.mock.fn(checkpoint.fingerprintMessage);
-    const capture = t.mock.fn(snapshots.captureContextSnapshot);
     t.mock.module(new URL("./checkpoint.js", import.meta.url).href, {
       namedExports: { ...checkpoint, fingerprintMessage: fingerprint },
     });
+    const snapshots = await import("./request-snapshot.js");
+    let latestTracker: InstanceType<typeof snapshots.RequestSnapshotTracker> | undefined;
+    class ObservedTracker extends snapshots.RequestSnapshotTracker {
+      constructor() { super(); latestTracker = this; }
+    }
     t.mock.module(new URL("./request-snapshot.js", import.meta.url).href, {
-      namedExports: { ...snapshots, captureContextSnapshot: capture },
+      namedExports: { ...snapshots, RequestSnapshotTracker: ObservedTracker },
     });
     const { createCodexCompactionExtension } = await import("./codex-compaction.js");
     const supported: Model<"openai-responses"> = {
@@ -44,17 +50,19 @@ if (!process.execArgv.includes(mockFlag)) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 10_000,
       compat: { supportsLongCacheRetention: true, ...{ remoteCompaction: { protocol: "v2" } } },
     };
-    type Hook = (event: ContextEvent | ContextWithSystemEvent, ctx: ExtensionContext) => unknown;
+    type HookEvent = ContextEvent | ContextWithSystemEvent | BeforeProviderRequestEvent;
+    type Hook = (event: HookEvent, ctx: ExtensionContext) => unknown;
 
     function fixture(currentModel: Model<Api> | undefined) {
       fingerprint.mock.resetCalls();
-      capture.mock.resetCalls();
       const hooks = new Map<string, Hook>();
       const pi = {
         on(name: string, handler: Hook) { hooks.set(name, handler); },
         registerCommand() {}, registerEntryRenderer() {},
       } as unknown as ExtensionAPI;
       createCodexCompactionExtension()(pi);
+      const tracker = latestTracker;
+      assert.ok(tracker);
       const session = SessionManager.inMemory();
       session.appendMessage({ role: "system", content: "Canonical prompt", timestamp: 0 });
       session.appendMessage({ role: "user", content: "Canonical request", timestamp: 1 });
@@ -67,8 +75,9 @@ if (!process.execArgv.includes(mockFlag)) {
         type: "context_with_system", messages: canonical.map((message) => message.role === "user"
           ? { ...message, content: "Projected request" } : message),
       };
-      const ctx = { model: currentModel, sessionManager: session, hasUI: false } as unknown as ExtensionContext;
-      return { ctx, event, projected, async run(input: ContextEvent | ContextWithSystemEvent) {
+      const ctx = { model: currentModel, sessionManager: session, hasUI: false, getSystemPrompt: () => "Canonical prompt" } as unknown as ExtensionContext;
+      const providerEvent: BeforeProviderRequestEvent = { type: "before_provider_request", payload: {} };
+      return { ctx, event, projected, providerEvent, tracker, async run(input: HookEvent) {
         const hook = hooks.get(input.type);
         assert.ok(hook, `${input.type} must be registered`);
         return hook(input, ctx);
@@ -79,17 +88,18 @@ if (!process.execArgv.includes(mockFlag)) {
       const current = fixture(supported);
       assert.equal(await current.run(current.event), undefined);
       assert.deepEqual(fingerprint.mock.calls.map((call) => call.arguments[0]), current.event.messages);
-      assert.equal(capture.mock.callCount(), 0, "capture waits for the system-inclusive projection");
+      assert.equal(current.tracker.current().context, undefined, "capture waits for the system-inclusive projection");
       await current.run(current.projected);
-      assert.equal(capture.mock.callCount(), 1);
-      const snapshot = capture.mock.calls[0].result;
+      assert.equal(current.tracker.current().context, undefined, "publish waits for the provider request");
+      await current.run(current.providerEvent);
+      const snapshot = current.tracker.current().context;
       assert.ok(snapshot);
       assert.equal(snapshot.sessionId, current.ctx.sessionManager.getSessionId());
       assert.equal(snapshot.identity.modelId, supported.id);
       assert.deepEqual(snapshot.messages, current.projected.messages);
       assert.notEqual(snapshot.messages, current.projected.messages, "capture retains a copy");
-      await current.run(current.projected);
-      assert.equal(capture.mock.callCount(), 1, "the pending source is consumed once");
+      await current.run(current.providerEvent);
+      assert.equal(current.tracker.current().context, snapshot, "a provider retry publishes the same snapshot");
     });
 
     for (const { name, model } of [
@@ -102,10 +112,12 @@ if (!process.execArgv.includes(mockFlag)) {
         assert.equal(await current.run(current.event), undefined);
         assert.equal(fingerprint.mock.callCount(), 0);
         await current.run(current.projected);
-        assert.equal(capture.mock.callCount(), 0);
+        await current.run(current.providerEvent);
+        assert.equal(current.tracker.current().context, undefined);
         current.ctx.model = supported;
         await current.run(current.projected);
-        assert.equal(capture.mock.callCount(), 0, "unsupported context cannot leave a source for a later capable model");
+        await current.run(current.providerEvent);
+        assert.equal(current.tracker.current().context, undefined, "unsupported context cannot leave a source for a later capable model");
         assert.equal(fingerprint.mock.callCount(), 0);
       });
     }
@@ -120,7 +132,30 @@ if (!process.execArgv.includes(mockFlag)) {
       assert.equal(fingerprint.mock.callCount(), 0);
       current.ctx.model = supported;
       await current.run(current.projected);
-      assert.equal(capture.mock.callCount(), 0);
+      await current.run(current.providerEvent);
+      assert.equal(current.tracker.current().context, undefined);
+    });
+
+    await t.test("recordContext without a target skips fingerprints and clears both pending stages", () => {
+      const tracker = new snapshots.RequestSnapshotTracker();
+      const canonical = [{ role: "user" as const, content: "source", timestamp: 1 }];
+      fingerprint.mock.resetCalls();
+      tracker.recordContext("session", undefined, canonical);
+      assert.equal(fingerprint.mock.callCount(), 0);
+      const target = { model: supported, identity: { provider: supported.provider, api: supported.api,
+        modelId: supported.id, baseUrl: supported.baseUrl, endpoint: `${supported.baseUrl}/responses` } };
+      tracker.recordContext("session", target, canonical);
+      tracker.recordProjectedRequest("session", target, () => canonical, () => undefined, canonical);
+      fingerprint.mock.resetCalls();
+      tracker.recordContext("session", undefined, structuredClone(canonical));
+      assert.equal(fingerprint.mock.callCount(), 0);
+      tracker.recordProviderRequest("session", undefined, () => assert.fail("canonical must stay lazy"),
+        () => assert.fail("prompt must stay lazy"));
+      assert.equal(tracker.current().context, undefined, "unsupported context clears a pending projected snapshot");
+      assert.equal(tracker.current().promptOverride, undefined);
+      tracker.recordProjectedRequest("session", target, () => assert.fail("unsupported context clears its pending source"),
+        () => assert.fail("checkpoint must stay lazy"), canonical);
+      assert.equal(fingerprint.mock.callCount(), 0);
     });
   });
 }

@@ -3,7 +3,8 @@ import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { parseSkillBlock } from "@earendil-works/pi-coding-agent";
 import type { ImageEstimates } from "./image-budget.js";
-import { contextUserItems, historyGroups, prepareRetention, userItemOrigins } from "./retention-input.js";
+import { contextUserItems, prepareRetention, userItemOrigins } from "./retention-input.js";
+import { historyGroups } from "./history-groups.js";
 
 const user = (text: string) => ({ role: "user", content: [{ type: "input_text", text }] });
 const notice = { role: "developer", content: [{ type: "input_text", text: " <IMAGE_RESIZE_NOTICE>resized</IMAGE_RESIZE_NOTICE> " }] };

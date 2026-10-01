@@ -18,6 +18,7 @@ import {
   latestCheckpoint,
   parseCheckpointDetails,
   projectCheckpointContext,
+  withoutSystemMessages,
 } from "./checkpoint.js";
 
 const identity: ProviderIdentity = {
@@ -324,4 +325,33 @@ test("does not guess an unverifiable legacy locale or rewrite its checkpoint", (
   assert.deepEqual(active.details.keptMessageFingerprints, details.keptMessageFingerprints);
   assert.equal(projectCheckpointContext(session.buildSessionProjection().messages, active.details), undefined);
   assert.deepEqual(session.getEntries(), saved);
+});
+
+test("withoutSystemMessages removes interleaved system messages while preserving order and references", () => {
+  const first = user("first", 1);
+  const tool: AgentMessage = { role: "toolResult", toolCallId: "call", toolName: "read",
+    content: [{ type: "text", text: "system" }], isError: false, timestamp: 3 };
+  const custom: AgentMessage = { role: "custom", customType: "system", content: "metadata", display: false, timestamp: 5 };
+  const last = user("last", 7);
+  const input: readonly AgentMessage[] = Object.freeze([
+    { role: "system", content: "first prompt", timestamp: 0 }, first,
+    { role: "system", content: "middle prompt", timestamp: 2 }, tool,
+    { role: "system", content: "another prompt", timestamp: 4 }, custom, last,
+    { role: "system", content: "last prompt", timestamp: 8 },
+  ]);
+  const saved = structuredClone(input);
+  const result = withoutSystemMessages(input);
+  const expected = [first, tool, custom, last];
+  assert.deepEqual(result, expected);
+  for (const [index, message] of expected.entries()) assert.equal(result[index], message);
+  assert.deepEqual(input, saved);
+});
+
+test("withoutSystemMessages handles empty and all-system transcripts and only filters the exact role", () => {
+  assert.deepEqual(withoutSystemMessages([]), []);
+  assert.deepEqual(withoutSystemMessages([{ role: "system" }, { role: "system" }]), []);
+  const input = [{ role: "SYSTEM", text: "preserve case" }, { role: "user", text: "preserve" }];
+  const result = withoutSystemMessages(input);
+  assert.deepEqual(result, input);
+  assert.notEqual(result, input);
 });
