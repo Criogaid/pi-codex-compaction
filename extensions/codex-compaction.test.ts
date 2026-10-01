@@ -1171,8 +1171,8 @@ test("uses the configured fallback after a remote failure and preserves legacy b
   assert.ok(fixture.notifications.some((item) => item.message.includes("using Pi compaction")));
 });
 
-test("successful remote compaction does not read malformed fallback settings", async () => {
-  await writeFile(fallbackSettingsPath, "invalid JSON");
+test("successful remote compaction does not validate an unused malformed fallback section", async () => {
+  await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, fallback: null }));
   const fixture = await fallbackFixture({ currentModel: model });
   const result = await fixture.run();
   assert.ok(result?.compaction);
@@ -1388,4 +1388,107 @@ test("native Responses fallback authenticates and retries with the configured ef
   assert.doesNotMatch(JSON.stringify(payloads[1]), /compaction_trigger/);
   assert.match(JSON.stringify(payloads[1]), /older task/);
   assert.equal(fixture.ctx.model, astraModel);
+});
+
+for (const reason of ["manual", "threshold", "overflow"] as const) {
+  test(`V2 off uses the configured text fallback for ${reason} compaction without a remote request`, async () => {
+    await writeFile(fallbackSettingsPath, JSON.stringify({
+      version: 1, remoteCompaction: { enabled: false },
+      fallback: { enabled: true, provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "high" },
+    }));
+    const fixture = await fallbackFixture({ currentModel: model });
+    fixture.event.reason = reason;
+    fixture.event.willRetry = reason === "overflow";
+    fixture.event.customInstructions = "Preserve the V2 switch test.";
+    const result = await fixture.run();
+    assert.ok(result?.compaction);
+    assert.equal(parseCheckpointDetails(result.compaction.details), undefined);
+    assert.equal(fixture.remoteRequests(), 0);
+    assert.equal(fixture.calls.length, 1);
+    assert.equal(fixture.calls[0].options?.reasoning, "high");
+    assert.match(JSON.stringify(fixture.calls[0].context), /Preserve the V2 switch test/);
+    assert.equal(fixture.ctx.model, model);
+    assert.equal(fixture.mock.pi.getThinkingLevel(), "low");
+  });
+}
+
+for (const fallback of [undefined, { enabled: true }, { enabled: false, provider: "missing", model: "missing", thinkingLevel: "high" }]) {
+  test(`V2 off delegates to Pi when fallback is inactive (${JSON.stringify(fallback)})`, async () => {
+    await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, remoteCompaction: { enabled: false }, fallback }));
+    const fixture = await fallbackFixture({ currentModel: model });
+    assert.equal(await fixture.run(), undefined);
+    assert.equal(fixture.remoteRequests(), 0);
+    assert.equal(fixture.calls.length, 0);
+    assert.equal(fixture.ctx.model, model);
+  });
+}
+
+test("turning V2 back on restores remote compaction on the next attempt", async () => {
+  const fixture = await fallbackFixture({ currentModel: model });
+  await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, remoteCompaction: { enabled: false } }));
+  assert.equal(await fixture.run(), undefined);
+  assert.equal(fixture.remoteRequests(), 0);
+  await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, remoteCompaction: { enabled: true } }));
+  const result = await fixture.run();
+  assert.ok(result?.compaction && parseCheckpointDetails(result.compaction.details));
+  assert.equal(fixture.remoteRequests(), 1);
+  assert.equal(fixture.calls.length, 0);
+});
+
+test("V2 off still stops compaction when the enabled fallback fails", async () => {
+  await writeFile(fallbackSettingsPath, JSON.stringify({
+    version: 1, remoteCompaction: { enabled: false },
+    fallback: { enabled: true, provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "high" },
+  }));
+  const fixture = await fallbackFixture({ currentModel: model, stopReason: "error" });
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.remoteRequests(), 0);
+  assert.equal(fixture.calls.length, 1);
+});
+
+test("a settings edit during a remote request applies to the next compaction only", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture({ currentModel: model });
+  fixture.mock.events.clear();
+  createCodexCompactionExtension({ fetch: async () => {
+    await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, remoteCompaction: { enabled: false }, fallback: { enabled: false } }));
+    return new Response("", { headers: { "content-type": "text/event-stream" } });
+  } })(fixture.mock.pi);
+  assert.ok((await fixture.run())?.compaction);
+  assert.equal(fixture.remoteRequests(), 1);
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(await fixture.run(), undefined);
+  assert.equal(fixture.remoteRequests(), 1);
+  assert.equal(fixture.calls.length, 1);
+});
+
+test("V2 off preserves replay of an existing opaque checkpoint", async () => {
+  const mock = mockPi();
+  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  const session = SessionManager.inMemory();
+  session.appendMessage({ role: "user", content: "older", timestamp: 0 });
+  const firstKept = session.appendMessage({ role: "user", content: "retained", timestamp: 1 });
+  const current = await context({ sessionManager: session });
+  const details = await compactSession(mock, session, firstKept, current);
+  await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, remoteCompaction: { enabled: false } }));
+  await assertSessionReplay(mock, session, current, details);
+});
+
+for (const remoteCompaction of [null, true, {}, { enabled: "false" }, { enabled: 0 }, { enabled: false, unexpected: true }]) {
+  test(`invalid V2 settings stop before remote or fallback requests (${JSON.stringify(remoteCompaction)})`, async () => {
+    await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, remoteCompaction }));
+    const fixture = await fallbackFixture({ currentModel: model });
+    assert.deepEqual(await fixture.run(), { cancel: true });
+    assert.equal(fixture.remoteRequests(), 0);
+    assert.equal(fixture.calls.length, 0);
+    assert.ok(fixture.notifications.some((notice) => notice.level === "error" && notice.message.includes("compaction stopped")));
+  });
+}
+
+test("malformed JSON stops before any remote request because the V2 switch cannot be read", async () => {
+  await writeFile(fallbackSettingsPath, "invalid JSON");
+  const fixture = await fallbackFixture({ currentModel: model });
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.remoteRequests(), 0);
+  assert.equal(fixture.calls.length, 0);
 });

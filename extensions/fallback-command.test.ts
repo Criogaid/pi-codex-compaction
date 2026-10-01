@@ -7,10 +7,10 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
 import { createCodexCompactionExtension } from "./codex-compaction.js";
-import { FALLBACK_SETTINGS_RELATIVE_PATH } from "./fallback-settings.js";
+import { COMPACTION_SETTINGS_RELATIVE_PATH } from "./fallback-settings.js";
 import { isolateAgentConfig, testRegistry } from "./test-registry.test.js";
 
-const settingsPath = join(isolateAgentConfig(), FALLBACK_SETTINGS_RELATIVE_PATH);
+const settingsPath = join(isolateAgentConfig(), COMPACTION_SETTINGS_RELATIVE_PATH);
 const settingsDirectory = dirname(settingsPath);
 const model: Model<"openai-responses"> = {
   id: "cheap/model", name: "Cheap model", provider: "cheap", api: "openai-responses",
@@ -315,4 +315,76 @@ test("RPC model search filters the offered choices", async () => {
   await current.run();
   assert.deepEqual(current.dialogs[1].options, []);
   await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
+});
+
+test("RPC V2 toggle saves the switch and preserves the fallback selection", async () => {
+  await writeSettings();
+  const current = await fixture([async (options) => options[2]]);
+  await current.run();
+  assert.equal(current.dialogs[0].options[2], "Remote Compaction V2: On");
+  assert.equal(current.dialogs.length, 1);
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 1, remoteCompaction: { enabled: false },
+    fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+  });
+  assert.match(current.notices[0].message, /Remote Compaction V2 is Off/);
+});
+
+test("TUI V2 Enter toggles twice on the same row without opening a secondary screen", async () => {
+  await writeSettings();
+  const current = await fixture([]);
+  const rendered = driveTui(current, [["\u001b[A", "\r"], ["\r"], ["\u001b"]]);
+  await current.run();
+  assert.equal(current.notices.length, 2);
+  assert.match(current.notices[0].message, /V2 is Off/);
+  assert.match(current.notices[1].message, /V2 is On/);
+  assert.equal(current.dialogs.length, 0);
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+  });
+  assert.match(rendered.join("\n"), /Remote Compaction V2/);
+});
+
+test("changing the fallback model preserves the V2 off switch", async () => {
+  await writeSettings(JSON.stringify({ version: 1, remoteCompaction: { enabled: false }, fallback: { enabled: true } }));
+  const current = await fixture([firstChoice, firstChoice, "high"]);
+  await current.run();
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 1, remoteCompaction: { enabled: false },
+    fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "high" },
+  });
+});
+
+test("changing the fallback switch preserves the V2 off switch", async () => {
+  await writeSettings(JSON.stringify({ version: 1, remoteCompaction: { enabled: false } }));
+  const current = await fixture([switchChoice]);
+  await current.run();
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 1, remoteCompaction: { enabled: false }, fallback: { enabled: true },
+  });
+});
+
+test("V2 switch saves reject intervening edits without replacing the new settings", async () => {
+  await writeSettings();
+  const edited = JSON.stringify({ version: 1, remoteCompaction: { enabled: false }, fallback: { enabled: false } });
+  const current = await fixture([async (options) => {
+    await writeFile(settingsPath, edited);
+    return options[2];
+  }]);
+  await current.run();
+  assert.equal(await readFile(settingsPath, "utf8"), edited);
+  assert.equal(current.notices[0].level, "error");
+  assert.match(current.notices[0].message, /changed while the menu was open/);
+  assert.deepEqual(await readdir(settingsDirectory), ["config.json"]);
+});
+
+test("an invalid V2 switch prevents menu edits without exposing file contents", async () => {
+  const invalid = JSON.stringify({ version: 1, remoteCompaction: { enabled: "private-file-value" } });
+  await writeSettings(invalid);
+  const current = await fixture([switchChoice]);
+  await current.run();
+  assert.equal(await readFile(settingsPath, "utf8"), invalid);
+  assert.equal(current.dialogs.length, 0);
+  assert.match(current.notices[0].message, /boolean enabled/);
+  assert.doesNotMatch(current.notices[0].message, /private-file-value/);
 });

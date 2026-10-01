@@ -19,7 +19,17 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 
 安装后无需配置。使用 Pi 官方 `openai-codex` 模型时，手动执行 `/compact` 或触发 Pi 自动压缩，扩展会优先尝试 remote compaction。
 
-压缩开始和完成时会显示提示。默认情况下，remote compaction 失败时显示 warning，并由 Pi 使用当前对话模型执行原生 compaction；当前模型不支持 remote compaction 时也由 Pi 原生处理。可以按下面的配置为这两种情况指定独立的压缩模型。
+压缩开始和完成时会显示提示。默认情况下，remote compaction 失败时显示 warning，并由 Pi 使用当前对话模型执行原生 compaction；当前模型不支持 remote compaction 时也由 Pi 原生处理。可以通过 `/codex-compaction` 关闭 V2，或为文本压缩指定独立模型。
+
+### Remote Compaction V2 开关
+
+`/codex-compaction` 菜单中的 `Remote Compaction V2` 默认 On。终端按回车或空格直接切换并保存，保持选中同一行；RPC 选中该项直接切换。关闭后不发起新的 V2 压缩请求：fallback 开关已开启且模型已配置时调用该模型，否则由 Pi 使用当前对话模型进行原生文本压缩。手动、自动阈值和上下文溢出压缩共用此规则。重新开启后，支持该协议的模型恢复优先尝试 V2。
+
+开关只控制后续压缩请求，已有 opaque 检查点仍按原规则重放。关闭 V2 不会把加密历史转换成文本；检查点格式和当前对话模型不变。
+
+要实测指定模型的文本压缩，将 V2 设为 Off、fallback 设为 On 并选好模型和思考等级，然后在已有可压缩内容的会话中执行 `/compact`。开始时应显示 `Using Pi text compaction with <provider>/<model> (<thinkingLevel>).`；还需确认压缩完成、Provider 请求记录使用所选模型，以及后续对话仍使用原模型。测试结束后按需把 V2 恢复 On。
+
+每次压缩开始时读取一次配置，期间修改应用于下次压缩。配置文件无法读取、JSON 无效或 V2 开关格式错误时停止压缩；V2 成功时不校验尚未用到的 fallback 部分。
 
 ### 指定降级压缩模型
 
@@ -34,6 +44,9 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 ```json
 {
   "version": 1,
+  "remoteCompaction": {
+    "enabled": true
+  },
   "fallback": {
     "enabled": true,
     "provider": "your-provider",
@@ -45,15 +58,15 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 
 将 `provider` 和 `model` 替换为 Pi 中已配置的实际 ID；显示名称不能代替 ID。模型必须支持指定的 `thinkingLevel`，例如 `high` 或 `off`。扩展通过 Pi 的模型注册表使用该模型的认证、Provider 配置与思考等级映射，不需要额外配置 API key。
 
-Remote Compaction V2 成功时继续使用当前模型的 opaque 检查点。远程请求失败，或当前模型不支持该协议时，扩展使用指定模型调用 Pi 原生文本压缩。手动 `/compact`、自动阈值压缩和上下文溢出恢复共用此规则。例如，使用 Astra 对话时可以把文本压缩交给 `gpt-6.1-sol` 的 `high`，摘要生成后仍由 Astra 继续对话，当前模型和对话思考等级不会被修改。
+Remote Compaction V2 成功时继续使用当前模型的 opaque 检查点。V2 被关闭、远程请求失败或当前模型不支持该协议时，扩展使用已启用的指定模型调用 Pi 原生文本压缩。手动 `/compact`、自动阈值压缩和上下文溢出恢复共用此规则。例如，使用 Astra 对话时可以把文本压缩交给 `gpt-6.1-sol` 的 `high`，摘要生成后仍由 Astra 继续对话，当前模型和对话思考等级不会被修改。
 
 文本压缩复用 Pi 准备的消息范围、已有文本摘要、最近消息保留点、文件操作记录及 `/compact` 自定义指令。摘要用量由实际压缩模型报告并写入 Pi 的压缩记录；需要切分一轮对话时，Pi 可能生成两份摘要并合计用量。Provider 的传输、思考预算、超时与重试沿用 Pi 设置；未设置请求超时时默认使用五分钟。原生摘要请求按 Pi 的规则使用 `cacheRetention: "none"`。选择更低价格的模型可以减少压缩费用，实际费用还取决于输入范围、输出和思考用量。
 
-每次需要降级时重新读取配置，修改后下次降级即生效。`fallback.enabled` 接受布尔值 `true` 或 `false`；旧配置省略该字段时视为 `true`。允许只保存开关，例如 `{"version":1,"fallback":{"enabled":true}}`；模型的 `provider`、`model`、`thinkingLevel` 三个字段必须同时提供或同时省略。模型未配置、开关为 `false`、文件不存在或移除 `fallback` 字段时，恢复 Pi 使用当前对话模型压缩的默认行为，不查找降级模型或调用其 Provider。配置格式错误仍会停止压缩；启用且已配置模型后，模型不可用、认证失败、请求失败、空摘要或达到输出长度上限也会停止此次压缩，避免再次转交当前对话模型。取消或切换会话时不保存压缩结果。
+`remoteCompaction.enabled` 接受布尔值 `true` 或 `false`，省略 `remoteCompaction` 时默认启用 V2；菜单保存时省略默认开启值。`fallback.enabled` 接受布尔值 `true` 或 `false`；旧配置省略该字段时视为 `true`。允许只保存开关，例如 `{"version":1,"fallback":{"enabled":true}}`；模型的 `provider`、`model`、`thinkingLevel` 三个字段必须同时提供或同时省略。模型未配置、fallback 开关为 `false`、文件不存在或移除 `fallback` 字段时，文本压缩使用 Pi 当前对话模型，不查找降级模型或调用其 Provider。需要降级时，fallback 配置错误会停止压缩；启用且已配置模型后，模型不可用、认证失败、请求失败、空摘要或达到输出长度上限也会停止此次压缩，避免再次转交当前对话模型。取消或切换会话时不保存压缩结果。
 
 已有 Codex opaque 检查点中的加密历史不能被另一个 Provider 解读，也不会自动还原成文本。指定模型的降级压缩沿用 Pi 原生准备中可用的摘要和消息范围；本功能不改变 Codex 检查点格式。
 
-配置格式、读取与菜单保存由 [fallback-settings.ts](extensions/fallback-settings.ts) 负责，命令交互由 [fallback-command.ts](extensions/fallback-command.ts) 负责。模型选择与原生摘要请求保留在 [fallback.ts](extensions/fallback.ts)；生命周期与降级决定保留在 [codex-compaction.ts](extensions/codex-compaction.ts)。
+V2 与 fallback 的配置格式、读取与菜单保存由 [fallback-settings.ts](extensions/fallback-settings.ts) 负责，命令交互由 [fallback-command.ts](extensions/fallback-command.ts) 负责。模型选择与原生摘要请求保留在 [fallback.ts](extensions/fallback.ts)；生命周期、V2 开关与降级决定保留在 [codex-compaction.ts](extensions/codex-compaction.ts)。
 
 ### Runtime parameters
 

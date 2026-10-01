@@ -1,13 +1,13 @@
-// Own fallback settings interaction; use Pi widgets without changing the session's model or thinking level.
+// Own compaction settings interaction; use Pi widgets without changing the session's model or thinking level.
 import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
 import { getSelectListTheme, getSettingsListTheme, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Container, fuzzyFilter, Input, SelectList, SettingsList, Text } from "@earendil-works/pi-tui";
-import { loadFallbackSettings, type FallbackConfiguration } from "./fallback-settings.js";
+import { loadCompactionSettings, type CompactionConfiguration, type FallbackConfiguration } from "./fallback-settings.js";
 
 const COMMAND_NAME = "codex-compaction";
 const CHANGE_MODEL = "Choose fallback model and thinking level";
 const MAX_VISIBLE_MODELS = 10;
-type SettingsAction = "model" | "toggle";
+type SettingsAction = "model" | "toggle" | "remote";
 
 function describeFallback(selection: FallbackConfiguration | undefined): string {
   if (selection?.model === undefined) return "No fallback model configured; inactive. Pi uses the chat model.";
@@ -16,21 +16,26 @@ function describeFallback(selection: FallbackConfiguration | undefined): string 
     : `Fallback model is Off. Pi will use the chat model for text compaction. Saved model: ${model}.`;
 }
 
-async function chooseAction(ctx: ExtensionCommandContext, current: FallbackConfiguration | undefined, selected: SettingsAction): Promise<SettingsAction | undefined> {
+async function chooseAction(ctx: ExtensionCommandContext, configuration: CompactionConfiguration, selected: SettingsAction): Promise<SettingsAction | undefined> {
+  const current = configuration.fallback;
+  const remoteValue = configuration.remoteCompactionEnabled ? "On" : "Off";
   const switchValue = current?.enabled ? "On" : "Off";
   if (ctx.mode !== "tui") {
     const switchLabel = `Fallback model: ${switchValue}`;
-    const action = await ctx.ui.select(describeFallback(current), [CHANGE_MODEL, switchLabel]);
+    const remoteLabel = `Remote Compaction V2: ${remoteValue}`;
+    const action = await ctx.ui.select(describeFallback(current), [CHANGE_MODEL, switchLabel, remoteLabel]);
     if (action === undefined) return undefined;
     if (action === CHANGE_MODEL) return "model";
     if (action === switchLabel) return "toggle";
+    if (action === remoteLabel) return "remote";
     throw new Error("Select a listed compaction setting");
   }
   return ctx.ui.custom<SettingsAction | undefined>((tui, _theme, _keys, done) => {
     const list = new SettingsList([
       { id: "toggle", label: "Fallback model", currentValue: switchValue, values: ["Off", "On"], description: describeFallback(current) },
       { id: "model", label: "Model and thinking level", currentValue: current?.model === undefined ? "Not configured" : `${current.provider}/${current.model} (${current.thinkingLevel})`, values: ["Choose"], description: "Choose a model; this does not change the switch." },
-    ], 2, getSettingsListTheme(), (id) => done(id === "toggle" ? "toggle" : "model"), () => done(undefined));
+      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When Off, use the configured fallback or Pi's chat-model text compaction. Existing checkpoints still replay." },
+    ], 3, getSettingsListTheme(), (id) => done(id === "toggle" ? "toggle" : id === "remote" ? "remote" : "model"), () => done(undefined));
     list.selectItem(selected);
     return {
       render: (width) => list.render(width),
@@ -88,21 +93,28 @@ async function chooseModel(ctx: ExtensionCommandContext, models: readonly Model<
   });
 }
 
-async function configureFallback(path: string, ctx: ExtensionCommandContext): Promise<void> {
+async function configureCompaction(path: string, ctx: ExtensionCommandContext): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify(`/${COMMAND_NAME} requires interactive or RPC mode; edit ${path} directly.`, "warning");
     return;
   }
   let selected: SettingsAction = "toggle";
   while (true) {
-    const settings = await loadFallbackSettings(path);
-    const current = settings.fallback;
-    const action = await chooseAction(ctx, current, selected);
+    const settings = await loadCompactionSettings(path);
+    const configuration = settings.configuration;
+    const current = configuration.fallback;
+    const action = await chooseAction(ctx, configuration, selected);
     if (action === undefined) return;
     selected = action;
-    if (action === "toggle") {
-      const selection = { ...current, enabled: !current?.enabled };
+    if (action === "remote") {
+      const selection = { remoteCompactionEnabled: !configuration.remoteCompactionEnabled, fallback: current };
       await settings.save(selection);
+      ctx.ui.notify(selection.remoteCompactionEnabled
+        ? "Remote Compaction V2 is On. Supported models try V2 before text fallback."
+        : "Remote Compaction V2 is Off. Text compaction uses the configured fallback when enabled; otherwise Pi uses the chat model.", "info");
+    } else if (action === "toggle") {
+      const selection = { ...current, enabled: !current?.enabled };
+      await settings.save({ remoteCompactionEnabled: configuration.remoteCompactionEnabled, fallback: selection });
       ctx.ui.notify(describeFallback(selection), "info");
     } else {
       const models = [...ctx.modelRegistry.getAvailable()].sort((left, right) => {
@@ -121,7 +133,7 @@ async function configureFallback(path: string, ctx: ExtensionCommandContext): Pr
             const thinkingLevel = levels.find((level) => level === chosenLevel);
             if (thinkingLevel === undefined) throw new Error("Select a supported fallback thinking level");
             const selection = { enabled: current?.enabled ?? false, provider: model.provider, model: model.id, thinkingLevel };
-            await settings.save(selection);
+            await settings.save({ remoteCompactionEnabled: configuration.remoteCompactionEnabled, fallback: selection });
             ctx.ui.notify(describeFallback(selection), "info");
           }
         }
@@ -132,15 +144,15 @@ async function configureFallback(path: string, ctx: ExtensionCommandContext): Pr
   }
 }
 
-export function registerFallbackCommand(pi: ExtensionAPI, path: string): void {
+export function registerCompactionCommand(pi: ExtensionAPI, path: string): void {
   pi.registerCommand(COMMAND_NAME, {
-    description: "Configure the fallback compaction model and thinking level",
+    description: "Configure V2 and fallback compaction settings",
     handler: async (args, ctx) => {
       try {
         if (args.trim()) throw new Error(`Usage: /${COMMAND_NAME}`);
-        await configureFallback(path, ctx);
+        await configureCompaction(path, ctx);
       } catch (error) {
-        ctx.ui.notify(error instanceof Error ? error.message : "Could not configure fallback compaction", "error");
+        ctx.ui.notify(error instanceof Error ? error.message : "Could not configure compaction settings", "error");
       }
     },
   });

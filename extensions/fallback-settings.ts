@@ -1,12 +1,13 @@
-// Own the fallback configuration format and revision-bound file updates used by compaction and its command.
+// Own compaction settings, lazy fallback validation, and revision-bound file updates.
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { isObject } from "./protocol.js";
 
-export const FALLBACK_SETTINGS_RELATIVE_PATH = "extensions/pi-codex-compaction/config.json";
+export const COMPACTION_SETTINGS_RELATIVE_PATH = "extensions/pi-codex-compaction/config.json";
 const LEGACY_FALLBACK_ENABLED = true;
+export const DEFAULT_REMOTE_COMPACTION_ENABLED = true;
 const SETTINGS_VERSION = 1;
 const MAX_SETTINGS_BYTES = 16 * 1024;
 const DEFAULT_FILE_MODE = 0o600;
@@ -16,6 +17,11 @@ export type FallbackConfiguration = { readonly enabled: boolean } & (
   | { readonly provider: string; readonly model: string; readonly thinkingLevel: string }
   | { readonly provider?: never; readonly model?: never; readonly thinkingLevel?: never }
 );
+
+export interface CompactionConfiguration {
+  readonly remoteCompactionEnabled: boolean;
+  readonly fallback: FallbackConfiguration | undefined;
+}
 
 interface SettingsFile {
   readonly bytes: Buffer | undefined;
@@ -28,11 +34,11 @@ async function readSettingsFile(path: string): Promise<SettingsFile> {
     file = await open(path, "r");
   } catch (error) {
     if (isObject(error) && error.code === "ENOENT") return { bytes: undefined, mode: DEFAULT_FILE_MODE };
-    throw new Error(`Could not open fallback settings at ${path}`, { cause: error });
+    throw new Error(`Could not open compaction settings at ${path}`, { cause: error });
   }
   try {
     const stat = await file.stat();
-    if (!stat.isFile()) throw new Error("Fallback settings must be a regular file");
+    if (!stat.isFile()) throw new Error("Compaction settings must be a regular file");
     const bytes = Buffer.alloc(MAX_SETTINGS_BYTES + 1);
     let length = 0;
     while (length < bytes.length) {
@@ -40,25 +46,45 @@ async function readSettingsFile(path: string): Promise<SettingsFile> {
       if (bytesRead === 0) break;
       length += bytesRead;
     }
-    if (length > MAX_SETTINGS_BYTES) throw new Error(`Fallback settings must not exceed ${MAX_SETTINGS_BYTES} bytes`);
+    if (length > MAX_SETTINGS_BYTES) throw new Error(`Compaction settings must not exceed ${MAX_SETTINGS_BYTES} bytes`);
     return { bytes: bytes.subarray(0, length), mode: stat.mode & FILE_PERMISSION_MASK };
   } catch (error) {
-    throw new Error(`Could not read fallback settings at ${path}; use a UTF-8 JSON object within ${MAX_SETTINGS_BYTES} bytes`, { cause: error });
+    throw new Error(`Could not read compaction settings at ${path}; use a UTF-8 JSON object within ${MAX_SETTINGS_BYTES} bytes`, { cause: error });
   } finally {
     await file.close();
   }
 }
 
-function parseSettings(bytes: Buffer | undefined): FallbackConfiguration | undefined {
-  if (bytes === undefined) return undefined;
+function parseSettings(bytes: Buffer | undefined): CompactionConfiguration {
+  if (bytes === undefined) return { remoteCompactionEnabled: DEFAULT_REMOTE_COMPACTION_ENABLED, fallback: undefined };
   // Accept a UTF-8 BOM, reject invalid bytes, and never echo file contents in errors.
   const settings: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  if (!isObject(settings) || Object.keys(settings).some((key) => !["version", "fallback"].includes(key))) {
-    throw new Error("Fallback settings must be an object with version and the optional fallback field");
+  if (!isObject(settings) || Object.keys(settings).some((key) => !["version", "remoteCompaction", "fallback"].includes(key))) {
+    throw new Error("Compaction settings must be an object with version and optional remoteCompaction and fallback fields");
   }
-  if (!("fallback" in settings)) return undefined;
-  if (settings.version !== SETTINGS_VERSION) throw new Error(`version must be ${SETTINGS_VERSION} when fallback is configured`);
-  const fallback = settings.fallback;
+  if (("fallback" in settings || "remoteCompaction" in settings) && settings.version !== SETTINGS_VERSION) {
+    throw new Error(`version must be ${SETTINGS_VERSION} when compaction settings are configured`);
+  }
+  let remoteCompactionEnabled = DEFAULT_REMOTE_COMPACTION_ENABLED;
+  if ("remoteCompaction" in settings) {
+    const remote = settings.remoteCompaction;
+    if (!isObject(remote) || Object.keys(remote).some((key) => key !== "enabled") || typeof remote.enabled !== "boolean") {
+      throw new Error("remoteCompaction must be an object with a boolean enabled field");
+    }
+    remoteCompactionEnabled = remote.enabled;
+  }
+  let resolvedFallback: { readonly value: FallbackConfiguration | undefined } | undefined;
+  return {
+    remoteCompactionEnabled,
+    // Successful V2 requests do not need to resolve or validate fallback settings.
+    get fallback() {
+      resolvedFallback ??= { value: "fallback" in settings ? parseFallback(settings.fallback) : undefined };
+      return resolvedFallback.value;
+    },
+  };
+}
+
+function parseFallback(fallback: unknown): FallbackConfiguration {
   if (!isObject(fallback) || Object.keys(fallback).some((key) => !["enabled", "provider", "model", "thinkingLevel"].includes(key))) {
     throw new Error("fallback must be an object with only enabled, provider, model, and thinkingLevel fields");
   }
@@ -84,28 +110,32 @@ function parseSettings(bytes: Buffer | undefined): FallbackConfiguration | undef
   };
 }
 
-/** Capture settings for display or execution. Saving detects intervening edits and replaces the file atomically. */
-export async function loadFallbackSettings(path: string) {
+/** Capture one revision; reading configuration.fallback validates it on demand and can throw. Saving detects edits before atomic replacement. */
+export async function loadCompactionSettings(path: string) {
   const original = await readSettingsFile(path);
-  let fallback: FallbackConfiguration | undefined;
+  let configuration: CompactionConfiguration;
   try {
-    fallback = parseSettings(original.bytes);
+    configuration = parseSettings(original.bytes);
   } catch (error) {
-    throw new Error(`Could not read fallback settings at ${path}; ${error instanceof SyntaxError || error instanceof TypeError ? "use a UTF-8 JSON object" : error instanceof Error ? error.message : "invalid configuration"}`, { cause: error });
+    throw new Error(`Could not read compaction settings at ${path}; ${error instanceof SyntaxError || error instanceof TypeError ? "use a UTF-8 JSON object" : error instanceof Error ? error.message : "invalid configuration"}`, { cause: error });
   }
   return {
-    fallback,
-    async save(selection: FallbackConfiguration): Promise<void> {
+    configuration,
+    async save(selection: CompactionConfiguration): Promise<void> {
       await withFileMutationQueue(path, async () => {
         await mkdir(dirname(path), { recursive: true });
         const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
-        const bytes = Buffer.from(`${JSON.stringify({ version: SETTINGS_VERSION, fallback: selection }, null, 2)}\n`);
-        if (bytes.length > MAX_SETTINGS_BYTES) throw new Error(`Fallback settings must not exceed ${MAX_SETTINGS_BYTES} bytes`);
+        const bytes = Buffer.from(`${JSON.stringify({
+          version: SETTINGS_VERSION,
+          ...(selection.remoteCompactionEnabled === DEFAULT_REMOTE_COMPACTION_ENABLED ? {} : { remoteCompaction: { enabled: selection.remoteCompactionEnabled } }),
+          ...(selection.fallback === undefined ? {} : { fallback: selection.fallback }),
+        }, null, 2)}\n`);
+        if (bytes.length > MAX_SETTINGS_BYTES) throw new Error(`Compaction settings must not exceed ${MAX_SETTINGS_BYTES} bytes`);
         try {
           await writeFile(temporary, bytes, { flag: "wx", mode: original.mode });
           const current = await readSettingsFile(path);
           if (original.bytes === undefined ? current.bytes !== undefined : !current.bytes?.equals(original.bytes)) {
-            throw new Error("Fallback settings changed while the menu was open; reopen /codex-compaction and try again");
+            throw new Error("Compaction settings changed while the menu was open; reopen /codex-compaction and try again");
           }
           // Reading follows existing symlinks; an atomic replacement would remove the link itself.
           const entry = await lstat(path).catch((error: unknown) => {
@@ -113,7 +143,7 @@ export async function loadFallbackSettings(path: string) {
             throw error;
           });
           if (entry?.isSymbolicLink()) {
-            throw new Error(`Fallback settings are a symbolic link; edit its target directly at ${path}`);
+            throw new Error(`Compaction settings are a symbolic link; edit its target directly at ${path}`);
           }
           await rename(temporary, path);
         } finally {
