@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { beforeEach, test } from "node:test";
 import type { Model, Provider } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -270,6 +271,7 @@ function driveTui(current: Awaited<ReturnType<typeof fixture>>, screens: readonl
     assert.ok(keys, "Unexpected extra screen");
     for (const key of keys) {
       rendered.push(...component.render(80));
+      rendered.push(...component.render(1_000));
       component.handleInput?.(key);
     }
     rendered.push(...component.render(32));
@@ -400,3 +402,98 @@ test("an invalid V2 switch prevents menu edits without exposing file contents", 
   assert.match(current.notices[0].message, /boolean enabled/);
   assert.doesNotMatch(current.notices[0].message, /private-file-value/);
 });
+
+const invalidFallback = { enabled: true, provider: "x" };
+const invalidFallbackSettings = `\uFEFF{\r\n  "version": 1,\r\n  "fallback": ${JSON.stringify(invalidFallback)}\r\n}\r\n`;
+const invalidFallbackError = `Could not read compaction settings at ${settingsPath}; fallback.model must be a non-empty model ID without surrounding whitespace`;
+
+function assertInvalidTuiMenu(rendered: readonly string[]) {
+  const lines = rendered.map(stripVTControlCharacters);
+  assert.match(lines.join("\n"), /Fallback model\s+Invalid/);
+  assert.match(lines.join("\n"), /Model and thinking level\s+Invalid/);
+  assert.ok(lines.some((line) => line.trim() === invalidFallbackError), "the fallback row describes the exact settings error");
+}
+
+test("RPC opens an invalid fallback menu with its validation error and leaves cancellation unchanged", async () => {
+  await writeSettings(invalidFallbackSettings);
+  const current = await fixture([undefined]);
+  await current.run();
+  assert.deepEqual(current.dialogs, [{
+    title: invalidFallbackError,
+    options: ["Remote Compaction V2: On", "Fallback model: Invalid", "Choose fallback model and thinking level"],
+  }]);
+  assert.deepEqual(current.notices, []);
+  assert.equal(await readFile(settingsPath, "utf8"), invalidFallbackSettings);
+});
+
+test("TUI opens an invalid fallback menu with its validation error and leaves cancellation unchanged", async () => {
+  await writeSettings(invalidFallbackSettings);
+  const current = await fixture([]);
+  const rendered = driveTui(current, [["\u001b[B", "\u001b"]]);
+  await current.run();
+  assertInvalidTuiMenu(rendered);
+  assert.deepEqual(current.notices, []);
+  assert.equal(await readFile(settingsPath, "utf8"), invalidFallbackSettings);
+});
+
+for (const mode of ["rpc", "tui"] as const) {
+  for (const enabled of [true, false]) {
+    test(`${mode} toggles V2 from ${enabled} while preserving the invalid fallback`, async () => {
+      await writeSettings(JSON.stringify({ version: 1, remoteCompaction: { enabled }, fallback: invalidFallback }));
+      const current = await fixture(mode === "rpc" ? [firstChoice] : []);
+      const rendered = mode === "tui" ? driveTui(current, [["\r"], ["\u001b[B", "\u001b"]]) : undefined;
+      await current.run();
+      assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+        version: 1, remoteCompaction: { enabled: !enabled }, fallback: invalidFallback,
+      });
+      assert.equal(current.notices.length, 1);
+      assert.equal(current.notices[0].level, "info");
+      assert.match(current.notices[0].message, enabled ? /V2 is Off/ : /V2 is On/);
+      if (rendered) assertInvalidTuiMenu(rendered);
+      else {
+        assert.equal(current.dialogs[0].title, invalidFallbackError);
+        assert.equal(current.dialogs[0].options[1], "Fallback model: Invalid");
+      }
+    });
+  }
+
+  test(`${mode} rejects an invalid fallback switch without writing settings${mode === "tui" ? " and keeps the selected row open" : ""}`, async () => {
+    await writeSettings(invalidFallbackSettings);
+    const current = await fixture(mode === "rpc" ? [switchChoice] : []);
+    const rendered = mode === "tui" ? driveTui(current, [["\u001b[B", "\r"], ["\r"], ["\u001b"]]) : undefined;
+    await current.run();
+    assert.equal(await readFile(settingsPath, "utf8"), invalidFallbackSettings);
+    assert.deepEqual(await readdir(settingsDirectory), ["config.json"]);
+    assert.deepEqual(current.notices, Array.from({ length: mode === "tui" ? 2 : 1 }, () => ({
+      message: `${invalidFallbackError}. Choose a model to replace it, or edit the file directly.`, level: "error",
+    })));
+    if (rendered) assertInvalidTuiMenu(rendered);
+    else assert.equal(current.dialogs[0].title, invalidFallbackError);
+  });
+
+  test(`${mode} replaces an invalid fallback with a disabled selected model`, async () => {
+    await writeSettings(JSON.stringify({ version: 1, remoteCompaction: { enabled: false }, fallback: invalidFallback }));
+    const current = await fixture(mode === "rpc" ? [modelChoice, firstChoice, "high"] : ["high"]);
+    if (mode === "tui") driveTui(current, [["\u001b[B", "\u001b[B", "\r"], ["CheapModel", "\r"], ["\u001b"]]);
+    await current.run();
+    assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+      version: 1, remoteCompaction: { enabled: false },
+      fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    });
+    assert.equal(current.notices.length, 1);
+    assert.equal(current.notices[0].level, "info");
+    assert.match(current.notices[0].message, /Fallback model is Off/);
+  });
+
+  test(`${mode} toggling V2 writes a normalized valid legacy fallback with explicit enabled`, async () => {
+    await writeSettings();
+    const current = await fixture(mode === "rpc" ? [firstChoice] : []);
+    if (mode === "tui") driveTui(current, [["\r"], ["\u001b"]]);
+    await current.run();
+    assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+      version: 1, remoteCompaction: { enabled: false },
+      fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+    });
+    assert.equal(current.notices[0].level, "info");
+  });
+}
