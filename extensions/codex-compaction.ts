@@ -31,8 +31,7 @@ import {
   projectCheckpointContext,
   projectCheckpointRequest,
 } from "./checkpoint.js";
-import { hasCheckpointMarker, isObject, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
-import { cacheProbeEnabled, captureCacheProbeRequest, recordCacheProbe, summarizeCacheProbeSystems, type CacheProbeContext, type CacheProbeRequest, type CacheProbeSystems } from "./cache-probe.js";
+import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
 
 const STATUS_KEY = "codex-compaction";
@@ -159,29 +158,17 @@ function websocketConnectTimeoutMs(value: unknown): number | undefined {
 function projectedCurrentMessages(
   event: SessionBeforeCompactEvent,
   identity: ProviderIdentity,
-  sessionId: string,
-): { messages: AgentMessage[]; prior?: CodexCheckpointDetails; probeContext: CacheProbeContext } {
+): { messages: AgentMessage[]; prior?: CodexCheckpointDetails } {
   const leafId = event.branchEntries.at(-1)?.id ?? null;
   const session = buildSessionContext(event.branchEntries, leafId);
   const prior = latestCheckpoint(event.branchEntries)?.details;
-  let messages = session.messages;
-  if (prior) {
-    if (!sameProvider(prior, identity)) {
-      throw new Error("The active opaque checkpoint belongs to a different provider backend");
-    }
-    const projected = projectCheckpointRequest(session.messages, prior);
-    if (!projected) throw new Error("The previous opaque checkpoint could not be projected safely");
-    messages = projected;
+  if (!prior) return { messages: session.messages };
+  if (!sameProvider(prior, identity)) {
+    throw new Error("The active opaque checkpoint belongs to a different provider backend");
   }
-  const sessionSystems = summarizeCacheProbeSystems(session.messages);
-  return { messages, prior, probeContext: {
-    sessionId,
-    checkpointId: prior?.checkpointId,
-    projectCheckpointRequestCalled: prior !== undefined,
-    systemMessagesCollapsed: prior !== undefined && sessionSystems.count > 0,
-    sessionSystems,
-    projectedSystems: summarizeCacheProbeSystems(messages),
-  } };
+  const projected = projectCheckpointRequest(session.messages, prior);
+  if (!projected) throw new Error("The previous opaque checkpoint could not be projected safely");
+  return { messages: projected, prior };
 }
 
 async function replayCheckpoint(payload: unknown, ctx: ExtensionContext): Promise<JsonObject | undefined> {
@@ -210,7 +197,6 @@ async function compactRemotely(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
   fetch?: typeof globalThis.fetch,
-  lastRequest?: CacheProbeRequest,
   lastSystemPrompt?: EffectiveSystemPrompt,
   lastContext?: EffectiveRequestContext,
 ) {
@@ -226,7 +212,7 @@ async function compactRemotely(
     if (event.customInstructions?.trim() && ctx.hasUI) {
       ctx.ui.notify("Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", "warning");
     }
-    const current = projectedCurrentMessages(event, supported.identity, sessionId);
+    const current = projectedCurrentMessages(event, supported.identity);
     const sourceHead = getCurrentSystemMessage(convertToLlm(current.messages));
     const effectivePrompt = lastSystemPrompt?.sessionId === sessionId && sourceHead &&
       fingerprintMessage(sourceHead) === lastSystemPrompt.sourceFingerprint &&
@@ -249,16 +235,11 @@ async function compactRemotely(
       maxRetryDelayMs: settings.retry?.provider?.maxRetryDelayMs,
       websocketConnectTimeoutMs: websocketConnectTimeoutMs(settings.websocketConnectTimeoutMs),
       signal: event.signal,
-      onPrepared: (payload) => {
+      onPrepared: () => {
         if (!sessionStillOwned(ctx, sessionId, event.signal)) throw new Error("Compaction session ownership changed");
         // Provider retries prepare the payload again; announce the compaction once.
         if (announced) return;
         announced = true;
-        if (cacheProbeEnabled()) {
-          const previous = lastRequest?.sessionId === sessionId ? lastRequest : undefined;
-          const probe = recordCacheProbe(previous, payload, current.probeContext);
-          if (ctx.hasUI) ctx.ui.notify(probe, "info");
-        }
         if (ctx.hasUI) ctx.ui.notify(
           `Starting Codex Remote Compaction V2 for ${supported.identity.provider}/${supported.identity.modelId}.`,
           "info",
@@ -312,8 +293,6 @@ export function createCodexCompactionExtension(
 ): (pi: ExtensionAPI) => void {
   return (pi) => {
     const warnings = new Set<string>();
-    let lastRequest: CacheProbeRequest | undefined;
-    let lastSystems: { readonly sessionId: string; readonly systems: CacheProbeSystems } | undefined;
     let lastSystemPrompt: EffectiveSystemPrompt | undefined;
     let pendingSource: { readonly sessionId: string; readonly fingerprints: readonly string[] } | undefined;
     let pendingContext: EffectiveRequestContext | undefined;
@@ -331,8 +310,6 @@ export function createCodexCompactionExtension(
 
     pi.on("session_start", () => {
       warnings.clear();
-      lastRequest = undefined;
-      lastSystems = undefined;
       lastSystemPrompt = undefined;
       pendingSource = undefined;
       pendingContext = undefined;
@@ -340,7 +317,7 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("session_before_compact", (event, ctx) =>
-      compactRemotely(pi, event, ctx, options.fetch, lastRequest, lastSystemPrompt, lastContext),
+      compactRemotely(pi, event, ctx, options.fetch, lastSystemPrompt, lastContext),
     );
 
     pi.on("session_compact", (event) => {
@@ -390,9 +367,6 @@ export function createCodexCompactionExtension(
         messages: structuredClone(event.messages),
       } : undefined;
       pendingSource = undefined;
-      if (cacheProbeEnabled()) {
-        lastSystems = { sessionId: ctx.sessionManager.getSessionId(), systems: summarizeCacheProbeSystems(event.messages) };
-      }
     });
 
     pi.on("before_provider_request", async (event, ctx) => {
@@ -400,14 +374,6 @@ export function createCodexCompactionExtension(
       lastSystemPrompt = captureEffectiveSystemPrompt(ctx);
       // Keep the pending snapshot for retries that prepare a payload without running context hooks again.
       lastContext = pendingContext;
-      // The probe keeps the payload this extension hands on; later handlers may still change it.
-      const observed = payload ?? event.payload;
-      if (cacheProbeEnabled() && ctx.model && isObject(observed)) {
-        const sessionId = ctx.sessionManager.getSessionId();
-        const systems = lastSystems?.sessionId === sessionId ? lastSystems.systems : undefined;
-        lastRequest = captureCacheProbeRequest(observed, sessionId, ctx.model, systems);
-        lastSystems = undefined;
-      }
       return payload;
     });
 
@@ -427,8 +393,6 @@ export function createCodexCompactionExtension(
 
     pi.on("session_shutdown", (_event, ctx) => {
       warnings.clear();
-      lastRequest = undefined;
-      lastSystems = undefined;
       lastSystemPrompt = undefined;
       pendingSource = undefined;
       pendingContext = undefined;

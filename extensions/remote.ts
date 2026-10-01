@@ -29,7 +29,7 @@ export interface RemoteCompactionRequest {
   /** Pi origins of the context's user messages, used to align provider user items with Pi roles. */
   userItemOrigins?: readonly UserItemOrigin[];
   priorCheckpoint?: { identity: ProviderIdentity; marker: string; replacementHistory: readonly JsonObject[] };
-  onPrepared?: (payload: JsonObject) => void;
+  onPrepared?: () => void;
   fetch?: typeof globalThis.fetch;
 }
 
@@ -123,7 +123,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       contextual = sent.map((item) => contextItems.has(item));
       sentInput = structuredClone(sent);
       images = estimates;
-      request.onPrepared?.(prepared);
+      request.onPrepared?.();
       return prepared;
     },
     onProviderStreamEvent: (event) => {
