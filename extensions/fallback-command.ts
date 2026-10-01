@@ -2,12 +2,25 @@
 import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
 import { getSelectListTheme, getSettingsListTheme, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Container, fuzzyFilter, Input, SelectList, SettingsList, Text } from "@earendil-works/pi-tui";
-import { loadCompactionSettings, type CompactionConfiguration, type FallbackConfiguration } from "./fallback-settings.js";
+import { loadCompactionSettings, type FallbackConfiguration } from "./fallback-settings.js";
 
 const COMMAND_NAME = "codex-compaction";
 const CHANGE_MODEL = "Choose fallback model and thinking level";
 const MAX_VISIBLE_MODELS = 10;
 type SettingsAction = "model" | "toggle" | "remote";
+
+/** A fallback that failed validation stays editable: V2 can still be toggled and a new model replaces it. */
+type FallbackState =
+  | { readonly value: FallbackConfiguration | undefined; readonly error?: never }
+  | { readonly value?: never; readonly error: string };
+
+function readFallback(read: () => FallbackConfiguration | undefined): FallbackState {
+  try {
+    return { value: read() };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 function describeFallback(selection: FallbackConfiguration | undefined): string {
   if (selection?.model === undefined) return "No fallback model configured; inactive. Pi uses the chat model.";
@@ -16,14 +29,20 @@ function describeFallback(selection: FallbackConfiguration | undefined): string 
     : `Fallback model is Off. Pi will use the chat model for text compaction. Saved model: ${model}.`;
 }
 
-async function chooseAction(ctx: ExtensionCommandContext, configuration: CompactionConfiguration, selected: SettingsAction): Promise<SettingsAction | undefined> {
-  const current = configuration.fallback;
-  const remoteValue = configuration.remoteCompactionEnabled ? "On" : "Off";
-  const switchValue = current?.enabled ? "On" : "Off";
+async function chooseAction(
+  ctx: ExtensionCommandContext,
+  remoteCompactionEnabled: boolean,
+  fallback: FallbackState,
+  selected: SettingsAction,
+): Promise<SettingsAction | undefined> {
+  const current = fallback.value;
+  const description = fallback.error ?? describeFallback(current);
+  const remoteValue = remoteCompactionEnabled ? "On" : "Off";
+  const switchValue = fallback.error !== undefined ? "Invalid" : current?.enabled ? "On" : "Off";
   if (ctx.mode !== "tui") {
     const switchLabel = `Fallback model: ${switchValue}`;
     const remoteLabel = `Remote Compaction V2: ${remoteValue}`;
-    const action = await ctx.ui.select(describeFallback(current), [remoteLabel, switchLabel, CHANGE_MODEL]);
+    const action = await ctx.ui.select(description, [remoteLabel, switchLabel, CHANGE_MODEL]);
     if (action === undefined) return undefined;
     if (action === CHANGE_MODEL) return "model";
     if (action === switchLabel) return "toggle";
@@ -33,8 +52,8 @@ async function chooseAction(ctx: ExtensionCommandContext, configuration: Compact
   return ctx.ui.custom<SettingsAction | undefined>((tui, _theme, _keys, done) => {
     const list = new SettingsList([
       { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When Off, use the configured fallback or Pi's chat-model text compaction. Existing checkpoints still replay." },
-      { id: "toggle", label: "Fallback model", currentValue: switchValue, values: ["Off", "On"], description: describeFallback(current) },
-      { id: "model", label: "Model and thinking level", currentValue: current?.model === undefined ? "Not configured" : `${current.provider}/${current.model} (${current.thinkingLevel})`, values: ["Choose"], description: "Choose a model; this does not change the switch." },
+      { id: "toggle", label: "Fallback model", currentValue: switchValue, values: fallback.error !== undefined ? ["Invalid"] : ["Off", "On"], description },
+      { id: "model", label: "Model and thinking level", currentValue: fallback.error !== undefined ? "Invalid" : current?.model === undefined ? "Not configured" : `${current.provider}/${current.model} (${current.thinkingLevel})`, values: ["Choose"], description: fallback.error !== undefined ? "Choose a model to replace the invalid fallback settings." : "Choose a model; this does not change the switch." },
     ], 3, getSettingsListTheme(), (id) => done(id === "toggle" ? "toggle" : id === "remote" ? "remote" : "model"), () => done(undefined));
     list.selectItem(selected);
     return {
@@ -102,16 +121,20 @@ async function configureCompaction(path: string, ctx: ExtensionCommandContext): 
   while (true) {
     const settings = await loadCompactionSettings(path);
     const configuration = settings.configuration;
-    const current = configuration.fallback;
-    const action = await chooseAction(ctx, configuration, selected);
+    const fallback = readFallback(() => configuration.fallback);
+    const current = fallback.value;
+    const action = await chooseAction(ctx, configuration.remoteCompactionEnabled, fallback, selected);
     if (action === undefined) return;
     selected = action;
     if (action === "remote") {
-      const selection = { remoteCompactionEnabled: !configuration.remoteCompactionEnabled, fallback: current };
-      await settings.save(selection);
-      ctx.ui.notify(selection.remoteCompactionEnabled
+      const remoteCompactionEnabled = !configuration.remoteCompactionEnabled;
+      // Save a valid fallback in normalized form; omit an invalid one so the file keeps it as written.
+      await settings.save(fallback.error === undefined ? { remoteCompactionEnabled, fallback: current } : { remoteCompactionEnabled });
+      ctx.ui.notify(remoteCompactionEnabled
         ? "Remote Compaction V2 is On. Supported models try V2 before text fallback."
         : "Remote Compaction V2 is Off. Text compaction uses the configured fallback when enabled; otherwise Pi uses the chat model.", "info");
+    } else if (action === "toggle" && fallback.error !== undefined) {
+      ctx.ui.notify(`${fallback.error}. Choose a model to replace it, or edit the file directly.`, "error");
     } else if (action === "toggle") {
       const selection = { ...current, enabled: !current?.enabled };
       await settings.save({ remoteCompactionEnabled: configuration.remoteCompactionEnabled, fallback: selection });

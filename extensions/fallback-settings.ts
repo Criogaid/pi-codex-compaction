@@ -55,8 +55,22 @@ async function readSettingsFile(path: string): Promise<SettingsFile> {
   }
 }
 
-function parseSettings(bytes: Buffer | undefined): CompactionConfiguration {
-  if (bytes === undefined) return { remoteCompactionEnabled: DEFAULT_REMOTE_COMPACTION_ENABLED, fallback: undefined };
+function settingsError(path: string, error: unknown): Error {
+  const reason = error instanceof SyntaxError || error instanceof TypeError ? "use a UTF-8 JSON object"
+    : error instanceof Error ? error.message : "invalid configuration";
+  return new Error(`Could not read compaction settings at ${path}; ${reason}`, { cause: error });
+}
+
+interface ParsedSettings {
+  readonly configuration: CompactionConfiguration;
+  /** The unvalidated fallback field, kept so saves that do not replace it preserve it as written. */
+  readonly rawFallback: { readonly value: unknown } | undefined;
+}
+
+function parseSettings(bytes: Buffer | undefined, path: string): ParsedSettings {
+  if (bytes === undefined) {
+    return { configuration: { remoteCompactionEnabled: DEFAULT_REMOTE_COMPACTION_ENABLED, fallback: undefined }, rawFallback: undefined };
+  }
   // Accept a UTF-8 BOM, reject invalid bytes, and never echo file contents in errors.
   const settings: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   if (!isObject(settings) || Object.keys(settings).some((key) => !["version", "remoteCompaction", "fallback"].includes(key))) {
@@ -75,12 +89,19 @@ function parseSettings(bytes: Buffer | undefined): CompactionConfiguration {
   }
   let resolvedFallback: { readonly value: FallbackConfiguration | undefined } | undefined;
   return {
-    remoteCompactionEnabled,
-    // Successful V2 requests do not need to resolve or validate fallback settings.
-    get fallback() {
-      resolvedFallback ??= { value: "fallback" in settings ? parseFallback(settings.fallback) : undefined };
-      return resolvedFallback.value;
+    configuration: {
+      remoteCompactionEnabled,
+      // Successful V2 requests do not need to resolve or validate fallback settings.
+      get fallback() {
+        try {
+          resolvedFallback ??= { value: "fallback" in settings ? parseFallback(settings.fallback) : undefined };
+        } catch (error) {
+          throw settingsError(path, error);
+        }
+        return resolvedFallback.value;
+      },
     },
+    rawFallback: "fallback" in settings ? { value: settings.fallback } : undefined,
   };
 }
 
@@ -110,25 +131,30 @@ function parseFallback(fallback: unknown): FallbackConfiguration {
   };
 }
 
-/** Capture one revision; reading configuration.fallback validates it on demand and can throw. Saving detects edits before atomic replacement. */
+/**
+ * Capture one revision; reading configuration.fallback validates it on demand and can throw.
+ * Saving detects edits before atomic replacement; a selection without a fallback field keeps the file's fallback as written.
+ */
 export async function loadCompactionSettings(path: string) {
   const original = await readSettingsFile(path);
-  let configuration: CompactionConfiguration;
+  let parsed: ParsedSettings;
   try {
-    configuration = parseSettings(original.bytes);
+    parsed = parseSettings(original.bytes, path);
   } catch (error) {
-    throw new Error(`Could not read compaction settings at ${path}; ${error instanceof SyntaxError || error instanceof TypeError ? "use a UTF-8 JSON object" : error instanceof Error ? error.message : "invalid configuration"}`, { cause: error });
+    throw settingsError(path, error);
   }
+  const { configuration, rawFallback } = parsed;
   return {
     configuration,
-    async save(selection: CompactionConfiguration): Promise<void> {
+    async save(selection: { readonly remoteCompactionEnabled: boolean; readonly fallback?: FallbackConfiguration | undefined }): Promise<void> {
+      const fallback = "fallback" in selection ? selection.fallback : rawFallback?.value;
       await withFileMutationQueue(path, async () => {
         await mkdir(dirname(path), { recursive: true });
         const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
         const bytes = Buffer.from(`${JSON.stringify({
           version: SETTINGS_VERSION,
           remoteCompaction: { enabled: selection.remoteCompactionEnabled },
-          ...(selection.fallback === undefined ? {} : { fallback: selection.fallback }),
+          ...(fallback === undefined ? {} : { fallback }),
         }, null, 2)}\n`);
         if (bytes.length > MAX_SETTINGS_BYTES) throw new Error(`Compaction settings must not exceed ${MAX_SETTINGS_BYTES} bytes`);
         try {
