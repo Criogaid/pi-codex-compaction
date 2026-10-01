@@ -540,6 +540,9 @@ async function providerCompaction(messages: SessionMessage[], options: {
   settings?: TestSettings; tools?: TestTools; customInstructions?: string;
   adaptPayload?: (payload: JsonObject) => JsonObject;
   ordinaryPrompt?: string;
+  ordinaryProjection?: (messages: AgentMessage[]) => AgentMessage[];
+  prepareOrdinarySource?: (messages: AgentMessage[]) => AgentMessage[];
+  retryOrdinaryPayload?: boolean;
   afterOrdinary?: (session: SessionManager, mock: ReturnType<typeof mockPi>, current: Awaited<ReturnType<typeof context>>, requestModel: Model<"openai-responses">) => void | Promise<void>;
 } = {}) {
   const mock = mockPi("high", options.settings, options.tools);
@@ -574,23 +577,35 @@ async function providerCompaction(messages: SessionMessage[], options: {
   let runtimePrompt = options.ordinaryPrompt ?? "system";
   const current = await context({ sessionManager, modelRegistry, model: requestModel, getSystemPrompt: () => runtimePrompt });
   let ordinaryPayload: JsonObject | undefined;
-  if (options.ordinaryPrompt !== undefined) {
-    const transcript = convertToLlm(sessionManager.buildSessionContext().messages);
-    const head = getCurrentSystemMessage(transcript);
+  if (options.ordinaryPrompt !== undefined || options.ordinaryProjection) {
+    const canonical = sessionManager.buildSessionContext().messages;
+    const source = options.prepareOrdinarySource?.(canonical) ?? canonical;
+    const head = getCurrentSystemMessage(convertToLlm(source));
     assert.ok(head);
-    const ordinaryContext: Context = { messages: [
+    const projected = await mock.events.get("context")?.[0]?.({ type: "context", messages: source.filter((message) => message.role !== "system") }, current.ctx) as ContextEventResult | undefined;
+    let transformed = projected?.messages ? [head, ...projected.messages] : source;
+    if (options.ordinaryProjection) transformed = options.ordinaryProjection(transformed);
+    await mock.events.get("context_with_system")?.[0]?.({ type: "context_with_system", messages: transformed }, current.ctx);
+    runtimePrompt = options.ordinaryPrompt ?? getSystemMessageText(head);
+    const transcript = convertToLlm(transformed);
+    const ordinaryContext: Context = { messages: options.ordinaryPrompt === undefined ? transcript : [
       { role: "system", content: options.ordinaryPrompt, toolsAdded: head.toolsAdded, timestamp: head.timestamp },
       ...transcript.filter((message) => message.role !== "system"),
     ] };
-    for await (const _event of registry.streamSimple(requestModel, ordinaryContext, {
+    for await (const event of registry.streamSimple(requestModel, ordinaryContext, {
       fetch: async () => sseResponse(), sessionId: sessionManager.getSessionId(),
       onPayload: async (input) => {
         assert.ok(isObject(input));
         ordinaryPayload = structuredClone(input);
-        return await mock.events.get("before_provider_request")?.[0]?.({ type: "before_provider_request", payload: input }, current.ctx) ?? input;
+        const event = { type: "before_provider_request", payload: input };
+        const rewritten = await mock.events.get("before_provider_request")?.[0]?.(event, current.ctx);
+        return options.retryOrdinaryPayload
+          ? await mock.events.get("before_provider_request")?.[0]?.(event, current.ctx) ?? input
+          : rewritten ?? input;
       },
     })) {
       // Drain the ordinary response before Pi clears its per-run prompt override.
+      if (event.type === "error") throw new Error(event.error.errorMessage ?? "Ordinary fixture request failed");
     }
     runtimePrompt = getSystemMessageText(head);
     await options.afterOrdinary?.(sessionManager, mock, current, requestModel);
@@ -598,6 +613,74 @@ async function providerCompaction(messages: SessionMessage[], options: {
   const details = await compactSession(mock, sessionManager, entries[firstUser], current, options.customInstructions);
   assert.ok(isObject(payload));
   return { payload, ordinaryPayload, contexts, details, notifications: current.notifications };
+}
+
+function toolHistory(): SessionMessage[] {
+  return [
+    { role: "system", content: "canonical prompt", timestamp: 0 },
+    { role: "user", content: "request", timestamp: 1 },
+    { role: "assistant", content: [{ type: "toolCall", id: "read-call", name: "read", arguments: { path: "settings.md" } }],
+      api: model.api, provider: model.provider, model: model.id, usage, stopReason: "toolUse", timestamp: 2 },
+    { role: "toolResult", toolCallId: "read-call", toolName: "read", content: [{ type: "text", text: "Original tool output" }], isError: false, timestamp: 3 },
+  ];
+}
+
+function packToolHistory(messages: AgentMessage[]): AgentMessage[] {
+  return messages.map((message) => message.role === "toolResult"
+    ? { ...message, content: [{ type: "text", text: "[large tool result replaced after 2 successful responses on this branch] obs_fixture" }] }
+    : message);
+}
+
+test("compaction preserves Pi's ordinary context projection and appends only new history", async () => {
+  const messages = toolHistory();
+  const saved = structuredClone(messages);
+  const result = await providerCompaction(messages, { ordinaryProjection: packToolHistory, retryOrdinaryPayload: true,
+    afterOrdinary(session) {
+      session.appendMessage({ role: "assistant", content: [{ type: "text", text: "New final answer" }],
+        api: model.api, provider: model.provider, model: model.id, usage, stopReason: "stop", timestamp: 4 });
+    },
+  });
+  assert.ok(result.ordinaryPayload && Array.isArray(result.ordinaryPayload.input) && Array.isArray(result.payload.input));
+  assert.equal(JSON.stringify(result.payload.input.slice(0, result.ordinaryPayload.input.length)), JSON.stringify(result.ordinaryPayload.input));
+  assert.match(JSON.stringify(result.payload.input.at(-2)), /New final answer/);
+  assert.equal(result.payload.input.length, result.ordinaryPayload.input.length + 2);
+  assert.deepEqual(messages, saved);
+});
+
+test("compaction does not reuse an ordinary context whose source includes unpersisted messages", async () => {
+  const result = await providerCompaction(toolHistory(), { ordinaryProjection: packToolHistory,
+    prepareOrdinarySource(messages) {
+      return [...messages, { role: "user", content: "request-local message", timestamp: 4 }];
+    },
+  });
+  assert.match(JSON.stringify(result.payload.input), /Original tool output/);
+  assert.doesNotMatch(JSON.stringify(result.payload.input), /obs_fixture|request-local message/);
+});
+
+for (const change of ["edit", "system", "session-start", "session-id", "model", "backend"] as const) {
+  test(`compaction discards its ordinary context projection after ${change} changes`, async () => {
+    const result = await providerCompaction(toolHistory(), { ordinaryProjection: packToolHistory,
+      async afterOrdinary(session, mock, current, requestModel) {
+        if (change === "edit") {
+          const entry = session.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user");
+          assert.ok(entry);
+          session.appendContextEdit(entry.id, { content: "edited request" });
+        }
+        if (change === "system") session.appendMessage({ role: "system", content: "new instructions", timestamp: 4 });
+        if (change === "session-start") await mock.events.get("session_start")?.[0]?.({ type: "session_start" }, current.ctx);
+        if (change === "session-id") session.getSessionId = () => "replacement-session";
+        if (change === "model") requestModel.id = "other-model";
+        if (change === "backend") {
+          requestModel.baseUrl = "https://other.example/v1";
+          const compat = { ...requestModel.compat, remoteCompaction: { protocol: "v2", endpoint: "https://other.example/v1/responses" } };
+          requestModel.compat = compat;
+        }
+      },
+    });
+    assert.match(JSON.stringify(result.payload.input), /Original tool output/);
+    assert.doesNotMatch(JSON.stringify(result.payload.input), /obs_fixture/);
+    if (change === "edit") assert.match(JSON.stringify(result.payload.input), /edited request/);
+  });
 }
 
 test("compaction reuses the effective ordinary prompt after Pi clears its run override", async () => {

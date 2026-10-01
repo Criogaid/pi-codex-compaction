@@ -25,9 +25,11 @@ Remote compaction captures the active session ID and current thinking level when
 
 Cache options use the same provider defaults and resolved `PI_CACHE_RETENTION` environment as normal requests. The extension passes the active session ID for cache keys and routing instead of forcing `cacheRetention: "none"`. Model sampling parameters, resolved authentication, and provider headers remain owned by Pi.
 
-压缩请求沿用 Pi 0.99 transcript 中声明提示词与工具的 system 消息；旧会话缺少 system 消息时回退到当前系统提示词和已激活工具。若其他扩展在 `before_agent_start` 覆盖整个 prompt，本包在普通请求发出前通过 `ctx.getSystemPrompt()` 记录实际生效的覆盖。随后压缩仅在 session、模型、后端及来源 system 消息指纹仍匹配时沿用它。覆盖仅保存在当前进程中；重启后需要先发出一次普通请求。来源 system 消息变化时丢弃旧覆盖。
+压缩请求沿用 Pi 0.99 transcript 中声明提示词与工具的 system 消息；旧会话缺少 system 消息时回退到当前系统提示词和已激活工具。若其他扩展在 `before_agent_start` 覆盖整个 prompt，本包在普通请求发出前通过 `ctx.getSystemPrompt()` 记录实际生效的覆盖。随后压缩仅在 session、模型、后端及来源 system 消息指纹仍匹配时沿用它。
 
-`images.blockImages`、`thinkingBudgets`、`websocketConnectTimeoutMs` 和 `retry.provider.maxRetryDelayMs` 按 Pi 设置生效；重试次数取 Pi 的 `retry.provider.maxRetries` 与 Codex 上限 2 中的较小值。其他扩展的 `context`、`before_provider_headers` 处理器以及 `prepareLoadout` 的隐藏声明不在扩展 API 可达范围内，不会作用于压缩请求。Remote Compaction V2 不接受 `/compact` 的自定义指令，提供时会显示 warning 并忽略。
+本包通过 `context_with_system` 保存普通请求经过 `context` 处理后的消息投影，包括工具输出占位文本。压缩时，只有原始会话历史仍与该请求的来源前缀逐条匹配，才沿用这份投影并追加新增消息，再交由 Pi Provider 序列化。历史编辑、系统状态变化、切换 session、模型或后端时丢弃旧投影；普通请求包含尚未写入会话的消息时不保存投影。Prompt 覆盖和消息投影仅保存在当前进程中；重启后需要先发出一次普通请求。
+
+`images.blockImages`、`thinkingBudgets`、`websocketConnectTimeoutMs` 和 `retry.provider.maxRetryDelayMs` 按 Pi 设置生效；重试次数取 Pi 的 `retry.provider.maxRetries` 与 Codex 上限 2 中的较小值。压缩不会重新执行其他扩展的处理器；本包 `context_with_system` 之后的消息改写、`before_provider_request` 的额外 payload 改写及 `before_provider_headers` 处理器不会被快照重放。Remote Compaction V2 不接受 `/compact` 的自定义指令，提供时会显示 warning 并忽略。
 
 The extension observes Responses events with `onProviderStreamEvent`, which works with Pi's HTTP and WebSocket adapters. It uses the configured transport for standard provider routes. An explicit nonstandard endpoint override uses HTTP because Pi exposes custom HTTP routing through `fetch`.
 

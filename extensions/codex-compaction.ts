@@ -54,6 +54,29 @@ interface EffectiveSystemPrompt {
   readonly text: string;
 }
 
+interface EffectiveRequestContext {
+  readonly sessionId: string;
+  readonly identity: ProviderIdentity;
+  readonly sourceFingerprints: readonly string[];
+  readonly messages: readonly AgentMessage[];
+}
+
+// Collapse source system state only for matching; preserve Pi's actual projected transcript for sending.
+function requestSource(messages: readonly AgentMessage[]): AgentMessage[] {
+  const head = getCurrentSystemMessage(convertToLlm([...messages]));
+  const conversation = messages.filter((message) => message.role !== "system");
+  return head ? [head, ...conversation] : conversation;
+}
+
+function reuseRequestContext(messages: AgentMessage[], snapshot: EffectiveRequestContext | undefined): AgentMessage[] {
+  if (!snapshot) return messages;
+  const source = requestSource(messages);
+  if (source.length < snapshot.sourceFingerprints.length || snapshot.sourceFingerprints.some(
+    (fingerprint, index) => fingerprintMessage(source[index]) !== fingerprint,
+  )) return messages;
+  return [...structuredClone(snapshot.messages), ...source.slice(snapshot.sourceFingerprints.length)];
+}
+
 
 function activeCheckpoint(ctx: ExtensionContext) {
   return latestCheckpoint(ctx.sessionManager.getBranch());
@@ -104,7 +127,7 @@ function requestContext(pi: ExtensionAPI, ctx: ExtensionContext, messages: Agent
   const llmMessages = settings.images?.blockImages ? withoutImages(converted) : converted;
   if (effectivePrompt) {
     const head = getCurrentSystemMessage(llmMessages);
-    if (head && fingerprintMessage(head) === effectivePrompt.sourceFingerprint) {
+    if (head) {
       // Pi applies per-run prompt overrides after context hooks and clears them when the run ends.
       const { sections: _sections, ...declarations } = head;
       return { messages: [{ ...declarations, content: effectivePrompt.text }, ...llmMessages.filter((message) => message.role !== "system")] };
@@ -189,6 +212,7 @@ async function compactRemotely(
   fetch?: typeof globalThis.fetch,
   lastRequest?: CacheProbeRequest,
   lastSystemPrompt?: EffectiveSystemPrompt,
+  lastContext?: EffectiveRequestContext,
 ) {
   const supported = capableModel(ctx.model);
   if (!supported) return undefined;
@@ -203,14 +227,20 @@ async function compactRemotely(
       ctx.ui.notify("Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", "warning");
     }
     const current = projectedCurrentMessages(event, supported.identity, sessionId);
-    const effectivePrompt = lastSystemPrompt?.sessionId === sessionId &&
+    const sourceHead = getCurrentSystemMessage(convertToLlm(current.messages));
+    const effectivePrompt = lastSystemPrompt?.sessionId === sessionId && sourceHead &&
+      fingerprintMessage(sourceHead) === lastSystemPrompt.sourceFingerprint &&
       sameModel(lastSystemPrompt.identity, supported.model) && sameBackend(lastSystemPrompt.identity, supported.identity)
       ? lastSystemPrompt : undefined;
+    const snapshot = lastContext?.sessionId === sessionId &&
+      sameModel(lastContext.identity, supported.model) && sameBackend(lastContext.identity, supported.identity)
+      ? lastContext : undefined;
+    const messages = reuseRequestContext(current.messages, snapshot);
     const response = await requestRemoteCompaction({
       modelRegistry: ctx.modelRegistry,
       model: supported.model,
-      context: requestContext(pi, ctx, current.messages, settings, effectivePrompt),
-      userItemOrigins: userItemOrigins(current.messages),
+      context: requestContext(pi, ctx, messages, settings, effectivePrompt),
+      userItemOrigins: userItemOrigins(messages),
       reasoning,
       sessionId,
       transport: settings.transport,
@@ -285,6 +315,9 @@ export function createCodexCompactionExtension(
     let lastRequest: CacheProbeRequest | undefined;
     let lastSystems: { readonly sessionId: string; readonly systems: CacheProbeSystems } | undefined;
     let lastSystemPrompt: EffectiveSystemPrompt | undefined;
+    let pendingSource: { readonly sessionId: string; readonly fingerprints: readonly string[] } | undefined;
+    let pendingContext: EffectiveRequestContext | undefined;
+    let lastContext: EffectiveRequestContext | undefined;
 
     pi.registerEntryRenderer<CompletionEntryData>(
       COMPLETION_ENTRY_TYPE,
@@ -301,10 +334,13 @@ export function createCodexCompactionExtension(
       lastRequest = undefined;
       lastSystems = undefined;
       lastSystemPrompt = undefined;
+      pendingSource = undefined;
+      pendingContext = undefined;
+      lastContext = undefined;
     });
 
     pi.on("session_before_compact", (event, ctx) =>
-      compactRemotely(pi, event, ctx, options.fetch, lastRequest, lastSystemPrompt),
+      compactRemotely(pi, event, ctx, options.fetch, lastRequest, lastSystemPrompt, lastContext),
     );
 
     pi.on("session_compact", (event) => {
@@ -319,6 +355,8 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("context", async (event, ctx) => {
+      pendingSource = { sessionId: ctx.sessionManager.getSessionId(), fingerprints: event.messages.map(fingerprintMessage) };
+      pendingContext = undefined;
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !await compatibleIdentity(checkpoint.details, ctx)) return undefined;
       const messages = projectCheckpointContext(event.messages, checkpoint.details);
@@ -337,6 +375,21 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("context_with_system", (event, ctx) => {
+      const supported = capableModel(ctx.model);
+      const sessionId = ctx.sessionManager.getSessionId();
+      const branch = ctx.sessionManager.getBranch();
+      const canonical = buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
+      const conversation = canonical.filter((message) => message.role !== "system");
+      // Request-local, unpersisted messages cannot be aligned safely with the session's future suffix.
+      const matches = pendingSource?.sessionId === sessionId && pendingSource.fingerprints.length === conversation.length &&
+        pendingSource.fingerprints.every((fingerprint, index) => fingerprintMessage(conversation[index]) === fingerprint);
+      const prior = latestCheckpoint(branch)?.details;
+      const source = prior ? projectCheckpointRequest(canonical, prior) : canonical;
+      pendingContext = supported && matches && source ? {
+        sessionId, identity: supported.identity, sourceFingerprints: requestSource(source).map(fingerprintMessage),
+        messages: structuredClone(event.messages),
+      } : undefined;
+      pendingSource = undefined;
       if (cacheProbeEnabled()) {
         lastSystems = { sessionId: ctx.sessionManager.getSessionId(), systems: summarizeCacheProbeSystems(event.messages) };
       }
@@ -345,6 +398,8 @@ export function createCodexCompactionExtension(
     pi.on("before_provider_request", async (event, ctx) => {
       const payload = await replayCheckpoint(event.payload, ctx);
       lastSystemPrompt = captureEffectiveSystemPrompt(ctx);
+      // Keep the pending snapshot for retries that prepare a payload without running context hooks again.
+      lastContext = pendingContext;
       // The probe keeps the payload this extension hands on; later handlers may still change it.
       const observed = payload ?? event.payload;
       if (cacheProbeEnabled() && ctx.model && isObject(observed)) {
@@ -375,6 +430,9 @@ export function createCodexCompactionExtension(
       lastRequest = undefined;
       lastSystems = undefined;
       lastSystemPrompt = undefined;
+      pendingSource = undefined;
+      pendingContext = undefined;
+      lastContext = undefined;
       ctx.ui.setStatus(STATUS_KEY, undefined);
     });
   };
