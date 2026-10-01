@@ -23,7 +23,7 @@ async function chooseAction(ctx: ExtensionCommandContext, configuration: Compact
   if (ctx.mode !== "tui") {
     const switchLabel = `Fallback model: ${switchValue}`;
     const remoteLabel = `Remote Compaction V2: ${remoteValue}`;
-    const action = await ctx.ui.select(describeFallback(current), [CHANGE_MODEL, switchLabel, remoteLabel]);
+    const action = await ctx.ui.select(describeFallback(current), [remoteLabel, switchLabel, CHANGE_MODEL]);
     if (action === undefined) return undefined;
     if (action === CHANGE_MODEL) return "model";
     if (action === switchLabel) return "toggle";
@@ -32,9 +32,9 @@ async function chooseAction(ctx: ExtensionCommandContext, configuration: Compact
   }
   return ctx.ui.custom<SettingsAction | undefined>((tui, _theme, _keys, done) => {
     const list = new SettingsList([
+      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When Off, use the configured fallback or Pi's chat-model text compaction. Existing checkpoints still replay." },
       { id: "toggle", label: "Fallback model", currentValue: switchValue, values: ["Off", "On"], description: describeFallback(current) },
       { id: "model", label: "Model and thinking level", currentValue: current?.model === undefined ? "Not configured" : `${current.provider}/${current.model} (${current.thinkingLevel})`, values: ["Choose"], description: "Choose a model; this does not change the switch." },
-      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When Off, use the configured fallback or Pi's chat-model text compaction. Existing checkpoints still replay." },
     ], 3, getSettingsListTheme(), (id) => done(id === "toggle" ? "toggle" : id === "remote" ? "remote" : "model"), () => done(undefined));
     list.selectItem(selected);
     return {
@@ -98,7 +98,7 @@ async function configureCompaction(path: string, ctx: ExtensionCommandContext): 
     ctx.ui.notify(`/${COMMAND_NAME} requires interactive or RPC mode; edit ${path} directly.`, "warning");
     return;
   }
-  let selected: SettingsAction = "toggle";
+  let selected: SettingsAction = "remote";
   while (true) {
     const settings = await loadCompactionSettings(path);
     const configuration = settings.configuration;
