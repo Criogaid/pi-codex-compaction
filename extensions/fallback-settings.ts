@@ -6,18 +6,16 @@ import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { isObject } from "./protocol.js";
 
 export const FALLBACK_SETTINGS_RELATIVE_PATH = "extensions/pi-codex-compaction/config.json";
-export const DEFAULT_FALLBACK_ENABLED = true;
+const LEGACY_FALLBACK_ENABLED = true;
 const SETTINGS_VERSION = 1;
 const MAX_SETTINGS_BYTES = 16 * 1024;
 const DEFAULT_FILE_MODE = 0o600;
 const FILE_PERMISSION_MASK = 0o777;
 
-export interface FallbackConfiguration {
-  readonly enabled: boolean;
-  readonly provider: string;
-  readonly model: string;
-  readonly thinkingLevel: string;
-}
+export type FallbackConfiguration = { readonly enabled: boolean } & (
+  | { readonly provider: string; readonly model: string; readonly thinkingLevel: string }
+  | { readonly provider?: never; readonly model?: never; readonly thinkingLevel?: never }
+);
 
 interface SettingsFile {
   readonly bytes: Buffer | undefined;
@@ -62,10 +60,14 @@ function parseSettings(bytes: Buffer | undefined): FallbackConfiguration | undef
   if (settings.version !== SETTINGS_VERSION) throw new Error(`version must be ${SETTINGS_VERSION} when fallback is configured`);
   const fallback = settings.fallback;
   if (!isObject(fallback) || Object.keys(fallback).some((key) => !["enabled", "provider", "model", "thinkingLevel"].includes(key))) {
-    throw new Error("fallback must be an object with provider, model, thinkingLevel, and optional enabled fields");
+    throw new Error("fallback must be an object with only enabled, provider, model, and thinkingLevel fields");
   }
   if ("enabled" in fallback && typeof fallback.enabled !== "boolean") {
     throw new Error("fallback.enabled must be a boolean");
+  }
+  const enabled = typeof fallback.enabled === "boolean" ? fallback.enabled : LEGACY_FALLBACK_ENABLED;
+  if (!("provider" in fallback) && !("model" in fallback) && !("thinkingLevel" in fallback)) {
+    return { enabled };
   }
   if (typeof fallback.provider !== "string" || !fallback.provider.trim() || fallback.provider !== fallback.provider.trim()) {
     throw new Error("fallback.provider must be a non-empty provider ID without surrounding whitespace");
@@ -77,7 +79,7 @@ function parseSettings(bytes: Buffer | undefined): FallbackConfiguration | undef
     throw new Error("fallback.thinkingLevel must be a non-empty thinking level");
   }
   return {
-    enabled: typeof fallback.enabled === "boolean" ? fallback.enabled : DEFAULT_FALLBACK_ENABLED,
+    enabled,
     provider: fallback.provider, model: fallback.model, thinkingLevel: fallback.thinkingLevel,
   };
 }

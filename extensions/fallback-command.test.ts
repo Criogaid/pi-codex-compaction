@@ -4,6 +4,8 @@ import { dirname, join } from "node:path";
 import { beforeEach, test } from "node:test";
 import type { Model, Provider } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { initTheme } from "@earendil-works/pi-coding-agent";
+import { getKeybindings } from "@earendil-works/pi-tui";
 import { createCodexCompactionExtension } from "./codex-compaction.js";
 import { FALLBACK_SETTINGS_RELATIVE_PATH } from "./fallback-settings.js";
 import { isolateAgentConfig, testRegistry } from "./test-registry.test.js";
@@ -28,7 +30,7 @@ async function writeSettings(text = currentSettings) {
   await writeFile(settingsPath, text);
 }
 
-async function fixture(choices: readonly Choice[], availableModel: Model<"openai-responses"> = model, hasUI = true) {
+async function fixture(choices: readonly Choice[], availableModel: Model<"openai-responses"> = model, hasUI = true, additionalModels: readonly Model<"openai-responses">[] = []) {
   const commands = new Map<string, Command>();
   // Exercise registration through the real extension entrypoint; lifecycle handlers are not invoked here.
   const pi = {
@@ -39,7 +41,7 @@ async function fixture(choices: readonly Choice[], availableModel: Model<"openai
   const rejectCompletion = () => { throw new Error("The settings command must not request a completion"); };
   const provider: Provider<"openai-responses"> = {
     id: "cheap", name: "Cheap provider", baseUrl: model.baseUrl, auth: {} as Provider["auth"],
-    getModels: () => [availableModel],
+    getModels: () => [availableModel, ...additionalModels],
     stream: rejectCompletion, streamSimple: rejectCompletion,
   };
   const registry = await testRegistry(provider);
@@ -50,6 +52,7 @@ async function fixture(choices: readonly Choice[], availableModel: Model<"openai
   const ctx = {
     hasUI, modelRegistry: registry, model: { ...model, id: "chat-model" }, thinkingLevel: "off",
     ui: {
+      async input() { return ""; },
       async select(title: string, options: string[]) {
         dialogs.push({ title, options });
         const choice = remaining.shift();
@@ -68,7 +71,7 @@ test("the command saves an available model and its supported thinking level with
   const chatModel = current.ctx.model;
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 1, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
   assert.equal(current.ctx.model, chatModel);
   assert.equal(current.ctx.thinkingLevel, "off");
@@ -96,55 +99,37 @@ test("cancelling an unconfigured command creates no configuration file", async (
 
 test("fallback can be switched off and back on without losing the saved model or thinking level", async () => {
   await writeSettings();
-  const disabled = await fixture([switchChoice, "Off"]);
+  const disabled = await fixture([switchChoice]);
   await disabled.run();
   assert.equal(disabled.dialogs[0].options[1], "Fallback model: On");
-  assert.deepEqual(disabled.dialogs[1].options, ["On", "Off"]);
+  assert.equal(disabled.dialogs.length, 1);
   const selection = { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "low" };
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, fallback: selection });
   assert.match(disabled.notices[0].message, /Pi will use the chat model/);
 
-  const enabled = await fixture([switchChoice, "On"]);
+  const enabled = await fixture([switchChoice]);
   await enabled.run();
   assert.equal(enabled.dialogs[0].options[1], "Fallback model: Off");
-  assert.deepEqual(enabled.dialogs[1].options, ["Off", "On"]);
-  assert.equal(enabled.dialogs.length, 2);
+  assert.equal(enabled.dialogs.length, 1);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, fallback: { ...selection, enabled: true } });
   assert.match(enabled.notices[0].message, /cheap\/cheap\/model \(low\)/);
 });
 
-test("switching an unconfigured fallback off does not create a configuration file", async () => {
-  const current = await fixture([switchChoice, "Off"]);
+test("enabling without a model saves only the switch and remains inactive", async () => {
+  const current = await fixture([switchChoice]);
   await current.run();
-  assert.equal(current.dialogs[0].options[1], "Fallback model: Off");
-  await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, fallback: { enabled: true } });
+  assert.equal(current.dialogs.length, 1);
+  assert.match(current.notices[0].message, /No fallback model configured; inactive/);
 });
 
-test("switching an unconfigured fallback on guides model and thinking selection", async () => {
-  const current = await fixture([switchChoice, "On", firstChoice, "high"]);
+test("configuring a model after enabling the switch preserves the on state", async () => {
+  await writeSettings(JSON.stringify({ version: 1, fallback: { enabled: true } }));
+  const current = await fixture([firstChoice, firstChoice, "high"]);
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
     version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
-});
-
-for (const stage of ["switch", "model", "thinking"] as const) {
-  test(`cancelling initial enable at the ${stage} selector creates no configuration file`, async () => {
-    const choices = stage === "switch" ? [switchChoice, undefined]
-      : stage === "model" ? [switchChoice, "On", undefined] : [switchChoice, "On", firstChoice, undefined];
-    const current = await fixture(choices);
-    await current.run();
-    await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
-    assert.deepEqual(current.notices, []);
-  });
-}
-
-test("cancelling the switch selector preserves existing settings byte for byte", async () => {
-  await writeSettings();
-  const current = await fixture([switchChoice, undefined]);
-  await current.run();
-  assert.equal(await readFile(settingsPath, "utf8"), currentSettings);
-  assert.deepEqual(current.notices, []);
 });
 
 test("changing the model or thinking level while disabled preserves the off state", async () => {
@@ -157,16 +142,9 @@ test("changing the model or thinking level while disabled preserves the off stat
   assert.match(current.notices[0].message, /Off/);
 });
 
-test("selecting the existing boolean value preserves settings byte for byte", async () => {
+test("a settings action outside the offered choices cannot be saved", async () => {
   await writeSettings();
-  const current = await fixture([switchChoice, "On"]);
-  await current.run();
-  assert.equal(await readFile(settingsPath, "utf8"), currentSettings);
-});
-
-test("a boolean value outside the offered choices cannot be saved", async () => {
-  await writeSettings();
-  const current = await fixture([switchChoice, "true"]);
+  const current = await fixture(["unlisted action"]);
   await current.run();
   assert.equal(await readFile(settingsPath, "utf8"), currentSettings);
   assert.equal(current.notices[0].level, "error");
@@ -269,4 +247,72 @@ test("an atomic settings update does not replace a symbolic link", async (t) => 
   assert.equal(await readFile(target, "utf8"), currentSettings);
   assert.match(current.notices[0].message, /symbolic link/);
   assert.deepEqual(await readdir(settingsDirectory), ["config.json", "target.json"]);
+});
+
+type CustomFactory = Parameters<ExtensionCommandContext["ui"]["custom"]>[0];
+
+function driveTui(current: Awaited<ReturnType<typeof fixture>>, screens: readonly (readonly string[])[]) {
+  initTheme("dark", false);
+  current.ctx.mode = "tui";
+  const remaining = [...screens];
+  const rendered: string[] = [];
+  current.ctx.ui.custom = async <T>(factory: (tui: Parameters<CustomFactory>[0], theme: Parameters<CustomFactory>[1], keys: Parameters<CustomFactory>[2], done: (result: T) => void) => ReturnType<CustomFactory>): Promise<T> => {
+    const result = Promise.withResolvers<T>();
+    // Supply only the host surface used by these real Pi widgets; no terminal is started.
+    const component = await factory(
+      { requestRender() {} } as Parameters<CustomFactory>[0],
+      {} as Parameters<CustomFactory>[1],
+      getKeybindings() as Parameters<CustomFactory>[2],
+      result.resolve,
+    );
+    const keys = remaining.shift();
+    assert.ok(keys, "Unexpected extra screen");
+    for (const key of keys) {
+      rendered.push(...component.render(80));
+      component.handleInput?.(key);
+    }
+    rendered.push(...component.render(32));
+    component.dispose?.();
+    return result.promise;
+  };
+  return rendered;
+}
+
+test("TUI Enter toggles twice on the same settings row without a secondary screen", async () => {
+  await writeSettings();
+  const current = await fixture([]);
+  const rendered = driveTui(current, [["\r"], ["\r"], ["\u001b"]]);
+  await current.run();
+  assert.equal(current.notices.length, 2);
+  assert.equal(current.dialogs.length, 0);
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+  });
+  assert.match(rendered.join("\n"), /Fallback model/);
+});
+
+test("TUI fuzzy search filters models by name while keeping the switch off", async () => {
+  const current = await fixture(["high"], model, true, [{ ...model, id: "aaa-unrelated", name: "Unrelated" }]);
+  const rendered = driveTui(current, [["\u001b[B", "\r"], ["CheapModel", "\r"], ["\u001b"]]);
+  await current.run();
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 1, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+  });
+  assert.match(rendered.join("\n"), /type to search/);
+});
+
+test("TUI an unmatched search cannot select a model and Escape leaves settings unchanged", async () => {
+  const current = await fixture([]);
+  driveTui(current, [["\u001b[B", "\r"], ["no-such-model", "\r", "\u001b"], ["\u001b"]]);
+  await current.run();
+  await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
+  assert.deepEqual(current.notices, []);
+});
+
+test("RPC model search filters the offered choices", async () => {
+  const current = await fixture([firstChoice, undefined]);
+  current.ctx.ui.input = async () => "no-such-model";
+  await current.run();
+  assert.deepEqual(current.dialogs[1].options, []);
+  await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
 });

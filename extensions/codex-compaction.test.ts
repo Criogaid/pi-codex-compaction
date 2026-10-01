@@ -1199,6 +1199,17 @@ test("an explicit off switch skips model resolution even when the saved model is
   assert.equal(fixture.remoteRequests(), 0);
 });
 
+for (const enabled of [false, true]) {
+  test(`a switch without a configured model remains inactive (enabled=${enabled})`, async () => {
+    await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, fallback: { enabled } }));
+    const fixture = await fallbackFixture();
+    fixture.ctx.modelRegistry.find = () => { throw new Error("An unconfigured fallback must not resolve a model"); };
+    assert.equal(await fixture.run(), undefined);
+    assert.equal(fixture.calls.length, 0);
+    assert.equal(fixture.remoteRequests(), 0);
+  });
+}
+
 test("an explicit on switch uses the selected fallback model", async () => {
   await writeFile(fallbackSettingsPath, JSON.stringify({
     version: 1, fallback: { enabled: true, provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "high" },
