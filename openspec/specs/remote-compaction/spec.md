@@ -92,18 +92,22 @@ The extension SHALL capture the active Pi session ID and current thinking level 
 - **THEN** 系统不将其用于 opaque 历史重放
 
 ### Requirement: Repeated compaction and checkpoint replay
-系统 SHALL 在同一 identity 下通过唯一 marker 将已有 opaque replacement history 注入下一次 Provider 请求，并支持 session resume 和 fork 后的重放。注入前 MUST 验证 marker 唯一且 Pi 保留的近期消息与已保存 fingerprint 一致。
+系统 SHALL 在同一 provider backend 下通过唯一 marker 将已有 opaque replacement history 注入下一次 Provider 请求，并支持 session resume 和 fork 后的重放。注入前 MUST 验证 marker 唯一且 Pi 保留的近期消息与已保存 fingerprint 一致。
 
 #### Scenario: Repeated compaction with matching identity
-- **WHEN** 活跃 session 已有合法 checkpoint，当前 Provider identity 完全一致，且保留消息 fingerprint 匹配
+- **WHEN** 活跃 session 已有合法 checkpoint，当前 provider、API、base URL 和 endpoint 均匹配，且保留消息 fingerprint 匹配
 - **THEN** 系统用 checkpoint replacement history 替换唯一 marker，再发起新的 Remote Compaction V2
 
 #### Scenario: Resume or fork preserves valid context
 - **WHEN** session resume 或 fork 后仍能定位 fallback summary，且保留消息 fingerprint 全部匹配
-- **THEN** 系统恢复 marker 投影，并允许相同 identity 重放 opaque 历史
+- **THEN** 系统恢复 marker 投影，并允许同一 provider backend 重放 opaque 历史
+
+#### Scenario: Model changes on the same provider backend
+- **WHEN** 当前模型变化，但 provider、API、base URL 和 endpoint 均匹配，且 checkpoint 投影与保留消息 fingerprint 均可验证
+- **THEN** 系统继续重放 checkpoint，并由所选 Provider 处理新模型；Pi 不提供服务端 `comp_hash`，模型间兼容性由后端决定
 
 #### Scenario: Provider identity changes
-- **WHEN** provider、API、model、base URL 或 endpoint 任一项变化
+- **WHEN** provider、API、base URL 或 endpoint 任一项变化
 - **THEN** 系统不得重放 opaque 历史，只保留 fallback marker 和 Pi 保留的近期消息，并向有 UI 的用户显示一次警告
 
 #### Scenario: Marker or retained messages cannot be verified

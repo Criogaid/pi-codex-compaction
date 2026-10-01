@@ -1,0 +1,7 @@
+node_modules/
+.bun/
+dist/
+.agent-tools/
+.env
+.env.*
+!.env.example

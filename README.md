@@ -7,11 +7,13 @@
 
 ## 安装
 
-This fork requires Pi 0.99.1 or newer. Run the following command from the cloned repository root to load the maintained package. The npm package under `@oipsanthony` contains the upstream implementation.
+需要 Pi 0.99.1 或更新版本。从 GitHub 安装：
 
 ```bash
-pi install ./packages/pi-codex-compaction
+pi install git:github.com/Criogaid/pi-codex-compaction
 ```
+
+开发时可在克隆后的仓库根目录执行 `pi install .`。本仓库以独立包 `pi-codex-compaction` 维护，来源为 `Criogaid/pi-extensions-anthony` 的 `fix/compaction-runtime-parameters` 分支；原 `@oipsanthony/pi-codex-compaction` npm 包对应上游实现。
 
 ## 使用
 
@@ -104,16 +106,27 @@ Checkpoint identity uses the resolved endpoint. A changed authentication endpoin
 
 加载旧检查点时，扩展先按检查点创建时的分支验证旧算法生成的指纹，确认匹配后在内存中修正为标准投影的指纹。此过程不改写会话文件，也不改变 checkpoint 格式。原始记录缺失或旧指纹不匹配时不执行修正；检查点创建之后的消息编辑仍受重放校验约束。
 
+独立维护后继续使用原有 checkpoint、marker 和 completion entry 标识，并保留旧 fallback summary 的文字，以兼容已有 Pi 会话。因此会话记录和部分降级提示仍包含原包名。
+
 实现基于 `@narumitw/pi-codex-compact`，许可证与 attribution 见 [LICENSE](LICENSE)。
 
-## Verification
+## 开发与验证
 
-From the repository root, run these npm scripts with Node 24 or newer:
+使用 Node 24 或更新版本。在仓库根目录安装依赖并运行：
 
 ```bash
-npm run test --workspace @oipsanthony/pi-codex-compaction
-npm run typecheck --workspace @oipsanthony/pi-codex-compaction
+bun install --frozen-lockfile
+npm run typecheck
+npm test
 npm run pack:check
 ```
 
-The test script compiles TypeScript into the ignored `dist/` directory and runs Node's test runner. It does not invoke Bun. Other upstream packages retain their existing test runtimes.
+测试脚本将 TypeScript 编译到 Git 忽略的 `dist/` 目录，再使用 Node 的测试运行器执行。打包检查使用 npm dry run，验证入口和全部运行时模块已包含，测试及迁移记录未进入发布包。CI 在 Linux 和 Windows 上运行相同命令。
+
+版本变更使用 Changesets：`npm run changeset` 添加记录，`npm run version-packages` 应用版本变更。本次迁移没有发布 npm 包；仓库不自动发布。
+
+## 来源与提交历史
+
+本仓库仅提取源分支中本插件的源码、测试、文档、许可证、专属 Changeset 和 remote-compaction 设计记录。包目录移到仓库根目录，原始作者、提交者、时间、正文及署名行保持不变；提交标题中的 scope 改为对应功能模块。重建提交改变了 Git 对象，原加密签名不再保留。
+
+[migration/history.json](migration/history.json) 记录源分支、源提交和重建提交的对应关系。现有 Changelog 的版本及旧提交引用保留为上游发布记录；`openspec/changes/archive/` 保留原设计阶段的包名和路径。运行行为以本 README 与当前测试为准，迁移不修改扩展运行时代码。

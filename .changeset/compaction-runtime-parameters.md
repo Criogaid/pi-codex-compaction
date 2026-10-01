@@ -1,5 +1,5 @@
 ---
-"@oipsanthony/pi-codex-compaction": major
+"pi-codex-compaction": major
 ---
 
 Inherit the active Pi session's thinking level and session ID during Remote Compaction V2. Use Pi's simple provider adapter for effort mapping and cache defaults instead of forcing caching off. Preserve the resolved provider environment and nullable header overrides.
