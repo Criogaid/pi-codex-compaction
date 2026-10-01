@@ -508,6 +508,46 @@ test("cancels a pending compaction when session ownership changes", async () => 
   assert.deepEqual(current.notifications, []);
 });
 
+for (const interruption of ["abort", "session-switch"] as const) {
+  test(`a late remote checkpoint after ${interruption} is discarded without starting fallback`, async () => {
+    const entered = Promise.withResolvers<void>();
+    const reply = Promise.withResolvers<Response>();
+    const controller = new AbortController();
+    const mock = mockPi("high", { transport: "sse", retry: { provider: { maxRetries: 0 } } });
+    let requests = 0;
+    createCodexCompactionExtension({ fetch: async () => {
+      requests++;
+      entered.resolve();
+      // Simulate a server completing after the caller stopped owning the request.
+      return reply.promise;
+    } })(mock.pi);
+    const native = openaiProvider();
+    const registry = await testRegistry({ ...native, id: model.provider });
+    let sessionId = "original-session";
+    const entries = branch();
+    const current = await context({
+      modelRegistry: registry,
+      sessionManager: { getSessionId: () => sessionId, getBranch: () => entries },
+    });
+    const compact = mock.events.get("session_before_compact")?.[0];
+    assert.ok(compact);
+    const pending = Promise.resolve(compact(compactEvent(controller.signal), current.ctx));
+    try {
+      await Promise.race([entered.promise, pending.then(() => { throw new Error("Compaction ended before its provider request"); })]);
+      if (interruption === "abort") controller.abort();
+      else sessionId = "replacement-session";
+      reply.resolve(sseResponse());
+      assert.deepEqual(await pending, { cancel: true });
+      assert.equal(requests, 1);
+      assert.deepEqual(mock.appendedEntries, []);
+      assert.deepEqual(current.notifications.filter((notice) => notice.level !== "info"), []);
+    } finally {
+      controller.abort();
+      reply.resolve(sseResponse());
+    }
+  });
+}
+
 test("unsupported and unconfigured models use Pi compaction silently", async () => {
   const mock = mockPi();
   createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
@@ -551,13 +591,17 @@ async function providerCompaction(messages: SessionMessage[], options: {
   ordinaryProjection?: (messages: AgentMessage[]) => AgentMessage[];
   prepareOrdinarySource?: (messages: AgentMessage[]) => AgentMessage[];
   retryOrdinaryPayload?: boolean;
+  compactionResponses?: readonly Response[];
   afterOrdinary?: (session: SessionManager, mock: ReturnType<typeof mockPi>, current: Awaited<ReturnType<typeof context>>, requestModel: Model<"openai-responses">) => void | Promise<void>;
 } = {}) {
   const mock = mockPi("high", options.settings, options.tools);
   let payload: unknown;
+  const requests: JsonObject[] = [];
   createCodexCompactionExtension({ fetch: async (input, init) => {
     payload = await new Request(input, init).json();
-    return sseResponse();
+    assert.ok(isObject(payload));
+    requests.push(structuredClone(payload));
+    return options.compactionResponses?.[requests.length - 1] ?? sseResponse();
   } })(mock.pi);
   const sessionManager = SessionManager.inMemory();
   const entries = messages.map((message) => sessionManager.appendMessage(message));
@@ -620,7 +664,7 @@ async function providerCompaction(messages: SessionMessage[], options: {
   }
   const details = await compactSession(mock, sessionManager, entries[firstUser], current, options.customInstructions);
   assert.ok(isObject(payload));
-  return { payload, ordinaryPayload, contexts, details, notifications: current.notifications };
+  return { payload, ordinaryPayload, contexts, details, requests, notifications: current.notifications };
 }
 
 function toolHistory(): SessionMessage[] {
@@ -635,7 +679,8 @@ function toolHistory(): SessionMessage[] {
 
 function packToolHistory(messages: AgentMessage[]): AgentMessage[] {
   return messages.map((message) => message.role === "toolResult"
-    ? { ...message, content: [{ type: "text", text: "[large tool result replaced after 2 successful responses on this branch] obs_fixture" }] }
+    ? { ...message, content: message.content.map((block) => block.type === "text"
+        ? { ...block, text: "[large tool result replaced after 2 successful responses on this branch] obs_fixture" } : block) }
     : message);
 }
 
@@ -655,6 +700,50 @@ test("compaction preserves Pi's ordinary context projection and appends only new
   assert.deepEqual(messages, saved);
 });
 
+test("an image-bearing projected prefix survives a failed HTTP compaction attempt and its retry", async () => {
+  const image = { type: "image" as const, mimeType: "image/png",
+    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==" };
+  const messages: SessionMessage[] = toolHistory().map((message) => {
+    if (message.role === "system") return { ...message, toolsAdded: [{
+      name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } } },
+    }] };
+    if (message.role === "user") return { ...message, content: [{ type: "text", text: "Inspect this image" }, image] };
+    if (message.role === "toolResult") return { ...message, content: [...message.content, image] };
+    return message;
+  });
+  const saved = structuredClone(messages);
+  const result = await providerCompaction(messages, {
+    ordinaryProjection: packToolHistory,
+    settings: { transport: "sse", images: { blockImages: false }, retry: { provider: { maxRetries: 1, maxRetryDelayMs: 1 } } },
+    compactionResponses: [new Response("Service unavailable", { status: 503 }), sseResponse()],
+    afterOrdinary(session) {
+      session.appendMessage({ role: "assistant", content: [{ type: "text", text: "Image inspected" }],
+        api: model.api, provider: model.provider, model: model.id, usage, stopReason: "stop", timestamp: 4 });
+    },
+  });
+  const ordinary = result.ordinaryPayload;
+  assert.ok(ordinary && Array.isArray(ordinary.input));
+  assert.ok(Array.isArray(ordinary.tools) && ordinary.tools.length > 0);
+  const images = ordinary.input.filter(isObject).flatMap((item) => [
+    ...(Array.isArray(item.content) ? item.content : []),
+    ...(Array.isArray(item.output) ? item.output : []),
+  ]).filter(isObject).filter((block) => block.type === "input_image");
+  assert.equal(images.length, 2);
+  assert.match(JSON.stringify(ordinary.input), /obs_fixture/);
+  assert.equal(result.requests.length, 2);
+  for (const request of result.requests) {
+    assert.ok(Array.isArray(request.input));
+    assert.equal(JSON.stringify(request.input.slice(0, ordinary.input.length)), JSON.stringify(ordinary.input));
+    assert.deepEqual(request.instructions, ordinary.instructions);
+    assert.deepEqual(request.tools, ordinary.tools);
+    assert.match(JSON.stringify(request.input.at(-2)), /Image inspected/);
+    assert.deepEqual(request.input.at(-1), { type: "compaction_trigger" });
+    assert.equal(request.input.length, ordinary.input.length + 2);
+  }
+  assert.deepEqual(result.requests[1], result.requests[0]);
+  assert.deepEqual(messages, saved);
+});
+
 test("compaction does not reuse an ordinary context whose source includes unpersisted messages", async () => {
   const result = await providerCompaction(toolHistory(), { ordinaryProjection: packToolHistory,
     prepareOrdinarySource(messages) {
@@ -665,7 +754,7 @@ test("compaction does not reuse an ordinary context whose source includes unpers
   assert.doesNotMatch(JSON.stringify(result.payload.input), /obs_fixture|request-local message/);
 });
 
-for (const change of ["edit", "system", "session-start", "session-id", "model", "backend"] as const) {
+for (const change of ["edit", "system", "session-start", "session-shutdown", "session-id", "model", "backend"] as const) {
   test(`compaction discards its ordinary context projection after ${change} changes`, async () => {
     const result = await providerCompaction(toolHistory(), { ordinaryProjection: packToolHistory,
       async afterOrdinary(session, mock, current, requestModel) {
@@ -676,6 +765,7 @@ for (const change of ["edit", "system", "session-start", "session-id", "model", 
         }
         if (change === "system") session.appendMessage({ role: "system", content: "new instructions", timestamp: 4 });
         if (change === "session-start") await mock.events.get("session_start")?.[0]?.({ type: "session_start" }, current.ctx);
+        if (change === "session-shutdown") await mock.events.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, current.ctx);
         if (change === "session-id") session.getSessionId = () => "replacement-session";
         if (change === "model") requestModel.id = "other-model";
         if (change === "backend") {
@@ -704,7 +794,7 @@ test("compaction reuses the effective ordinary prompt after Pi clears its run ov
   assert.deepEqual(messages, saved);
 });
 
-for (const change of ["system", "session-start", "session-id", "model"] as const) {
+for (const change of ["system", "session-start", "session-shutdown", "session-id", "model"] as const) {
   test(`compaction discards an ordinary prompt override after ${change} changes`, async () => {
     const messages: SessionMessage[] = [
       { role: "system", content: "canonical prompt", timestamp: 0 },
@@ -714,6 +804,7 @@ for (const change of ["system", "session-start", "session-id", "model"] as const
       async afterOrdinary(session, mock, current, requestModel) {
         if (change === "system") session.appendMessage({ role: "system", content: "new instructions", timestamp: 2 });
         if (change === "session-start") await mock.events.get("session_start")?.[0]?.({ type: "session_start" }, current.ctx);
+        if (change === "session-shutdown") await mock.events.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, current.ctx);
         if (change === "session-id") session.getSessionId = () => "replacement-session";
         if (change === "model") requestModel.id = "other-model";
       },

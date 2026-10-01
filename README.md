@@ -68,6 +68,8 @@ The extension observes Responses events with `onProviderStreamEvent`, which work
 
 Tests compare ordinary and compaction requests through the real Pi Responses adapters using simulated HTTP responses. Matching parameters do not guarantee a cache hit or a billing reduction; those depend on the backend and request prefix.
 
+回归测试覆盖含用户图片和工具输出图片的请求前缀、工具输出投影后遇到 HTTP 503 的重试、会话关闭后的快照清理，以及取消或切换会话后的迟到压缩响应。配置命令通过真实扩展入口和 Pi 模型注册表测试，覆盖取消不保存、外部修改冲突和受支持的思考等级；这些测试不向真实模型发送请求。
+
 ### History retention
 
 [retention-input.ts](extensions/retention-input.ts) 按 [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs) 的默认规则筛选普通 Responses 消息：排除环境、技能、内部上下文及旧版提示片段，识别可见 hook 提示，并把图片缩放通知与来源消息一起处理。Hook XML 使用固定版本的 `saxes` 解析，边界用例与官方 `quick-xml` 实际运行结果对照。
