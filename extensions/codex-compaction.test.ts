@@ -69,8 +69,7 @@ const usage = {
 
 type Handler = (...args: any[]) => unknown;
 
-// Persisted timeout strings exercise the runtime boundary beyond Settings' numeric type.
-type TestSettings = Omit<ReturnType<ExtensionAPI["getSettings"]>, "websocketConnectTimeoutMs"> & { websocketConnectTimeoutMs?: unknown };
+type TestSettings = ReturnType<ExtensionAPI["getSettings"]>;
 interface TestTools { active: string[]; all: Tool[] }
 
 function mockPi(thinkingLevel: ThinkingLevel = "high", settings: TestSettings = { transport: "sse" }, tools: TestTools = { active: [], all: [] }) {
@@ -886,9 +885,9 @@ for (const blockImages of [true, false]) {
   });
 }
 
-test("passes effective runtime settings from Pi to the provider on every compaction", async () => {
+test("preserves Pi reasoning and retry settings while fixing V2 transport to SSE", async () => {
   const settings: TestSettings = { transport: "websocket", thinkingBudgets: { minimal: 16, low: 32, medium: 64, high: 128 },
-    retry: { maxRetries: 17, provider: { maxRetries: 9, maxRetryDelayMs: 321 } }, websocketConnectTimeoutMs: "disabled" };
+    retry: { maxRetries: 17, provider: { maxRetries: 9, maxRetryDelayMs: 321 } }, websocketConnectTimeoutMs: 0 };
   const observed: SimpleStreamOptions[] = [];
   const provider = fakeProvider((options) => { assert.ok(options); observed.push(options); });
   const mock = mockPi("high", settings);
@@ -897,11 +896,11 @@ test("passes effective runtime settings from Pi to the provider on every compact
   const compact = mock.events.get("session_before_compact")?.[0];
   assert.ok(compact);
   assert.ok(await compact(compactEvent(), current.ctx));
-  assert.equal(observed[0].transport, "websocket");
+  assert.equal(observed[0].transport, "sse");
   assert.deepEqual(observed[0].thinkingBudgets, settings.thinkingBudgets);
   assert.equal(observed[0].maxRetries, 2);
   assert.equal(observed[0].maxRetryDelayMs, 321);
-  assert.equal(observed[0].websocketConnectTimeoutMs, 0);
+  assert.equal(observed[0].websocketConnectTimeoutMs, undefined);
   settings.transport = "sse";
   settings.retry = { provider: { maxRetries: 0, maxRetryDelayMs: 123 } };
   settings.websocketConnectTimeoutMs = 45;
@@ -909,20 +908,7 @@ test("passes effective runtime settings from Pi to the provider on every compact
   assert.equal(observed[1].transport, "sse");
   assert.equal(observed[1].maxRetries, 0);
   assert.equal(observed[1].maxRetryDelayMs, 123);
-  assert.equal(observed[1].websocketConnectTimeoutMs, 45);
-});
-
-test("normalizes websocket timeout strings and rejects invalid runtime values", async () => {
-  for (const [configured, expected] of [[undefined, undefined], [0, 0], [12.9, 12], [" 25.9 ", 25], [" DISABLED ", 0],
-    ["", undefined], ["  ", undefined], [-1, undefined], ["-1", undefined], [NaN, undefined], [Infinity, undefined], ["invalid", undefined]] as const) {
-    let observed: SimpleStreamOptions | undefined;
-    const mock = mockPi("high", { transport: "sse", websocketConnectTimeoutMs: configured });
-    createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
-    const current = await context({ modelRegistry: await testRegistry(fakeProvider((options) => { observed = options; })) });
-    const result = await mock.events.get("session_before_compact")?.[0]?.(compactEvent(), current.ctx);
-    assert.ok(result && observed);
-    assert.equal(observed.websocketConnectTimeoutMs, expected, String(configured));
-  }
+  assert.equal(observed[1].websocketConnectTimeoutMs, undefined);
 });
 
 test("warns for nonempty custom instructions and leaves provider instructions unchanged", async () => {

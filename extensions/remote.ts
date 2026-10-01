@@ -1,6 +1,6 @@
 // Own V2 request adaptation; Pi's model registry owns authentication and provider dispatch.
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Context, Model, ProviderHeaders, ThinkingBudgets, Transport, Usage } from "@earendil-works/pi-ai";
+import type { Context, Model, ProviderHeaders, ThinkingBudgets, Usage } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
 import { trimToolOutputsToContextWindow } from "./context-window.js";
@@ -19,12 +19,10 @@ export interface RemoteCompactionRequest {
   context: Context;
   reasoning: ThinkingLevel;
   sessionId: string;
-  transport?: Transport;
   thinkingBudgets?: ThinkingBudgets;
   /** Pi's provider retry setting; Codex caps compaction retries below it. */
   maxRetries?: number;
   maxRetryDelayMs?: number;
-  websocketConnectTimeoutMs?: number;
   signal: AbortSignal;
   /** Pi origins of the context's user messages, used to align provider user items with Pi roles. */
   userItemOrigins?: readonly UserItemOrigin[];
@@ -65,7 +63,6 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   request.signal.throwIfAborted();
   const configured = capableModel(request.model);
   if (!configured) throw new CodexCompactionProtocolError("Model is not configured for remote compaction");
-  const overridesEndpoint = configured.identity.endpoint !== deriveEndpoint(configured.identity.baseUrl, configured.identity.api);
   const collector = createCompactionCollector();
   let sentInput: JsonObject[] | undefined;
   let identity: ProviderIdentity | undefined;
@@ -90,12 +87,12 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   };
   const stream = request.modelRegistry.streamSimple(request.model, request.context, {
     signal: request.signal,
-    transport: overridesEndpoint ? "sse" : request.transport,
+    // Pi pools WebSockets without comparing handshake headers; V2 needs its feature header on every request.
+    transport: "sse",
     reasoning: request.reasoning === "off" ? undefined : request.reasoning,
     thinkingBudgets: request.thinkingBudgets,
     sessionId: request.sessionId,
     timeoutMs: REQUEST_TIMEOUT_MS,
-    websocketConnectTimeoutMs: request.websocketConnectTimeoutMs,
     maxRetries: Math.min(request.maxRetries ?? MAX_RETRIES, MAX_RETRIES),
     maxRetryDelayMs: request.maxRetryDelayMs,
     transformHeaders: mergeRemoteCompactionHeader,

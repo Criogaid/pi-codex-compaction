@@ -132,13 +132,6 @@ function canonicalMessages(ctx: ExtensionContext): AgentMessage[] {
   return buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
 }
 
-function websocketConnectTimeoutMs(value: unknown): number | undefined {
-  const parsed = typeof value === "string"
-    ? value.trim().toLowerCase() === "disabled" ? 0 : value.trim() ? Number(value.trim()) : undefined
-    : value;
-  return typeof parsed === "number" && Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : undefined;
-}
-
 function projectedCurrentMessages(
   event: SessionBeforeCompactEvent,
   identity: ProviderIdentity,
@@ -265,11 +258,9 @@ async function compactRemotely(
       userItemOrigins: userItemOrigins(messages),
       reasoning,
       sessionId,
-      transport: settings.transport,
       thinkingBudgets: settings.thinkingBudgets,
       maxRetries: settings.retry?.provider?.maxRetries,
       maxRetryDelayMs: settings.retry?.provider?.maxRetryDelayMs,
-      websocketConnectTimeoutMs: websocketConnectTimeoutMs(settings.websocketConnectTimeoutMs),
       signal: event.signal,
       onPrepared: () => {
         if (!sessionStillOwned(ctx, sessionId, event.signal)) throw new Error("Compaction session ownership changed");

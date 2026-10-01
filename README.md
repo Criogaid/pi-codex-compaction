@@ -78,9 +78,9 @@ Cache options use the same provider defaults and resolved `PI_CACHE_RETENTION` e
 
 本包通过 `context_with_system` 保存普通请求经过 `context` 处理后的消息投影，包括工具输出占位文本。压缩时，只有原始会话历史仍与该请求的来源前缀逐条匹配，才沿用这份投影并追加新增消息，再交由 Pi Provider 序列化。历史编辑、系统状态变化、切换 session、模型或后端时丢弃旧投影；普通请求包含尚未写入会话的消息时不保存投影。Prompt 覆盖和消息投影仅保存在当前进程中；重启后需要先发出一次普通请求。
 
-`images.blockImages`、`thinkingBudgets`、`websocketConnectTimeoutMs` 和 `retry.provider.maxRetryDelayMs` 按 Pi 设置生效；重试次数取 Pi 的 `retry.provider.maxRetries` 与 Codex 上限 2 中的较小值。压缩不会重新执行其他扩展的处理器；本包 `context_with_system` 之后的消息改写、`before_provider_request` 的额外 payload 改写及 `before_provider_headers` 处理器不会被快照重放。工具 `prepareLoadout` 隐藏的声明由 Pi 在 context 处理器之后过滤，扩展 API 无法取得，因此使用该能力时压缩请求仍会声明这些工具，缓存前缀会从工具定义处分叉。Remote Compaction V2 不接受 `/compact` 的自定义指令，提供时会显示 warning 并忽略。
+V2 请求固定使用 SSE，避免复用缺少 `remote_compaction_v2` 功能头的普通 WebSocket 连接；session ID、缓存参数和请求前缀保持原规则，普通对话与文本降级仍沿用 Pi 的传输设置。`images.blockImages`、`thinkingBudgets` 和 `retry.provider.maxRetryDelayMs` 按 Pi 设置生效；重试次数取 Pi 的 `retry.provider.maxRetries` 与 Codex 上限 2 中的较小值。压缩不会重新执行其他扩展的处理器；本包 `context_with_system` 之后的消息改写、`before_provider_request` 的额外 payload 改写及 `before_provider_headers` 处理器不会被快照重放。工具 `prepareLoadout` 隐藏的声明由 Pi 在 context 处理器之后过滤，扩展 API 无法取得，因此使用该能力时压缩请求仍会声明这些工具，缓存前缀会从工具定义处分叉。Remote Compaction V2 不接受 `/compact` 的自定义指令，提供时会显示 warning 并忽略。
 
-The extension observes Responses events with `onProviderStreamEvent`, which works with Pi's HTTP and WebSocket adapters. It uses the configured transport for standard provider routes. An explicit nonstandard endpoint override uses HTTP because Pi exposes custom HTTP routing through `fetch`.
+扩展通过 Pi 的 `onProviderStreamEvent` 收集 Responses 事件；显式配置非标准 endpoint 时，通过 `fetch` 重定向到已校验的同源地址。
 
 Tests compare ordinary and compaction requests through the real Pi Responses adapters using simulated HTTP responses. Matching parameters do not guarantee a cache hit or a billing reduction; those depend on the backend and request prefix.
 

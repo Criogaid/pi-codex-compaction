@@ -27,7 +27,7 @@ function response() {
 }
 function request(modelRegistry: Awaited<ReturnType<typeof testRegistry>>) {
   return { modelRegistry, model, context: { messages: [{ role: "user" as const, content: "current", timestamp: 1 }] },
-    reasoning: "high" as const, sessionId: "session", transport: "sse" as const,
+    reasoning: "high" as const, sessionId: "session",
     signal: new AbortController().signal };
 }
 
@@ -98,10 +98,10 @@ test("rejects a prior checkpoint when authentication changes the endpoint", asyn
   assert.equal(sent, false);
 });
 
-test("accepts header-only auth and raw WebSocket events without requiring an HTTP body", async () => {
-  const websocketModel = { ...model, api: "openai-codex-responses" as const };
+test("accepts header-only auth and provider-owned event streams", async () => {
+  const codexModel = { ...model, api: "openai-codex-responses" as const };
   const eventProvider: Provider = {
-    ...provider, getModels: () => [websocketModel],
+    ...provider, getModels: () => [codexModel],
     streamSimple(preparedModel, _context, options) {
       const stream = createAssistantMessageEventStream();
       const message: AssistantMessage = {
@@ -113,9 +113,9 @@ test("accepts header-only auth and raw WebSocket events without requiring an HTT
         try {
           assert.equal(options?.apiKey, undefined);
           assert.equal(options?.headers?.cookie, "fixture-cookie");
-          assert.equal(options?.transport, "websocket");
+          assert.equal(options?.transport, "sse");
           await options?.onPayload?.({ model: preparedModel.id, input: [] }, preparedModel);
-          const item = { type: "compaction", encrypted_content: "websocket-opaque" };
+          const item = { type: "compaction", encrypted_content: "provider-opaque" };
           await options?.onProviderStreamEvent?.({ type: "response.output_item.done", item }, preparedModel);
           await options?.onProviderStreamEvent?.({ type: "response.completed" }, preparedModel);
           stream.push({ type: "done", reason: "stop", message });
@@ -130,10 +130,10 @@ test("accepts header-only auth and raw WebSocket events without requiring an HTT
     },
   };
   const registry = await testRegistry(eventProvider, async () => ({ auth: { headers: { cookie: "fixture-cookie" } } }));
-  const result = await requestRemoteCompaction({ ...request(registry), model: websocketModel, transport: "websocket",
-    fetch: async () => { assert.fail("WebSocket provider must not require an HTTP request"); },
+  const result = await requestRemoteCompaction({ ...request(registry), model: codexModel,
+    fetch: async () => { assert.fail("Custom provider owns its transport"); },
   });
-  assert.equal(result.item.encrypted_content, "websocket-opaque");
+  assert.equal(result.item.encrypted_content, "provider-opaque");
 });
 
 for (const fault of ["endpoint", "method", "feature-header", "model"] as const) {
