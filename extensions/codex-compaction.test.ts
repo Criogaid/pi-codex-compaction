@@ -1,5 +1,5 @@
-import { writeFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, writeFile, rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import {
@@ -28,10 +28,10 @@ import {
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, parseCheckpointDetails } from "./checkpoint.js";
 import { createCodexCompactionExtension } from "./codex-compaction.js";
 import { isolateAgentConfig, testRegistry } from "./test-registry.test.js";
-import { FALLBACK_SETTINGS_FILENAME } from "./fallback.js";
 import { isObject, type JsonObject } from "./protocol.js";
 
-const fallbackSettingsPath = join(isolateAgentConfig(), FALLBACK_SETTINGS_FILENAME);
+const fallbackSettingsPath = join(isolateAgentConfig(), "extensions", "pi-codex-compaction", "config.json");
+await mkdir(dirname(fallbackSettingsPath), { recursive: true });
 afterEach(() => rm(fallbackSettingsPath, { force: true }));
 
 const capability = {

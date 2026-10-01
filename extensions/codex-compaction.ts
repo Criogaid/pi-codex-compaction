@@ -34,7 +34,7 @@ import {
 } from "./checkpoint.js";
 import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
-import { FALLBACK_SETTINGS_FILENAME, requestFallbackCompaction } from "./fallback.js";
+import { FALLBACK_SETTINGS_RELATIVE_PATH, requestFallbackCompaction } from "./fallback.js";
 import {
   applyPromptOverride,
   captureContextSnapshot,
@@ -314,7 +314,7 @@ export function createCodexCompactionExtension(
   options: { fetch?: typeof globalThis.fetch } = {},
 ): (pi: ExtensionAPI) => void {
   return (pi) => {
-    const fallbackSettingsPath = resolve(getAgentDir(), FALLBACK_SETTINGS_FILENAME);
+    const fallbackSettingsPath = resolve(getAgentDir(), FALLBACK_SETTINGS_RELATIVE_PATH);
     const warnings = new Set<string>();
     let snapshots: RequestSnapshots = {};
 

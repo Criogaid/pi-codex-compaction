@@ -23,7 +23,7 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 
 ### 指定降级压缩模型
 
-在 Pi 配置目录新建 `pi-codex-compaction.json`。默认路径为 `~/.pi/agent/pi-codex-compaction.json`；设置了 `PI_CODING_AGENT_DIR` 时使用该目录。配置使用 UTF-8 JSON：
+在 `~/.pi/agent/extensions/pi-codex-compaction/` 目录新建 `config.json`，目录不存在时先创建。设置了 `PI_CODING_AGENT_DIR` 时，配置路径为该目录下的 `extensions/pi-codex-compaction/config.json`。配置使用 UTF-8 JSON：
 
 ```json
 {

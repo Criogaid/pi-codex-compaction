@@ -4,7 +4,7 @@ import { getSupportedThinkingLevels, type Api, type AssistantMessage, type Model
 import { compact, SettingsManager, type ExtensionAPI, type ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { isObject } from "./protocol.js";
 
-export const FALLBACK_SETTINGS_FILENAME = "pi-codex-compaction.json";
+export const FALLBACK_SETTINGS_RELATIVE_PATH = "extensions/pi-codex-compaction/config.json";
 const SETTINGS_VERSION = 1;
 const MAX_SETTINGS_BYTES = 16 * 1024;
 const REQUEST_TIMEOUT_MS = 300_000;
