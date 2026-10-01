@@ -43,18 +43,21 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
   request.onPrepared(selection);
   const settings = SettingsManager.inMemory(request.settings);
   const providerRetry = settings.getProviderRetrySettings();
+  // pi-virtual limits are display hints. Zero lets native compact use its reserve budget;
+  // streamSimple routes the original model and caps each request to the physical model's limit.
+  const budgetModel = selection.model.api === "pi-virtual" ? { ...selection.model, maxTokens: 0 } : selection.model;
   // Pi 0.99.1 can append file lists to empty or provider-aborted summaries; inspect the actual completions.
   const responses: Promise<AssistantMessage>[] = [];
   const result = await compact(
     request.preparation,
-    selection.model,
+    budgetModel,
     undefined,
     undefined,
     request.customInstructions,
     request.signal,
     selection.thinkingLevel,
-    (model, context, options) => {
-      const stream = request.modelRegistry.streamSimple(model, context, {
+    (_model, context, options) => {
+      const stream = request.modelRegistry.streamSimple(selection.model, context, {
         ...options,
         transport: settings.getTransport(),
         thinkingBudgets: settings.getThinkingBudgets(),

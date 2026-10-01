@@ -56,7 +56,7 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 }
 ```
 
-将 `provider` 和 `model` 替换为 Pi 中已配置的实际 ID；显示名称不能代替 ID。模型必须支持指定的 `thinkingLevel`，例如 `high` 或 `off`。扩展通过 Pi 的模型注册表使用该模型的认证、Provider 配置与思考等级映射，不需要额外配置 API key。
+将 `provider` 和 `model` 替换为 Pi 中已配置的实际 ID；显示名称不能代替 ID。模型必须支持指定的 `thinkingLevel`，例如 `high` 或 `off`。扩展通过 Pi 的模型注册表使用该模型的认证、Provider 配置与思考等级映射，不需要额外配置 API key。选择虚拟模型时，每份摘要由 Pi 路由一次；输出预算同时受原生压缩预留量和实际模型上限约束，不使用虚拟模型的展示限额提前截断。
 
 Remote Compaction V2 成功时继续使用当前模型的 opaque 检查点。V2 被关闭、远程请求失败或当前模型不支持该协议时，扩展使用已启用的指定模型调用 Pi 原生文本压缩。手动 `/compact`、自动阈值压缩和上下文溢出恢复共用此规则。例如，使用 Astra 对话时可以把文本压缩交给 `gpt-6.1-sol` 的 `high`，摘要生成后仍由 Astra 继续对话，当前模型和对话思考等级不会被修改。
 
