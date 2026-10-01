@@ -354,7 +354,10 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("context", async (event, ctx) => {
-      snapshots.pendingSource = { sessionId: ctx.sessionManager.getSessionId(), fingerprints: event.messages.map(fingerprintMessage) };
+      // Pi clones context messages per request, so fingerprints are never cached; hash only when V2 can reuse them.
+      snapshots.pendingSource = capableModel(ctx.model)
+        ? { sessionId: ctx.sessionManager.getSessionId(), fingerprints: event.messages.map(fingerprintMessage) }
+        : undefined;
       snapshots.pendingContext = undefined;
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !await compatibleIdentity(checkpoint.details, ctx)) return undefined;
