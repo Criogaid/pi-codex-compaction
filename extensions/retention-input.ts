@@ -37,6 +37,10 @@ function contextual(text: string): boolean {
 
 // quick-xml's struct deserializer accepts any root name and reads only the first root.
 // A nonempty hook_run_id and exactly one direct text field are required; nested fields are ignored.
+// Known deviation: saxes rejects some input quick-xml 0.41 accepts (a leading XML declaration or
+// DOCTYPE, prefixed attributes, a raw "<" in attribute values, "]]>" in text, invalid names, and
+// control characters). Such text is classified as ordinary user text, never the reverse; retention
+// differs only when it shares a message with other parts.
 function hookPrompt(text: string): boolean {
   if (!text.includes("hook_run_id")) return false;
   const parser = new SaxesParser({ fragment: true });
