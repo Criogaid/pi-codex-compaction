@@ -29,7 +29,7 @@ Cache options use the same provider defaults and resolved `PI_CACHE_RETENTION` e
 
 本包通过 `context_with_system` 保存普通请求经过 `context` 处理后的消息投影，包括工具输出占位文本。压缩时，只有原始会话历史仍与该请求的来源前缀逐条匹配，才沿用这份投影并追加新增消息，再交由 Pi Provider 序列化。历史编辑、系统状态变化、切换 session、模型或后端时丢弃旧投影；普通请求包含尚未写入会话的消息时不保存投影。Prompt 覆盖和消息投影仅保存在当前进程中；重启后需要先发出一次普通请求。
 
-`images.blockImages`、`thinkingBudgets`、`websocketConnectTimeoutMs` 和 `retry.provider.maxRetryDelayMs` 按 Pi 设置生效；重试次数取 Pi 的 `retry.provider.maxRetries` 与 Codex 上限 2 中的较小值。压缩不会重新执行其他扩展的处理器；本包 `context_with_system` 之后的消息改写、`before_provider_request` 的额外 payload 改写及 `before_provider_headers` 处理器不会被快照重放。Remote Compaction V2 不接受 `/compact` 的自定义指令，提供时会显示 warning 并忽略。
+`images.blockImages`、`thinkingBudgets`、`websocketConnectTimeoutMs` 和 `retry.provider.maxRetryDelayMs` 按 Pi 设置生效；重试次数取 Pi 的 `retry.provider.maxRetries` 与 Codex 上限 2 中的较小值。压缩不会重新执行其他扩展的处理器；本包 `context_with_system` 之后的消息改写、`before_provider_request` 的额外 payload 改写及 `before_provider_headers` 处理器不会被快照重放。工具 `prepareLoadout` 隐藏的声明由 Pi 在 context 处理器之后过滤，扩展 API 无法取得，因此使用该能力时压缩请求仍会声明这些工具，缓存前缀会从工具定义处分叉。Remote Compaction V2 不接受 `/compact` 的自定义指令，提供时会显示 warning 并忽略。
 
 The extension observes Responses events with `onProviderStreamEvent`, which works with Pi's HTTP and WebSocket adapters. It uses the configured transport for standard provider routes. An explicit nonstandard endpoint override uses HTTP because Pi exposes custom HTTP routing through `fetch`.
 
@@ -100,7 +100,7 @@ Checkpoint identity uses the resolved endpoint. A changed authentication endpoin
 
 保留消息被其他扩展或编辑改变、导致指纹不再匹配时，检查点不会重放，扩展会在当前会话中提示一次。
 
-同时使用会改写工具输出的 `context` 扩展时，在 Pi 的 `packages` 列表中将本包放在这些扩展之前。例如，SoL-Pi Observation Pack 会把已暴露的工具输出替换为占位文本；先投影 checkpoint，再处理近期消息，可避免这些占位文本改变受保护的保留历史。Pi 按扩展加载顺序执行处理器，本包不会跳过指纹校验。
+同时使用会改写工具输出的 `context` 扩展时，在 Pi 的 `packages` 列表中将本包放在这些扩展之前。例如，有些扩展会把已暴露的工具输出替换为占位文本；先投影 checkpoint，再处理近期消息，可避免这些占位文本改变受保护的保留历史。Pi 按扩展加载顺序执行处理器，本包不会跳过指纹校验。
 
 加载旧检查点时，扩展先按检查点创建时的分支验证旧算法生成的指纹，确认匹配后在内存中修正为标准投影的指纹。此过程不改写会话文件，也不改变 checkpoint 格式。原始记录缺失或旧指纹不匹配时不执行修正；检查点创建之后的消息编辑仍受重放校验约束。
 
