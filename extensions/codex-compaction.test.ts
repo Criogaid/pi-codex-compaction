@@ -1188,6 +1188,28 @@ test("disabled fallback delegates unsupported models to Pi", async () => {
   assert.equal(fixture.calls.length, 0);
 });
 
+test("an explicit off switch skips model resolution even when the saved model is unavailable", async () => {
+  await writeFile(fallbackSettingsPath, JSON.stringify({
+    version: 1, fallback: { enabled: false, provider: "removed", model: "old", thinkingLevel: "unsupported" },
+  }));
+  const fixture = await fallbackFixture();
+  fixture.ctx.modelRegistry.find = () => { throw new Error("Disabled fallback must not resolve a model"); };
+  assert.equal(await fixture.run(), undefined);
+  assert.equal(fixture.calls.length, 0);
+  assert.equal(fixture.remoteRequests(), 0);
+});
+
+test("an explicit on switch uses the selected fallback model", async () => {
+  await writeFile(fallbackSettingsPath, JSON.stringify({
+    version: 1, fallback: { enabled: true, provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "high" },
+  }));
+  const fixture = await fallbackFixture();
+  assert.ok((await fixture.run())?.compaction);
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(fixture.calls[0].options?.reasoning, "high");
+  assert.equal(fixture.ctx.model, astraModel);
+});
+
 for (const content of [
   "invalid JSON",
   "[]",
@@ -1199,6 +1221,7 @@ for (const content of [
   JSON.stringify({ version: 1, fallback: { provider: "missing", model: fallbackModel.id, thinkingLevel: "high" } }),
   JSON.stringify({ version: 1, fallback: { provider: fallbackModel.provider, model: "missing", thinkingLevel: "high" } }),
   JSON.stringify({ version: 1, fallback: { provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "high", unexpected: true } }),
+  ...["false", 0, null].map((enabled) => JSON.stringify({ version: 1, fallback: { enabled, provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel: "high" } })),
   JSON.stringify({ unexpected: true }),
   " ".repeat(16 * 1024 + 1),
 ]) {

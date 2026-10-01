@@ -19,6 +19,7 @@ const currentSettings = '\uFEFF{\r\n  "version": 1,\r\n  "fallback": {"provider"
 type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
 type Choice = string | undefined | ((options: readonly string[]) => Promise<string | undefined>);
 const firstChoice: Choice = async (options) => options[0];
+const switchChoice: Choice = async (options) => options[1];
 
 beforeEach(() => rm(settingsDirectory, { recursive: true, force: true }));
 
@@ -67,7 +68,7 @@ test("the command saves an available model and its supported thinking level with
   const chatModel = current.ctx.model;
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, fallback: { provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
   assert.equal(current.ctx.model, chatModel);
   assert.equal(current.ctx.thinkingLevel, "off");
@@ -93,18 +94,82 @@ test("cancelling an unconfigured command creates no configuration file", async (
   await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
 });
 
-test("disabling fallback removes the selection and makes the default chat-model behavior explicit", async () => {
+test("fallback can be switched off and back on without losing the saved model or thinking level", async () => {
   await writeSettings();
-  const current = await fixture([async (options) => options[1]]);
-  await current.run();
-  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1 });
-  assert.match(current.notices[0].message, /Pi will use the chat model/);
+  const disabled = await fixture([switchChoice, "Off"]);
+  await disabled.run();
+  assert.equal(disabled.dialogs[0].options[1], "Fallback model: On");
+  assert.deepEqual(disabled.dialogs[1].options, ["On", "Off"]);
+  const selection = { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "low" };
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, fallback: selection });
+  assert.match(disabled.notices[0].message, /Pi will use the chat model/);
+
+  const enabled = await fixture([switchChoice, "On"]);
+  await enabled.run();
+  assert.equal(enabled.dialogs[0].options[1], "Fallback model: Off");
+  assert.deepEqual(enabled.dialogs[1].options, ["Off", "On"]);
+  assert.equal(enabled.dialogs.length, 2);
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, fallback: { ...selection, enabled: true } });
+  assert.match(enabled.notices[0].message, /cheap\/cheap\/model \(low\)/);
 });
 
-test("disabling an already disabled fallback does not create a configuration file", async () => {
-  const current = await fixture([async (options) => options[1]]);
+test("switching an unconfigured fallback off does not create a configuration file", async () => {
+  const current = await fixture([switchChoice, "Off"]);
   await current.run();
+  assert.equal(current.dialogs[0].options[1], "Fallback model: Off");
   await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
+});
+
+test("switching an unconfigured fallback on guides model and thinking selection", async () => {
+  const current = await fixture([switchChoice, "On", firstChoice, "high"]);
+  await current.run();
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "high" },
+  });
+});
+
+for (const stage of ["switch", "model", "thinking"] as const) {
+  test(`cancelling initial enable at the ${stage} selector creates no configuration file`, async () => {
+    const choices = stage === "switch" ? [switchChoice, undefined]
+      : stage === "model" ? [switchChoice, "On", undefined] : [switchChoice, "On", firstChoice, undefined];
+    const current = await fixture(choices);
+    await current.run();
+    await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
+    assert.deepEqual(current.notices, []);
+  });
+}
+
+test("cancelling the switch selector preserves existing settings byte for byte", async () => {
+  await writeSettings();
+  const current = await fixture([switchChoice, undefined]);
+  await current.run();
+  assert.equal(await readFile(settingsPath, "utf8"), currentSettings);
+  assert.deepEqual(current.notices, []);
+});
+
+test("changing the model or thinking level while disabled preserves the off state", async () => {
+  await writeSettings(JSON.stringify({ version: 1, fallback: { enabled: false, provider: "removed", model: "old", thinkingLevel: "low" } }));
+  const current = await fixture([firstChoice, firstChoice, "high"]);
+  await current.run();
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 1, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+  });
+  assert.match(current.notices[0].message, /Off/);
+});
+
+test("selecting the existing boolean value preserves settings byte for byte", async () => {
+  await writeSettings();
+  const current = await fixture([switchChoice, "On"]);
+  await current.run();
+  assert.equal(await readFile(settingsPath, "utf8"), currentSettings);
+});
+
+test("a boolean value outside the offered choices cannot be saved", async () => {
+  await writeSettings();
+  const current = await fixture([switchChoice, "true"]);
+  await current.run();
+  assert.equal(await readFile(settingsPath, "utf8"), currentSettings);
+  assert.equal(current.notices[0].level, "error");
 });
 
 test("only off is offered for a model without reasoning", async () => {

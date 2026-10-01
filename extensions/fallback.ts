@@ -23,7 +23,7 @@ export interface FallbackCompactionRequest {
 }
 
 function selectFallback(fallback: FallbackConfiguration | undefined, registry: ModelRegistry): FallbackModel | undefined {
-  if (!fallback) return undefined;
+  if (!fallback?.enabled) return undefined;
   const model = registry.find(fallback.provider, fallback.model);
   if (!model) throw new Error(`fallback.model must name a configured model: ${fallback.provider}/${fallback.model}`);
   const supportedLevels = getSupportedThinkingLevels(model);

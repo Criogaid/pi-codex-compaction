@@ -6,12 +6,14 @@ import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { isObject } from "./protocol.js";
 
 export const FALLBACK_SETTINGS_RELATIVE_PATH = "extensions/pi-codex-compaction/config.json";
+export const DEFAULT_FALLBACK_ENABLED = true;
 const SETTINGS_VERSION = 1;
 const MAX_SETTINGS_BYTES = 16 * 1024;
 const DEFAULT_FILE_MODE = 0o600;
 const FILE_PERMISSION_MASK = 0o777;
 
 export interface FallbackConfiguration {
+  readonly enabled: boolean;
   readonly provider: string;
   readonly model: string;
   readonly thinkingLevel: string;
@@ -59,8 +61,11 @@ function parseSettings(bytes: Buffer | undefined): FallbackConfiguration | undef
   if (!("fallback" in settings)) return undefined;
   if (settings.version !== SETTINGS_VERSION) throw new Error(`version must be ${SETTINGS_VERSION} when fallback is configured`);
   const fallback = settings.fallback;
-  if (!isObject(fallback) || Object.keys(fallback).some((key) => !["provider", "model", "thinkingLevel"].includes(key))) {
-    throw new Error("fallback must be an object with provider, model, and thinkingLevel fields");
+  if (!isObject(fallback) || Object.keys(fallback).some((key) => !["enabled", "provider", "model", "thinkingLevel"].includes(key))) {
+    throw new Error("fallback must be an object with provider, model, thinkingLevel, and optional enabled fields");
+  }
+  if ("enabled" in fallback && typeof fallback.enabled !== "boolean") {
+    throw new Error("fallback.enabled must be a boolean");
   }
   if (typeof fallback.provider !== "string" || !fallback.provider.trim() || fallback.provider !== fallback.provider.trim()) {
     throw new Error("fallback.provider must be a non-empty provider ID without surrounding whitespace");
@@ -71,7 +76,10 @@ function parseSettings(bytes: Buffer | undefined): FallbackConfiguration | undef
   if (typeof fallback.thinkingLevel !== "string" || !fallback.thinkingLevel.trim()) {
     throw new Error("fallback.thinkingLevel must be a non-empty thinking level");
   }
-  return { provider: fallback.provider, model: fallback.model, thinkingLevel: fallback.thinkingLevel };
+  return {
+    enabled: typeof fallback.enabled === "boolean" ? fallback.enabled : DEFAULT_FALLBACK_ENABLED,
+    provider: fallback.provider, model: fallback.model, thinkingLevel: fallback.thinkingLevel,
+  };
 }
 
 /** Capture settings for display or execution. Saving detects intervening edits and replaces the file atomically. */
@@ -85,11 +93,11 @@ export async function loadFallbackSettings(path: string) {
   }
   return {
     fallback,
-    async save(selection: FallbackConfiguration | undefined): Promise<void> {
+    async save(selection: FallbackConfiguration): Promise<void> {
       await withFileMutationQueue(path, async () => {
         await mkdir(dirname(path), { recursive: true });
         const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
-        const bytes = Buffer.from(`${JSON.stringify({ version: SETTINGS_VERSION, ...(selection ? { fallback: selection } : {}) }, null, 2)}\n`);
+        const bytes = Buffer.from(`${JSON.stringify({ version: SETTINGS_VERSION, fallback: selection }, null, 2)}\n`);
         if (bytes.length > MAX_SETTINGS_BYTES) throw new Error(`Fallback settings must not exceed ${MAX_SETTINGS_BYTES} bytes`);
         try {
           await writeFile(temporary, bytes, { flag: "wx", mode: original.mode });
