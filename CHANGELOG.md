@@ -2,6 +2,8 @@
 
 ## 未发布
 
+## 0.4.1
+
 - V2 模型识别改为显式 `compat.remoteCompaction` 配置优先；未配置时，`openai-responses` 或 `openai-codex-responses` 模型的 ID 包含 `gpt`（不区分大小写）即尝试 V2，不再限制服务商或官方地址；其他 API 的 GPT 模型未配置时直接使用 Pi 原生压缩，不显示失败警告。无效配置不会退回名称匹配。检查点支持保存和恢复自定义 API 标识，继续校验后端身份。
 
 ## 0.4.0
