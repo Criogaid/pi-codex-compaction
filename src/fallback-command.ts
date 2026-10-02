@@ -58,7 +58,7 @@ async function chooseAction(
   }
   return ctx.ui.custom<SettingsAction | undefined>((tui, _theme, _keys, done) => {
     const list = new SettingsList([
-      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When On, try V2 with the chat model. When Off, unsupported, or failed, use text summaries. The settings below choose their model. Existing checkpoints still replay." },
+      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When On, try V2 with the chat model. When Off, unsupported, or failed, use text summaries. The settings below choose their model. Turning V2 off does not affect previously compressed chat history." },
       { id: "toggle", label: SUMMARY_SWITCH_LABEL, currentValue: switchValue, values: invalid ? ["Invalid"] : ["Off", "On"], description },
       { id: "model", label: SUMMARY_MODEL_LABEL, currentValue: invalid ? "Invalid" : fallbackModelLabel(current) ?? "Not configured", values: ["Choose"], description: invalid ? "Choose a model to replace the invalid fallback settings." : `Choose the model and thinking level used when "${SUMMARY_SWITCH_LABEL}" is On. Choosing a model does not enable the switch or change the chat model. ${TEXT_SUMMARY_DESCRIPTION}` },
     ], 3, getSettingsListTheme(), (id) => done(id === "toggle" ? "toggle" : id === "remote" ? "remote" : "model"), () => done(undefined));
