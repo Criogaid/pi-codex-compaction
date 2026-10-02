@@ -1,5 +1,5 @@
 node_modules/
-.bun/
+.serena/
 dist/
 .agent-tools/
 .env

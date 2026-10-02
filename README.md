@@ -90,7 +90,7 @@ Remote Compaction V2 成功时，继续使用当前模型的 opaque 检查点。
 
 另一个 Provider 无法解读已有 Codex opaque 检查点中的加密历史，这些历史也不会自动还原成文本。指定模型的降级压缩使用 Pi 原生准备中可用的摘要和消息范围，Codex 检查点格式保持不变。
 
-配置格式、读取与菜单保存由 [fallback-settings.ts](extensions/fallback-settings.ts) 负责，命令交互由 [fallback-command.ts](extensions/fallback-command.ts) 负责。[fallback.ts](extensions/fallback.ts) 处理模型选择和原生摘要请求，[codex-compaction.ts](extensions/codex-compaction.ts) 处理生命周期、V2 开关及降级决定。
+配置格式、读取与菜单保存由 [fallback-settings.ts](src/fallback-settings.ts) 负责，命令交互由 [fallback-command.ts](src/fallback-command.ts) 负责。[fallback.ts](src/fallback.ts) 处理模型选择和原生摘要请求，[index.ts](src/index.ts) 处理生命周期、V2 开关及降级决定。
 
 ### 运行参数
 
@@ -126,7 +126,7 @@ Remote Compaction V2 不接受 `/compact` 自定义指令，提供时会显示�
 
 ### 历史保留
 
-[retention-input.ts](extensions/retention-input.ts) 按 [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs) 的默认规则筛选普通 Responses 消息，排除环境、技能、内部上下文和旧版提示片段，并识别可见 hook 提示。[history-groups.ts](extensions/history-groups.ts) 将图片缩放通知与来源消息分为同一组。
+[retention-input.ts](src/retention-input.ts) 按 [Codex rust-v0.159.2](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/core/src/compact_remote_v2.rs) 的默认规则筛选普通 Responses 消息，排除环境、技能、内部上下文和旧版提示片段，并识别可见 hook 提示。[history-groups.ts](src/history-groups.ts) 将图片缩放通知与来源消息分为同一组。
 
 Hook XML 由固定版本的 `saxes` 解析，边界用例与官方 `quick-xml` 的实际运行结果对照。`saxes` 比 `quick-xml` 严格：带 XML 声明或 DOCTYPE、属性带命名空间前缀、属性值含未转义的 `<`、文本含 `]]>`、元素名非法或含控制字符的 hook 文本，都按普通用户文本处理。这些文本与其他内容同属一条消息时，才会影响保留结果。
 
@@ -134,11 +134,11 @@ Pi 会把 `!cmd` 执行结果、扩展消息和展开后的技能作为 user 消
 
 `bashExecution` 与隐藏的扩展消息（`display: false`）作为上下文排除；显示的扩展消息按 Codex 可见 hook 提示的规则保留。技能块只保留用户在技能之后输入的文字。来源序列与 Provider 实际发送的 user 条目数量不一致时，退回纯文本分类。
 
-[retention.ts](extensions/retention.ts) 从最新消息开始，按 `RETAINED_MESSAGE_TOKEN_BUDGET` 保留消息组。[text-budget.ts](extensions/text-budget.ts) 用 UTF-8 字节估算 token，截断时保留文本首尾。[image-budget.ts](extensions/image-budget.ts) 使用官方默认启用的图片预算，通过 Pi 解码器读取原始尺寸。
+[retention.ts](src/retention.ts) 从最新消息开始，按 `RETAINED_MESSAGE_TOKEN_BUDGET` 保留消息组。[text-budget.ts](src/text-budget.ts) 用 UTF-8 字节估算 token，截断时保留文本首尾。[image-budget.ts](src/image-budget.ts) 使用官方默认启用的图片预算，通过 Pi 解码器读取原始尺寸。
 
 边界图片和标签整体保留。图片放不下时，不回填更旧的消息。
 
-发送压缩请求前，[context-window.ts](extensions/context-window.ts) 按官方 `trim_function_call_history_to_fit_context_window` 规则估算整份历史。超过模型 `contextWindow` 的 95% 时，从末尾开始将连续工具输出替换为固定截断提示，遇到非工具输出即停止。因此，上下文溢出恢复也能在请求前缩减历史。
+发送压缩请求前，[context-window.ts](src/context-window.ts) 按官方 `trim_function_call_history_to_fit_context_window` 规则估算整份历史。超过模型 `contextWindow` 的 95% 时，从末尾开始将连续工具输出替换为固定截断提示，遇到非工具输出即停止。因此，上下文溢出恢复也能在请求前缩减历史。
 
 opaque 项追加在保留消息之后，不占上述预算。旧 `compaction_summary` 项在接收或加载时规范化为 `compaction`。
 
@@ -197,9 +197,9 @@ Codex 还会根据服务端下发的 `comp_hash` 判断模型间的压缩兼容�
 
 检查点身份绑定认证后解析出的 endpoint。认证地址改变时，扩展会在发送 opaque 历史前拒绝重放。
 
-扩展不对响应事件、opaque 项或保留历史施加额外的序列化字节上限，历史选择使用官方 token 预算。Pi 负责传输，扩展传递取消信号，并使用 [remote.ts](extensions/remote.ts) 的请求超时和重试设置。事件收集器只保存当前压缩项，不积累完整事件流。
+扩展不对响应事件、opaque 项或保留历史施加额外的序列化字节上限，历史选择使用官方 token 预算。Pi 负责传输，扩展传递取消信号，并使用 [remote.ts](src/remote.ts) 的请求超时和重试设置。事件收集器只保存当前压缩项，不积累完整事件流。
 
-[checkpoint.ts](extensions/checkpoint.ts) 通过 Pi 的 `buildSessionProjection()` 生成保留消息指纹。投影应用消息编辑和隐藏规则，忽略旧压缩记录，并按 `context` 事件约定排除 system 消息。
+[checkpoint.ts](src/checkpoint.ts) 通过 Pi 的 `buildSessionProjection()` 生成保留消息指纹。投影应用消息编辑和隐藏规则，忽略旧压缩记录，并按 `context` 事件约定排除 system 消息。
 
 其他扩展或编辑改变保留消息、导致指纹不匹配时，检查点停止重放，扩展会在当前会话中提示一次。
 
@@ -217,25 +217,36 @@ Codex 还会根据服务端下发的 `comp_hash` 判断模型间的压缩兼容�
 
 ## 开发与验证
 
+仓库按源码和测试分开维护：
+
+```text
+src/               扩展入口和运行时模块
+tests/             单元、集成与打包测试
+.github/workflows/  CI 配置
+package.json       依赖、验证命令与 Pi 入口
+package-lock.json  锁定开发和测试依赖
+tsconfig.json      TypeScript 编译配置
+```
+
+Pi 从 `package.json` 中的 `pi.extensions` 加载 `src/index.ts`。npm 包包含 `src/`、README、CHANGELOG 和许可证，测试及编译产物不进入发布包。
+
+直接引用旧 `extensions/index.ts` 入口的本地命令或资源过滤配置，需要改为 `src/index.ts`。通过包目录、Git 或 npm 安装时，Pi 自动使用 manifest 中的入口。
+
 需要 Node 24 或更新版本。在仓库根目录安装依赖并运行检查：
 
 ```bash
-bun install --frozen-lockfile
+npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm run pack:check
 ```
 
-测试脚本先将 TypeScript 编译到 Git 忽略的 `dist/` 目录，再用 Node 测试运行器执行。打包检查通过 npm dry run 确认入口和全部运行时模块已包含，测试及迁移记录未进入发布包。
+测试脚本将源码和测试编译到 Git 忽略的 `dist/`，再用 Node 测试运行器执行。`npm run pack:check` 单独运行 [package.test.ts](tests/package.test.ts)：通过 npm dry run 校验发布文件清单，并用 Pi 的真实加载器验证入口、命令和生命周期钩子。
 
 CI 在 Ubuntu 24.04 和 Windows 上运行相同命令，配置见 [ci.yml](.github/workflows/ci.yml)。
 
-版本变更使用 Changesets。用 `npm run changeset` 添加记录，用 `npm run version-packages` 应用版本变更。提取迁移没有发布 npm 包，仓库不自动发布。
+待发布变更记录在 [CHANGELOG.md](CHANGELOG.md) 的“未发布”部分。发布时更新版本和变更记录，使用 npm 的版本与发布命令；仓库不自动发布。
 
-## 来源与提交历史
+## 来源
 
-本仓库以独立包 `pi-codex-compaction` 维护，来自 `Criogaid/pi-extensions-anthony` 的 `fix/compaction-runtime-parameters` 分支。原 `@oipsanthony/pi-codex-compaction` npm 包对应上游实现。
-
-仓库只提取源分支中本插件的源码、测试、文档、许可证、专属 Changeset 和 remote-compaction 设计记录，并将包目录移到仓库根目录。原始作者、提交者、时间、提交正文和署名行保持不变，提交标题的 scope 改为对应功能模块。重建提交改变了 Git 对象，原加密签名不再保留。
-
-[migration/history.json](migration/history.json) 记录源分支、源提交和重建提交的对应关系。现有 Changelog 的版本和旧提交引用作为上游发布记录保留，`openspec/changes/archive/` 保留原设计阶段的包名和路径。运行行为以本 README 和当前测试为准；迁移没有修改扩展运行时代码。
+本仓库以独立包 `pi-codex-compaction` 维护，来自 `Criogaid/pi-extensions-anthony` 的 `fix/compaction-runtime-parameters` 分支。原 `@oipsanthony/pi-codex-compaction` npm 包对应上游实现。提交历史保留在 Git 中，许可证和署名见 [LICENSE](LICENSE)。
