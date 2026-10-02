@@ -1,23 +1,18 @@
 // Own model eligibility and endpoint identity; authentication supplies the effective base URL.
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { hasApi } from "@earendil-works/pi-ai";
 import { isObject } from "./protocol.js";
 
 export const CODEX_API = "openai-codex-responses" as const;
-export const OPENAI_RESPONSES_API = "openai-responses" as const;
-export type RemoteCompactionApi = typeof CODEX_API | typeof OPENAI_RESPONSES_API;
-const OFFICIAL_PROVIDER = "openai-codex";
-const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api";
 
 export interface ProviderIdentity {
   readonly provider: string;
-  readonly api: RemoteCompactionApi;
+  readonly api: Api;
   readonly modelId: string;
   readonly baseUrl: string;
   readonly endpoint: string;
 }
 export interface CapableModel {
-  readonly model: Model<RemoteCompactionApi>;
+  readonly model: Model<Api>;
   readonly identity: ProviderIdentity;
 }
 
@@ -30,18 +25,15 @@ export function normalizeUrl(value: string): string {
   url.pathname = url.pathname.replace(/\/+$/, "") || "/";
   return url.toString().replace(/\/$/, "");
 }
-/** Mirror Pi 0.99's resolveCodexUrl and the OpenAI SDK's `/responses` route for a normalized base URL. */
-export function deriveEndpoint(baseUrl: string, api: RemoteCompactionApi): string {
-  if (api === OPENAI_RESPONSES_API) return `${baseUrl}/responses`;
+/** Use Pi's Codex route for that adapter and the Responses route for other APIs. */
+export function deriveEndpoint(baseUrl: string, api: Api): string {
+  if (api !== CODEX_API) return `${baseUrl}/responses`;
   if (baseUrl.endsWith("/codex/responses")) return baseUrl;
   if (baseUrl.endsWith("/codex")) return `${baseUrl}/responses`;
   return `${baseUrl}/codex/responses`;
 }
 
-function configuredEndpoint(model: Model<RemoteCompactionApi>, baseUrl: string): string | undefined {
-  // Pi preserves extension metadata but its built-in compatibility type does not declare it.
-  const compat: unknown = model.compat;
-  const value = isObject(compat) ? compat.remoteCompaction : undefined;
+function configuredEndpoint(value: unknown, model: Model<Api>, baseUrl: string): string | undefined {
   if (!isObject(value) || value.protocol !== "v2" ||
       (value.endpoint !== undefined && typeof value.endpoint !== "string")) return undefined;
   try {
@@ -54,7 +46,11 @@ function configuredEndpoint(model: Model<RemoteCompactionApi>, baseUrl: string):
 }
 
 export function capableModel(model: Model<Api> | undefined, effectiveBaseUrl?: string): CapableModel | undefined {
-  if (!model || (!hasApi(model, CODEX_API) && !hasApi(model, OPENAI_RESPONSES_API))) return undefined;
+  if (!model) return undefined;
+  // Pi preserves extension metadata but its built-in compatibility type does not declare it.
+  const compat: unknown = model.compat;
+  const configured = isObject(compat) ? compat.remoteCompaction : undefined;
+  if (configured === undefined && !model.id.toLowerCase().includes("gpt")) return undefined;
   let configuredBaseUrl: string;
   let baseUrl: string;
   try {
@@ -63,8 +59,8 @@ export function capableModel(model: Model<Api> | undefined, effectiveBaseUrl?: s
   } catch {
     return undefined;
   }
-  const endpoint = model.provider === OFFICIAL_PROVIDER && hasApi(model, CODEX_API) && configuredBaseUrl === OFFICIAL_BASE_URL
-    ? deriveEndpoint(baseUrl, CODEX_API) : configuredEndpoint(model, baseUrl);
+  const endpoint = configured === undefined
+    ? deriveEndpoint(baseUrl, model.api) : configuredEndpoint(configured, model, baseUrl);
   return endpoint ? {
     model,
     identity: { provider: model.provider, api: model.api, modelId: model.id, baseUrl, endpoint },

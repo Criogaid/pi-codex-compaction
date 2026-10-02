@@ -52,6 +52,7 @@ test("persists and validates the complete provider endpoint identity", () => {
   for (const patch of [
     { provider: "other" },
     { modelId: "other" },
+    { api: "anthropic-messages" },
     {
       baseUrl: "https://other.example/v1",
       endpoint: "https://other.example/v1/responses",
@@ -67,7 +68,6 @@ test("persists and validates the complete provider endpoint identity", () => {
     parseCheckpointDetails({ ...details, endpoint: "https://other.example/v1/responses" }),
     undefined,
   );
-  assert.equal(parseCheckpointDetails({ ...details, api: "anthropic-messages" }), undefined);
   assert.equal(parseCheckpointDetails({ ...details, version: 2 }), undefined);
   assert.doesNotMatch(JSON.stringify(details), /authorization|apiKey|token/i);
 });
@@ -108,6 +108,15 @@ test("selects checkpoints from the active fork only", () => {
   assert.equal(latestCheckpoint(branch.slice(0, 1))?.details.checkpointId, "checkpoint-first");
   const native = { ...entry("native", second, "second"), details: undefined, summary: "native" };
   assert.equal(latestCheckpoint([...branch, native]), undefined);
+});
+
+test("round-trips custom API identities and rejects missing API identifiers", () => {
+  const details = createCheckpointDetails({ identity: { ...identity, api: "custom-api" },
+    replacementHistory: [opaque], keptMessages: [] });
+  assert.deepEqual(parseCheckpointDetails(JSON.parse(JSON.stringify(details))), details);
+  for (const api of [undefined, null, "", 42]) {
+    assert.equal(parseCheckpointDetails({ ...details, api }), undefined);
+  }
 });
 
 test("normalizes the legacy compaction alias when loading a saved checkpoint", () => {

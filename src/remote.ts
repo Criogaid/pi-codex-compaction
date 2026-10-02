@@ -1,8 +1,8 @@
 // Own V2 request adaptation; Pi's model registry owns authentication and provider dispatch.
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Context, Model, ProviderHeaders, ThinkingBudgets, Usage } from "@earendil-works/pi-ai";
+import type { Api, Context, Model, ProviderHeaders, ThinkingBudgets, Usage } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, type ProviderIdentity, type RemoteCompactionApi } from "./capability.js";
+import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, type ProviderIdentity } from "./capability.js";
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
@@ -16,7 +16,7 @@ const MISSING_PAYLOAD_MESSAGE = "Provider did not expose a request payload";
 
 export interface RemoteCompactionRequest {
   modelRegistry: Pick<ModelRegistry, "streamSimple">;
-  model: Model<RemoteCompactionApi>;
+  model: Model<Api>;
   context: Context;
   reasoning: ThinkingLevel;
   sessionId: string;

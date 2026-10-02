@@ -89,7 +89,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 test("V2 uses a fresh HTTP request with its feature header after an ordinary WebSocket request", async () => {
   const provider = openaiCodexProvider();
   const model: Model<"openai-codex-responses"> = {
-    id: "fixture", name: "Fixture", api: "openai-codex-responses", provider: provider.id,
+    id: "gpt-fixture", name: "Fixture", api: "openai-codex-responses", provider: provider.id,
     baseUrl: "https://chatgpt.com/backend-api", reasoning: true, input: ["text"],
     contextWindow: 100_000, maxTokens: 10_000,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

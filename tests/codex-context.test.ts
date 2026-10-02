@@ -48,7 +48,7 @@ if (!process.execArgv.includes(mockFlag)) {
       id: "gpt-6.1-sol", name: "GPT-6.1 Sol", provider: "custom-codex", api: "openai-responses",
       baseUrl: "https://codex-gateway.example/v1", reasoning: true, input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 10_000,
-      compat: { supportsLongCacheRetention: true, ...{ remoteCompaction: { protocol: "v2" } } },
+      compat: { supportsLongCacheRetention: true },
     };
     type HookEvent = ContextEvent | ContextWithSystemEvent | BeforeProviderRequestEvent;
     type Hook = (event: HookEvent, ctx: ExtensionContext) => unknown;
@@ -104,8 +104,8 @@ if (!process.execArgv.includes(mockFlag)) {
     });
 
     for (const { name, model } of [
-      { name: "Responses model without V2 metadata", model: { ...supported, compat: undefined } },
-      { name: "non-Responses model even with V2 metadata", model: { ...supported, api: "anthropic-messages" } },
+      { name: "non-GPT model without V2 metadata", model: { ...supported, id: "other-model", compat: undefined } },
+      { name: "GPT model with invalid V2 metadata", model: { ...supported, compat: { ...supported.compat, ...{ remoteCompaction: false } } } },
       { name: "missing model", model: undefined },
     ] satisfies readonly { readonly name: string; readonly model: Model<Api> | undefined }[]) {
       await t.test(`${name} skips fingerprints and cannot create a context snapshot`, async () => {
@@ -128,7 +128,7 @@ if (!process.execArgv.includes(mockFlag)) {
       await current.run(current.event);
       assert.ok(fingerprint.mock.callCount() > 0);
       fingerprint.mock.resetCalls();
-      current.ctx.model = { ...supported, compat: undefined };
+      current.ctx.model = { ...supported, id: "other-model", compat: undefined };
       await current.run(structuredClone(current.event));
       assert.equal(fingerprint.mock.callCount(), 0);
       current.ctx.model = supported;

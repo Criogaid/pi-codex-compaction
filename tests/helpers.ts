@@ -10,7 +10,6 @@ import { InMemoryCredentialStore, InMemoryModelsStore, type AuthResult, type Pro
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import type { RemoteCompactionApi } from "../src/capability.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 
 export async function testRegistry(provider: Provider, resolve: () => Promise<AuthResult | undefined> = async () => ({ auth: { apiKey: "fixture-key" } })): Promise<ModelRegistry> {
@@ -43,7 +42,7 @@ export interface SessionRequest {
 
 /** Exercise real Pi sessions and provider serialization; replace only network I/O with bounded SSE fixtures. */
 export async function sessionFixture(options: {
-  readonly api?: RemoteCompactionApi;
+  readonly api?: "openai-responses" | "openai-codex-responses";
   readonly extensions: readonly ExtensionFactory[];
 }) {
   const directory = await mkdtemp(join(tmpdir(), "pi-compaction-session-"));

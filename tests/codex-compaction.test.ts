@@ -102,7 +102,7 @@ function fakeProvider(observe?: (options: SimpleStreamOptions | undefined) => vo
     baseUrl: capability.baseUrl,
     auth: {} as Provider["auth"],
     getModels: () => [model],
-    streamSimple(_model, context, options) {
+    streamSimple(currentModel, context, options) {
       observe?.(options);
       const stream = createAssistantMessageEventStream();
       void (async () => {
@@ -113,21 +113,21 @@ function fakeProvider(observe?: (options: SimpleStreamOptions | undefined) => vo
             return { role: "user", content: [{ type: "input_text", text }] };
           });
           for (let attempt = 0; attempt < payloadPreparations; attempt++) {
-            await options?.onPayload?.({ model: model.id, input }, model);
+            await options?.onPayload?.({ model: currentModel.id, input }, currentModel);
           }
           const response = await options?.fetch?.(capability.endpoint, {
             method: "POST",
             headers: options.headers as HeadersInit,
           });
           for (const line of (await response?.text() ?? "").split("\n")) {
-            if (line.startsWith("data: ")) await options?.onProviderStreamEvent?.(JSON.parse(line.slice(6)), _model);
+            if (line.startsWith("data: ")) await options?.onProviderStreamEvent?.(JSON.parse(line.slice(6)), currentModel);
           }
           const message = {
             role: "assistant" as const,
             content: [],
-            api: model.api,
-            provider: model.provider,
-            model: model.id,
+            api: currentModel.api,
+            provider: currentModel.provider,
+            model: currentModel.id,
             usage,
             stopReason: "stop" as const,
             timestamp: Date.now(),
@@ -138,9 +138,9 @@ function fakeProvider(observe?: (options: SimpleStreamOptions | undefined) => vo
           const message = {
             role: "assistant" as const,
             content: [],
-            api: model.api,
-            provider: model.provider,
-            model: model.id,
+            api: currentModel.api,
+            provider: currentModel.provider,
+            model: currentModel.id,
             usage,
             stopReason: "error" as const,
             errorMessage: error instanceof Error ? error.message : String(error),
@@ -338,6 +338,23 @@ test("does not notify when a session starts", async () => {
   const start = mock.events.get("session_start")?.[0];
   await start?.({ type: "session_start", reason: "startup" }, current.ctx);
   assert.deepEqual(current.notifications, []);
+});
+
+test("compacts GPT models without metadata through the registered provider regardless of API name", async () => {
+  for (const api of ["openai-responses", "custom-api"]) {
+    const mock = mockPi();
+    createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+    const compact = mock.events.get("session_before_compact")?.[0];
+    const current = await context({ model: { ...model, api, compat: undefined } });
+    const result = await compact?.(compactEvent(), current.ctx) as {
+      compaction: { details: unknown; usage: unknown };
+    };
+    const details = parseCheckpointDetails(result.compaction.details);
+    assert.ok(details);
+    assert.equal(details.api, api);
+    assert.equal(details.modelId, model.id);
+    assert.deepEqual(result.compaction.usage, usage);
+  }
 });
 
 test("creates and resumes a checkpoint for a configured custom provider", async () => {
@@ -542,16 +559,16 @@ for (const interruption of ["abort", "session-switch"] as const) {
   });
 }
 
-test("unsupported and unconfigured models use Pi compaction silently", async () => {
+test("non-GPT models without metadata and models with invalid metadata use Pi compaction silently", async () => {
   const mock = mockPi();
   createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
 
-  const unsupported = await context({ model: { ...model, api: "openai-completions" } });
+  const unsupported = await context({ model: { ...model, compat: { ...{ remoteCompaction: false } } } });
   assert.equal(await compact?.(compactEvent(), unsupported.ctx), undefined);
   assert.deepEqual(unsupported.notifications, []);
 
-  const unconfigured = await context({ model: { ...model, compat: undefined } });
+  const unconfigured = await context({ model: { ...model, id: "other-model", compat: undefined } });
   assert.equal(await compact?.(compactEvent(), unconfigured.ctx), undefined);
   assert.deepEqual(unconfigured.notifications, []);
 });

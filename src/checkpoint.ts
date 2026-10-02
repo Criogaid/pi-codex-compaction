@@ -12,8 +12,6 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { isObject, type JsonObject, REMOTE_COMPACTION_PROTOCOL, validateCompactionItem } from "./protocol.js";
 import {
-  CODEX_API,
-  OPENAI_RESPONSES_API,
   normalizeUrl,
   type ProviderIdentity,
 } from "./capability.js";
@@ -102,7 +100,8 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
     value.checkpointId.length < 8 ||
     typeof value.provider !== "string" ||
     !value.provider ||
-    (value.api !== CODEX_API && value.api !== OPENAI_RESPONSES_API) ||
+    typeof value.api !== "string" ||
+    !value.api ||
     typeof value.modelId !== "string" ||
     !value.modelId ||
     typeof value.baseUrl !== "string" ||

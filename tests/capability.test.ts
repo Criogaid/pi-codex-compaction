@@ -26,6 +26,32 @@ const configuredCompat = {
   },
 };
 
+test("defaults to a case-insensitive GPT substring in the model ID regardless of provider or API", () => {
+  for (const api of ["openai-responses", "openai-codex-responses", "openai-completions", "custom-api"]) {
+    for (const id of ["gpt-example", "gateway/GPT-example", "example-gPt-alias"]) {
+      const current = model({ id, name: "Custom display name", api, compat: { supportsToolSearch: true } });
+      assert.equal(capableModel(current)?.model, current);
+    }
+  }
+  assert.equal(capableModel(undefined), undefined);
+  assert.equal(capableModel(model({ id: "other-model", name: "GPT display name" })), undefined);
+  assert.equal(capableModel(model({ id: "other-model", provider: "openai-codex",
+    baseUrl: "https://chatgpt.com/backend-api" })), undefined);
+});
+
+test("explicit metadata takes precedence over the model ID and official provider defaults", () => {
+  assert.ok(capableModel(model({ id: "other-model", api: "custom-api", compat: configuredCompat })));
+  for (const remoteCompaction of [false, null, {}, { protocol: "v3" }]) {
+    assert.equal(capableModel(model({ provider: "openai-codex", baseUrl: "https://chatgpt.com/backend-api",
+      compat: { remoteCompaction } })), undefined);
+  }
+  const supported = capableModel(model({ provider: "openai-codex",
+    baseUrl: "https://chatgpt.com/backend-api", compat: { remoteCompaction: {
+      protocol: "v2", endpoint: "https://chatgpt.com/backend-api/custom-responses",
+    } } }));
+  assert.equal(supported?.identity.endpoint, "https://chatgpt.com/backend-api/custom-responses");
+});
+
 test("enables the official OpenAI Codex endpoint without model metadata", () => {
   const supported = capableModel(
     model({
@@ -115,8 +141,7 @@ test("accepts capabilities inherited from providers or applied by modelOverrides
   assert.ok(capableModel(overridden));
 });
 
-test("rejects missing, malformed, cross-origin, and unsupported capabilities", () => {
-  assert.equal(capableModel(model()), undefined);
+test("rejects malformed, cross-origin, and unsupported capability metadata without name fallback", () => {
   assert.equal(capableModel(model({ compat: { remoteCompaction: true } })), undefined);
   assert.equal(
     capableModel(
@@ -150,7 +175,6 @@ test("rejects missing, malformed, cross-origin, and unsupported capabilities", (
     ),
     undefined,
   );
-  assert.equal(capableModel(model({ api: "openai-completions", compat: configuredCompat })), undefined);
 });
 
 test("normalizes safe URLs and rejects ambiguous endpoint identities", () => {

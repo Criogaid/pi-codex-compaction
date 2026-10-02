@@ -141,9 +141,9 @@ Pi 原生压缩（文字摘要） <----------------------------+
 
 ## 自定义网关
 
-默认只有 Pi 自带的 `openai-codex` 服务商（官方地址）会尝试 V2。其他网关须本身支持 Codex Remote Compaction V2，仅兼容普通 Responses API 不够；模型的 API 类型须为 `openai-responses` 或 `openai-codex-responses`。
+模型是否尝试 V2 由 `compat.remoteCompaction` 决定：有配置时按配置判断；没有配置时，模型 ID 包含 `gpt`（不区分大小写）即尝试 V2。服务商名称、API 类型和是否使用官方地址不参与启用判断。显示名称不参与匹配。
 
-在 Pi 的 `models.json` 中为模型添加 `compat.remoteCompaction`：
+显式配置须指定 `protocol: "v2"`，可同时指定 `endpoint`。配置无效时不尝试 V2，也不会退回名称匹配。非 GPT 模型或需要覆盖端点时，可以在 Pi 的 `models.json` 中添加：
 
 ```json
 {
@@ -154,7 +154,7 @@ Pi 原生压缩（文字摘要） <----------------------------+
       "apiKey": "$CUSTOM_CODEX_API_KEY",
       "models": [
         {
-          "id": "gpt-example",
+          "id": "custom-model",
           "compat": {
             "remoteCompaction": {
               "protocol": "v2"
@@ -170,6 +170,8 @@ Pi 原生压缩（文字摘要） <----------------------------+
 替换地址和模型 ID，并设置 `CUSTOM_CODEX_API_KEY` 环境变量。这个例子请求 `https://gateway.example.com/v1/responses`。
 
 网关的压缩请求使用其他路径时，可以在 `remoteCompaction` 内增加 `endpoint`。它的协议、主机和端口须与 Pi 认证后实际使用的 `baseUrl` 一致，且不能包含用户名、密码、查询参数（`?`）或片段（`#`）。
+
+V2 总开关仍决定是否发送新的远程压缩请求。模型名匹配只决定是否尝试；Pi 的适配器和网关仍须实际支持 V2，请求失败时按现有规则退回 Pi 原生压缩。默认端点按 API 推导：`openai-codex-responses` 使用 Codex 路径，其他 API 使用 `/responses`。检查点继续绑定实际 provider、API 和端点，防止跨后端重放。
 
 ## 注意事项
 
