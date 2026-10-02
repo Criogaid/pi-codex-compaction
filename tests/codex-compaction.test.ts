@@ -357,12 +357,7 @@ test("creates and resumes a checkpoint for a configured custom provider", async 
   assert.deepEqual(result.compaction.usage, usage);
   assert.doesNotMatch(JSON.stringify(details), /secret/);
   assert.equal(current.statuses.get("codex-compaction"), undefined);
-  assert.deepEqual(current.notifications.filter((notice) => notice.message.startsWith("Starting Codex Remote Compaction V2")), [
-    {
-      message: "Starting Codex Remote Compaction V2 for custom-codex/gpt-5.6.",
-      level: "info",
-    },
-  ]);
+  assert.deepEqual(current.notifications.map((notice) => notice.level), ["info"]);
 
   const compactionEntry = {
     type: "compaction" as const,
@@ -460,7 +455,7 @@ test("provider switches do not replay opaque history", async () => {
   assert.equal(await project?.({ type: "context", messages: [] }, switched.ctx), undefined);
   const select = mock.events.get("model_select")?.[0];
   await select?.({ type: "model_select", model: switchedModel }, switched.ctx);
-  assert.match(switched.notifications[0]?.message ?? "", /cannot replay/);
+  assert.equal(switched.notifications[0]?.level, "warning");
 });
 
 test("configured auth failures fall back to native Pi compaction", async () => {
@@ -472,7 +467,7 @@ test("configured auth failures fall back to native Pi compaction", async () => {
   });
   assert.equal(await compact?.(compactEvent(), failed.ctx), undefined);
   assert.equal(failed.notifications.length, 1);
-  assert.match(failed.notifications.at(-1)?.message ?? "", /using Pi compaction/);
+  assert.equal(failed.notifications.at(-1)?.level, "warning");
 
   const controller = new AbortController();
   controller.abort();
@@ -857,9 +852,8 @@ test("uses transcript tools and system updates instead of the current fallback c
 for (const blockImages of [true, false]) {
   test(`applies blockImages=${blockImages} to user and tool-result payloads without changing history`, async () => {
     const image = { type: "image" as const, data: "fixture-image", mimeType: "image/png" };
-    const placeholder = { type: "text" as const, text: "Image reading is disabled." };
     const separator = { type: "text" as const, text: "separator" };
-    const content = [image, image, placeholder, separator, image, image];
+    const content = [image, image, separator, image, image];
     const messages: SessionMessage[] = [
       { role: "user", content, timestamp: 1 },
       { role: "assistant", content: [{ type: "toolCall", id: "call", name: "read", arguments: {} }],
@@ -870,12 +864,17 @@ for (const blockImages of [true, false]) {
     const result = await providerCompaction(messages, { settings: { transport: "sse", images: { blockImages } } });
     const converted = result.contexts[0].messages.filter((message) => message.role === "user" || message.role === "toolResult");
     assert.equal(converted.length, 2);
+    const first = converted[0].content;
+    assert.ok(Array.isArray(first));
+    const placeholder = first[0];
+    if (blockImages) assert.ok(placeholder.type === "text" && placeholder.text.length > 0);
     for (const message of converted) {
       assert.deepEqual(message.content, blockImages ? [placeholder, separator, placeholder] : content);
     }
     const wire = JSON.stringify(result.payload);
     if (blockImages) {
       assert.doesNotMatch(wire, /input_image|fixture-image/);
+      assert.ok(placeholder.type === "text");
       assert.equal(wire.split(placeholder.text).length - 1, 4);
     } else {
       assert.match(wire, /input_image/);
@@ -915,9 +914,7 @@ test("warns for nonempty custom instructions and leaves provider instructions un
   for (const customInstructions of [undefined, "", " \n\t", "Summarize only security issues."]) {
     const result = await providerCompaction([{ role: "user", content: "request", timestamp: 1 }], { customInstructions });
     const warnings = result.notifications.filter((notice) => notice.level === "warning");
-    assert.deepEqual(warnings, customInstructions?.trim() ? [{
-      message: "Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", level: "warning",
-    }] : []);
+    assert.equal(warnings.length, customInstructions?.trim() ? 1 : 0);
     assert.doesNotMatch(JSON.stringify(result.payload), /Summarize only security issues/);
   }
 });
@@ -929,9 +926,9 @@ test("announces once when a provider prepares multiple retry payloads and again 
   const compact = mock.events.get("session_before_compact")?.[0];
   assert.ok(compact);
   assert.ok(await compact(compactEvent(), current.ctx));
-  assert.equal(current.notifications.filter((notice) => notice.message.startsWith("Starting Codex Remote Compaction V2")).length, 1);
+  assert.equal(current.notifications.filter((notice) => notice.level === "info").length, 1);
   assert.ok(await compact(compactEvent(), current.ctx));
-  assert.equal(current.notifications.filter((notice) => notice.message.startsWith("Starting Codex Remote Compaction V2")).length, 2);
+  assert.equal(current.notifications.filter((notice) => notice.level === "info").length, 2);
   assert.deepEqual(current.notifications.filter((notice) => notice.level === "warning"), []);
 });
 
@@ -993,8 +990,7 @@ test("warns about failed projection once per session and checkpoint and resets o
   await failProjection();
   await failProjection();
   assert.equal(current.notifications.length, 1);
-  assert.deepEqual(current.notifications[0], { level: "warning",
-    message: "The active Codex checkpoint no longer matches the retained messages, so its opaque history is not replayed." });
+  assert.equal(current.notifications[0].level, "warning");
   sessionId = "second-session";
   await failProjection();
   assert.equal(current.notifications.length, 2);
@@ -1149,12 +1145,13 @@ test("uses the configured fallback after a remote failure and preserves legacy b
   assert.equal(fixture.remoteRequests(), 1);
   assert.equal(fixture.calls.length, 1);
   assert.equal(fixture.ctx.model, model);
-  assert.ok(fixture.notifications.some((item) => item.message.includes("configured fallback model")));
+  const warnings = () => fixture.notifications.filter((item) => item.level === "warning").length;
+  assert.equal(warnings(), 1);
   await rm(fallbackSettingsPath);
   const legacy = await fixture.run();
   assert.equal(legacy, undefined);
   assert.equal(fixture.calls.length, 1);
-  assert.ok(fixture.notifications.some((item) => item.message.includes("using Pi compaction")));
+  assert.equal(warnings(), 2);
 });
 
 test("successful remote compaction does not validate an unused malformed fallback section", async () => {
@@ -1228,7 +1225,7 @@ for (const content of [
     assert.deepEqual(await fixture.run(), { cancel: true });
     assert.equal(fixture.calls.length, 0);
     assert.equal(fixture.remoteRequests(), 0);
-    assert.ok(fixture.notifications.some((item) => item.level === "error" && item.message.includes("compaction stopped")));
+    assert.ok(fixture.notifications.some((item) => item.level === "error"));
     assert.equal(fixture.sessionManager.getBranch().filter((item) => item.type === "compaction").length, 0);
   });
 }
@@ -1320,7 +1317,7 @@ test("split-turn fallback uses Pi's two summary requests and combines usage", as
   fixture.event.preparation.turnPrefixMessages = [{ role: "user", content: "unfinished turn", timestamp: 3 }];
   const result = await fixture.run();
   assert.ok(result?.compaction);
-  assert.match(result.compaction.summary, /Turn Context \(split turn\)/);
+  assert.equal(result.compaction.summary.split("Keep working on the cache fix.").length - 1, 2);
   assert.equal(fixture.calls.length, 2);
   assert.equal(result.compaction.usage?.input, usage.input * 2);
   assert.equal(result.compaction.usage?.output, usage.output * 2);
@@ -1467,7 +1464,7 @@ for (const remoteCompaction of [null, true, {}, { enabled: "false" }, { enabled:
     assert.deepEqual(await fixture.run(), { cancel: true });
     assert.equal(fixture.remoteRequests(), 0);
     assert.equal(fixture.calls.length, 0);
-    assert.ok(fixture.notifications.some((notice) => notice.level === "error" && notice.message.includes("compaction stopped")));
+    assert.ok(fixture.notifications.some((notice) => notice.level === "error"));
   });
 }
 

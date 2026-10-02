@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendCompactionTrigger, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker } from "../src/protocol.js";
+import { CodexCompactionProtocolError, appendCompactionTrigger, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker } from "../src/protocol.js";
 
 const item = { type: "compaction", encrypted_content: "opaque" };
 const done = { type: "response.output_item.done", item };
@@ -18,16 +18,16 @@ test("rejects identical duplicate output events as Codex does", () => {
   collector.observe(done);
   collector.observe(done);
   collector.observe(completed);
-  assert.throws(() => collector.finish(), /2 compaction output events/);
+  assert.throws(() => collector.finish(), CodexCompactionProtocolError);
 });
 
 test("requires output_item.done and response.completed", () => {
   const missingItem = createCompactionCollector();
   missingItem.observe(completed);
-  assert.throws(() => missingItem.finish(), /0 compaction output events/);
+  assert.throws(() => missingItem.finish(), CodexCompactionProtocolError);
   const incomplete = createCompactionCollector();
   incomplete.observe(done);
-  assert.throws(() => incomplete.finish(), /without response.completed/);
+  assert.throws(() => incomplete.finish(), CodexCompactionProtocolError);
 });
 
 test("accepts the upstream compaction_summary alias and resets on a retried response", () => {
@@ -59,8 +59,8 @@ test("replays one marker and appends one final trigger", () => {
   const prepared = prepareRemoteCompactionPayload(payload, { marker, replacementHistory: replacement });
   assert.deepEqual(prepared.input, [replacement[0], payload.input[1], { type: "compaction_trigger" }]);
   assert.equal(payload.input.length, 2);
-  assert.throws(() => rewriteCheckpointMarker({ input: [] }, marker, replacement), /0 checkpoint markers/);
-  assert.throws(() => appendCompactionTrigger({ input: [{ type: "compaction_trigger" }] }), /already contains/);
+  assert.throws(() => rewriteCheckpointMarker({ input: [] }, marker, replacement), CodexCompactionProtocolError);
+  assert.throws(() => appendCompactionTrigger({ input: [{ type: "compaction_trigger" }] }), CodexCompactionProtocolError);
 });
 
 test("recognizes non-null objects while rejecting arrays and primitives", () => {
@@ -100,14 +100,14 @@ test("adapts history without a checkpoint and validates the resulting trigger se
     return { ...history, instructions: "adapted" };
   }), { ...payload, instructions: "adapted", input: [{ type: "compaction_trigger" }] });
   assert.equal(adaptations, 1);
-  assert.throws(() => prepareRemoteCompactionPayload(payload, undefined, () => ({ input: [{ type: "compaction_trigger" }] })), /already contains/);
-  assert.throws(() => prepareRemoteCompactionPayload(payload, undefined, () => ({ input: "invalid" })), /missing an input array/);
+  assert.throws(() => prepareRemoteCompactionPayload(payload, undefined, () => ({ input: [{ type: "compaction_trigger" }] })), CodexCompactionProtocolError);
+  assert.throws(() => prepareRemoteCompactionPayload(payload, undefined, () => ({ input: "invalid" })), CodexCompactionProtocolError);
 });
 
 test("does not adapt malformed payloads or failed marker substitutions", () => {
   const adapt = () => assert.fail("invalid history must not reach the adapter");
-  assert.throws(() => prepareRemoteCompactionPayload(null, undefined, adapt), /missing an input array/);
-  assert.throws(() => prepareRemoteCompactionPayload({ input: [] }, { marker: "missing", replacementHistory: [] }, adapt), /0 checkpoint markers/);
+  assert.throws(() => prepareRemoteCompactionPayload(null, undefined, adapt), CodexCompactionProtocolError);
+  assert.throws(() => prepareRemoteCompactionPayload({ input: [] }, { marker: "missing", replacementHistory: [] }, adapt), CodexCompactionProtocolError);
   const reason = new Error("adaptation failed");
   assert.throws(() => prepareRemoteCompactionPayload({ input: [] }, undefined, () => { throw reason; }), (error) => error === reason);
 });

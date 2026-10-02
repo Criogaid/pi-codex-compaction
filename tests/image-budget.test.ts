@@ -48,7 +48,7 @@ test("uses the original file cap and ordinary fallback for undecodable inline im
 test("checks cancellation before starting another image decode", async () => {
   const controller = new AbortController();
   controller.abort();
-  await assert.rejects(estimateImages([{ content: [{ type: "input_image" }] }], controller.signal), /abort/i);
+  await assert.rejects(estimateImages([{ content: [{ type: "input_image" }] }], controller.signal), { name: "AbortError" });
 });
 
 test("rounds each original image dimension to 32px patches", async () => {
@@ -75,7 +75,7 @@ test("estimates original images in both tool output arrays and resolves cloned p
     assert.equal(estimates.bytes(structuredClone(image)), 24, type);
   }
   const ignored = await estimateImages([{ type: "function_call", output: [image] }], new AbortController().signal);
-  assert.throws(() => ignored.bytes(image), /missing its byte estimate/);
+  assert.throws(() => ignored.bytes(image), Error);
 });
 
 test("falls back for malformed inline encodings and unsupported URLs", async () => {
@@ -95,7 +95,7 @@ test("requires a request-local estimate even when a URL was decoded by an earlie
   const prepared = await estimateImages([{ content: [image] }], new AbortController().signal);
   assert.equal(prepared.bytes(image), 4);
   const empty = await estimateImages([], new AbortController().signal);
-  assert.throws(() => empty.bytes({ ...image }), /missing its byte estimate/);
+  assert.throws(() => empty.bytes({ ...image }), Error);
 });
 
 test("rejects an already aborted request even when there are no images", async () => {

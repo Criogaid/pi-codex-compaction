@@ -216,7 +216,13 @@ test("a transcript without system messages reads and includes the supplied promp
 for (const blockImages of [true, false]) {
   test(`image blocking ${blockImages} preserves text order and deduplicates only adjacent placeholders`, () => {
     const image = { type: "image" as const, data: "fixture", mimeType: "image/png" };
-    const blocked = { type: "text" as const, text: "Image reading is disabled." };
+    const probe: UserMessage = { role: "user", content: [image], timestamp: 0 };
+    const projected = compactionRequest({}, sessionId, target, [system(), probe], { ...declarationsInTranscript, blockImages: true });
+    const projectedUser = projected.context.messages[1];
+    assert.equal(projectedUser.role, "user");
+    assert.ok(Array.isArray(projectedUser.content));
+    const blocked = projectedUser.content[0];
+    assert.ok(blocked.type === "text" && blocked.text.length > 0);
     const text = { type: "text" as const, text: "between images" };
     const content = [image, image, blocked, text, image, image];
     const head = system();

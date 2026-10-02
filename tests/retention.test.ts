@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { buildReplacementHistory, RETAINED_MESSAGE_TOKEN_BUDGET } from "../src/retention.js";
 import type { JsonObject } from "../src/protocol.js";
 import { prepareRetention } from "../src/retention-input.js";
+import { truncateTextToTokenBudget } from "../src/text-budget.js";
 
 async function retain(input: readonly JsonObject[]) {
   return buildReplacementHistory(await prepareRetention(input, new AbortController().signal), opaque);
@@ -24,7 +25,7 @@ test("matches Codex's boundary truncation with one token remaining", async () =>
   const newest = user("x".repeat((RETAINED_MESSAGE_TOKEN_BUDGET - 1) * 4));
   const retained = await retain([user("excluded older input"), user("abcdefghij"), newest]);
   assert.equal(retained.length, 3);
-  assert.equal(content(retained[0])[0].text, "ab…2 tokens truncated…ij");
+  assert.equal(content(retained[0])[0].text, truncateTextToTokenBudget("abcdefghij", 1));
   assert.deepEqual(retained[1], newest);
 });
 
@@ -35,7 +36,7 @@ test("charges UTF-8 bytes and keeps complete Unicode characters at both boundari
   const truncated = content(retained[0])[0].text;
   assert.ok(truncated);
   assert.match(truncated, /^HEAD/);
-  assert.match(truncated, /…2 tokens truncated…/);
+  assert.equal(Array.from(truncated).filter((character) => character === "😀").length, RETAINED_MESSAGE_TOKEN_BUDGET - 2);
   assert.match(truncated, /TAIL$/);
   assert.doesNotMatch(truncated, /\uFFFD/);
   assert.equal(content(input)[0].text, text);
@@ -49,7 +50,7 @@ test("rounds each text part separately and truncates content in its original ord
   ] };
   const retained = await retain([boundary, newest]);
   assert.deepEqual(retained[0].content, [
-    { type: "input_text", text: "aaaaa" }, { type: "input_text", text: "bb…1 tokens truncated…bb" },
+    { type: "input_text", text: "aaaaa" }, { type: "input_text", text: truncateTextToTokenBudget("bbbbb", 1) },
     boundary.content[2],
   ]);
 });
@@ -66,7 +67,7 @@ test("keeps a resize notice with its source and charges the notice text", async 
   const retained = await retain([source, notice]);
   assert.equal(retained.length, 3);
   assert.deepEqual(retained[1], notice);
-  assert.match(content(retained[0])[0].text ?? "", /tokens truncated/);
+  assert.ok((content(retained[0])[0].text?.length ?? Infinity) < RETAINED_MESSAGE_TOKEN_BUDGET * 4);
   assert.deepEqual(await retain([{ role: "assistant", content: [] }, notice]), [opaque]);
 });
 

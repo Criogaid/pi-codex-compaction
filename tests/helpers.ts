@@ -146,3 +146,11 @@ export function legacyCheckpointSummary(checkpointId: string): string {
     "Full replay requires @oipsanthony/pi-codex-compaction and the original provider endpoint and model. " +
     "Without them, only Pi's retained recent messages remain available.";
 }
+
+export function assertTrimmedOutput(actual: JsonObject, original: JsonObject): JsonObject {
+  assert.equal(typeof actual.output, "string");
+  assert.ok(String(actual.output).length > 0);
+  assert.notDeepEqual(actual.output, original.output);
+  assert.deepEqual({ ...actual, output: original.output }, original);
+  return actual;
+}

@@ -128,5 +128,5 @@ test("falls back to no contextual items when the provider changes user item coun
 });
 
 test("observes cancellation before retaining a source with supplied estimates", async () => {
-  await assert.rejects(prepareRetention([user("request")], AbortSignal.abort(), { images }), /abort/i);
+  await assert.rejects(prepareRetention([user("request")], AbortSignal.abort(), { images }), { name: "AbortError" });
 });

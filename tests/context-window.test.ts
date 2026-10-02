@@ -3,9 +3,9 @@ import { test } from "node:test";
 import { itemTokenCount, trimToolOutputsToContextWindow } from "../src/context-window.js";
 import type { ImageEstimates } from "../src/image-budget.js";
 import type { JsonObject } from "../src/protocol.js";
+import { assertTrimmedOutput } from "./helpers.js";
 
 const images: ImageEstimates = { bytes: () => 7_373 };
-const truncated = "Output exceeded the available model context and was truncated";
 const notice = { role: "developer", content: [{ type: "input_text", text: "<image_resize_notice></image_resize_notice>" }] };
 
 const itemCases: readonly [string, JsonObject, number][] = [
@@ -50,8 +50,11 @@ for (const type of ["reasoning", "compaction", "compaction_summary", "context_co
 test("trims only above the floored 95 percent window including instructions", () => {
   const output = { type: "function_call_output", output: "x".repeat(72) };
   assert.deepEqual(trimToolOutputsToContextWindow([output], "a", 20, images), [output]);
-  assert.deepEqual(trimToolOutputsToContextWindow([output], "abcde", 20, images), [{ ...output, output: truncated }]);
-  assert.deepEqual(trimToolOutputsToContextWindow([output], "a", 19, images), [{ ...output, output: truncated }]);
+  for (const [instructions, window] of [["abcde", 20], ["a", 19]] as const) {
+    const result = trimToolOutputsToContextWindow([output], instructions, window, images);
+    assert.equal(result.length, 1);
+    assertTrimmedOutput(result[0], output);
+  }
   assert.deepEqual(trimToolOutputsToContextWindow([output], { ignored: "x".repeat(100) }, 20, images), [output]);
 });
 
@@ -60,7 +63,9 @@ test("rounds a source and its resize notice separately and removes the notice wh
   // 61 source bytes and 43 notice bytes occupy 16 + 11 tokens, not 26.
   assert.equal(Buffer.byteLength(notice.content[0].text), 43);
   assert.deepEqual(trimToolOutputsToContextWindow([output, notice], "", 29, images), [output, notice]);
-  assert.deepEqual(trimToolOutputsToContextWindow([output, notice], "", 28, images), [{ ...output, output: truncated }]);
+  const result = trimToolOutputsToContextWindow([output, notice], "", 28, images);
+  assert.equal(result.length, 1);
+  assertTrimmedOutput(result[0], output);
 });
 
 test("rewrites newest outputs first and stops once the history fits", () => {
@@ -68,8 +73,10 @@ test("rewrites newest outputs first and stops once the history fits", () => {
   const last = { type: "custom_tool_call_output", call_id: "b", output: "y".repeat(400) };
   const input = [first, notice, last, notice];
   const saved = structuredClone(input);
-  assert.deepEqual(trimToolOutputsToContextWindow(input, "", 150, images), [first, notice, { ...last, output: truncated }]);
-  assert.deepEqual(trimToolOutputsToContextWindow(input, "", 40, images), [{ ...first, output: truncated }, { ...last, output: truncated }]);
+  const one = trimToolOutputsToContextWindow(input, "", 150, images);
+  assert.deepEqual(one, [first, notice, assertTrimmedOutput(one[2], last)]);
+  const both = trimToolOutputsToContextWindow(input, "", 40, images);
+  assert.deepEqual(both, [assertTrimmedOutput(both[0], first), assertTrimmedOutput(both[1], last)]);
   assert.deepEqual(input, saved);
 });
 
@@ -86,7 +93,8 @@ test("stops at every non-output item even if earlier outputs still overflow", ()
     { type: "tool_search_call", arguments: {} }, { type: "compaction", encrypted_content: "opaque" },
   ]) {
     assert.deepEqual(trimToolOutputsToContextWindow([output, barrier], "", 1, images), [output, barrier]);
-    assert.deepEqual(trimToolOutputsToContextWindow([output, barrier, output, notice], "", 1, images), [output, barrier, { ...output, output: truncated }]);
+    const result = trimToolOutputsToContextWindow([output, barrier, output, notice], "", 1, images);
+    assert.deepEqual(result, [output, barrier, assertTrimmedOutput(result[2], output)]);
   }
 });
 

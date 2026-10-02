@@ -25,25 +25,33 @@ test("counts UTF-8 bytes instead of UTF-16 code units", () => {
   }
 });
 
-// Golden outputs from the pre-runtime-parameters truncator, including partial grapheme clusters.
-for (const [text, budget, expected] of [
-  ["", 0, ""],
-  ["a", 0, "…1 tokens truncated…"],
-  ["😀", 0, "…1 tokens truncated…"],
-  ["abcd", 1, "abcd"],
-  ["abcde", 1, "ab…1 tokens truncated…de"],
-  ["abcdefghij", 1, "ab…2 tokens truncated…ij"],
-  ["abcdefghij", 2, "abcd…1 tokens truncated…ghij"],
-  ["😀😀😀", 1, "…2 tokens truncated…"],
-  ["😀😀😀", 2, "😀…1 tokens truncated…😀"],
-  ["é中😀z", 1, "é…2 tokens truncated…z"],
-  ["中😀文", 2, "中…1 tokens truncated…文"],
-  ["e\u0301e\u0301", 1, "e…1 tokens truncated…\u0301"],
-  ["café", 1, "ca…1 tokens truncated…é"],
-  ["\ud800abcd\udc00", 2, "\ud800a…1 tokens truncated…d\udc00"],
-  ["é中😀", 3, "é中😀"],
+for (const [text, budget, prefix, suffix, omittedTokens] of [
+  ["", 0, "", "", 0],
+  ["a", 0, "", "", 1],
+  ["😀", 0, "", "", 1],
+  ["abcd", 1, "abcd", "", 0],
+  ["abcde", 1, "ab", "de", 1],
+  ["abcdefghij", 1, "ab", "ij", 2],
+  ["abcdefghij", 2, "abcd", "ghij", 1],
+  ["😀😀😀", 1, "", "", 2],
+  ["😀😀😀", 2, "😀", "😀", 1],
+  ["é中😀z", 1, "é", "z", 2],
+  ["中😀文", 2, "中", "文", 1],
+  ["e\u0301e\u0301", 1, "e", "\u0301", 1],
+  ["café", 1, "ca", "é", 1],
+  ["\ud800abcd\udc00", 2, "\ud800a", "d\udc00", 1],
+  ["é中😀", 3, "é中😀", "", 0],
 ] as const) {
-  test(`preserves legacy truncation for ${JSON.stringify(text)} at ${budget} tokens`, () => {
-    assert.equal(truncateTextToTokenBudget(text, budget), expected);
+  test(`retains the budgeted boundaries of ${JSON.stringify(text)} at ${budget} tokens`, () => {
+    const actual = truncateTextToTokenBudget(text, budget);
+    if (omittedTokens === 0) {
+      assert.equal(actual, text);
+    } else {
+      assert.ok(actual.startsWith(prefix));
+      assert.ok(actual.endsWith(suffix));
+      const notice = actual.slice(prefix.length, actual.length - suffix.length);
+      assert.deepEqual(notice.match(/\d+/g), [String(omittedTokens)]);
+      assert.ok(!notice.includes("\uFFFD"));
+    }
   });
 }

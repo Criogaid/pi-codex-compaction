@@ -64,7 +64,7 @@ if (!process.execArgv.includes(mockFlag)) {
     assert.equal(fallback.bytes(malformed), 7_373);
     assert.equal(decoded.length, beforeMalformed, "noncanonical trailing bits never reach the decoder");
 
-    await assert.rejects(estimateImages([{ content: [image(250), image(251)] }], controller.signal), /cancelled during decode/);
+    await assert.rejects(estimateImages([{ content: [image(250), image(251)] }], controller.signal), (error) => error === controller.signal.reason);
     assert.equal(decoded.at(-1), 250);
     assert.ok(!decoded.includes(251), "cancellation stops before the next decode");
   });
