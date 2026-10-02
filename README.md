@@ -9,13 +9,13 @@
 需要 Pi 0.99.1 或更新版本：
 
 ```bash
-pi install git:github.com/Criogaid/pi-codex-compaction
+pi install npm:@criogaid/pi-codex-compaction
 ```
 
-npm 发布包名为 `@criogaid/pi-codex-compaction`。首次发布前请使用上面的 Git 地址；发布后可执行：
+也可以从 Git 仓库安装：
 
 ```bash
-pi install npm:@criogaid/pi-codex-compaction
+pi install git:github.com/Criogaid/pi-codex-compaction
 ```
 
 不要安装不带作用域的 `pi-codex-compaction`，它属于另一个仓库。
@@ -159,7 +159,7 @@ npm run pack:check
 
 ## 发布
 
-[Publish](.github/workflows/publish.yml) 在推送 `v*` 标签时运行。标签必须与 `package.json` 的版本一致，例如版本 `0.2.2` 对应标签 `v0.2.2`。流程目前只发布正式版本，不接受带 `-beta`、`-rc` 等后缀的预发布版本。
+[Publish](.github/workflows/publish.yml) 在推送 `v*` 标签时运行。标签必须与 `package.json` 的版本一致，例如版本 `0.3.0` 对应标签 `v0.3.0`。流程目前只发布正式版本，不接受带 `-beta`、`-rc` 等后缀的预发布版本。
 
 首次发布前，在本仓库的 **Settings → Secrets and variables → Actions** 中添加 `NPM_TOKEN`。按 [npm 文档](https://docs.npmjs.com/creating-and-viewing-access-tokens)创建 granular access token，授予 `@criogaid` 作用域的发布权限（Read and write / publish and stage），并启用 Bypass two-factor authentication。包创建后，可以将 token 权限缩小到该包。
 

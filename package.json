@@ -1,6 +1,6 @@
 {
   "name": "@criogaid/pi-codex-compaction",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Provider-aware Codex Remote Compaction V2 for Pi.",
   "type": "module",
   "repository": {
