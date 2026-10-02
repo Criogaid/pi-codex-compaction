@@ -1,10 +1,11 @@
 // Own ordinary-request prompt and context snapshots that let compaction reuse Pi's projected request prefix,
 // and build compaction's provider context the way Pi 0.99 builds an ordinary request.
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, getSystemMessageText, type Context, type Message, type Tool } from "@earendil-works/pi-ai";
-import { convertToLlm } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
 import { type CodexCheckpointDetails, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
+import { isObject, type JsonObject } from "./protocol.js";
 
 const BLOCKED_IMAGE_TEXT = "Image reading is disabled.";
 
@@ -92,14 +93,17 @@ export function captureContextSnapshot(
   };
 }
 
+function matchingSource(messages: readonly AgentMessage[], snapshot: Pick<ContextSnapshot, "sourceFingerprints">): AgentMessage[] | undefined {
+  const source = requestSource(messages);
+  return source.length < snapshot.sourceFingerprints.length || snapshot.sourceFingerprints.some(
+    (fingerprint, index) => fingerprintMessage(source[index]) !== fingerprint,
+  ) ? undefined : source;
+}
+
 /** Reuse the projected request while its source is an unchanged prefix, then append newer messages. */
 export function reuseContextSnapshot(messages: AgentMessage[], snapshot: ContextSnapshot | undefined): AgentMessage[] {
-  if (!snapshot) return messages;
-  const source = requestSource(messages);
-  if (source.length < snapshot.sourceFingerprints.length || snapshot.sourceFingerprints.some(
-    (fingerprint, index) => fingerprintMessage(source[index]) !== fingerprint,
-  )) return messages;
-  return [...structuredClone(snapshot.messages), ...source.slice(snapshot.sourceFingerprints.length)];
+  const source = snapshot && matchingSource(messages, snapshot);
+  return source ? [...structuredClone(snapshot.messages), ...source.slice(snapshot.sourceFingerprints.length)] : messages;
 }
 
 /** Pi 0.99 applies per-run prompt overrides after context hooks by collapsing system messages into one head. */
@@ -110,10 +114,95 @@ export function applyPromptOverride(messages: Message[], override: PromptOverrid
   return [{ ...declarations, content: override.text }, ...withoutSystemMessages(messages)];
 }
 
+/** Public Pi state that can change declarations or request parameters without changing the conversation. */
+export interface ProviderRequestInputs {
+  readonly systemPrompt: string;
+  readonly thinkingLevel: ThinkingLevel;
+  readonly settings: ReturnType<ExtensionAPI["getSettings"]>;
+  readonly activeTools: readonly string[];
+  readonly tools: readonly ToolInfo[];
+}
+
+interface ProviderRequestFields {
+  readonly instructions?: string;
+  readonly tools?: readonly JsonObject[];
+  readonly reasoning?: JsonObject;
+  readonly prompt_cache_key?: string;
+  readonly prompt_cache_retention?: string;
+  readonly service_tier?: string;
+}
+
+export interface ProviderRequestSnapshot extends SnapshotScope {
+  readonly sourceFingerprints: readonly string[];
+  readonly inputsKey: string;
+  readonly fields: ProviderRequestFields;
+  readonly verbosity?: string;
+  readonly prefix: readonly JsonObject[];
+}
+
+function declarationPrefix(input: readonly JsonObject[]): readonly JsonObject[] {
+  const end = input.findIndex((item) => item.type !== "additional_tools" &&
+    !((item.type === undefined || item.type === "message") && (item.role === "system" || item.role === "developer")));
+  return end < 0 ? input : input.slice(0, end);
+}
+
+function requestInputsKey(target: CapableModel, inputs: ProviderRequestInputs): string {
+  return JSON.stringify({ model: target.model, ...inputs });
+}
+
+function captureProviderRequest(
+  context: ContextSnapshot, target: CapableModel, payload: unknown, inputs: ProviderRequestInputs,
+): ProviderRequestSnapshot | undefined {
+  if (!isObject(payload) || payload.model !== target.model.id ||
+    !Array.isArray(payload.input) || !payload.input.every(isObject)) return undefined;
+  const { instructions, tools, reasoning, prompt_cache_key, prompt_cache_retention, service_tier, text } = payload;
+  const verbosity = isObject(text) ? text.verbosity : undefined;
+  if ((instructions !== undefined && typeof instructions !== "string") ||
+    (tools !== undefined && (!Array.isArray(tools) || !tools.every(isObject))) ||
+    (reasoning !== undefined && !isObject(reasoning)) ||
+    (prompt_cache_key !== undefined && typeof prompt_cache_key !== "string") ||
+    (prompt_cache_retention !== undefined && typeof prompt_cache_retention !== "string") ||
+    (service_tier !== undefined && typeof service_tier !== "string") ||
+    (text !== undefined && !isObject(text)) || (verbosity !== undefined && typeof verbosity !== "string")) return undefined;
+  return {
+    sessionId: context.sessionId, identity: context.identity, sourceFingerprints: context.sourceFingerprints,
+    inputsKey: requestInputsKey(target, inputs),
+    fields: structuredClone({ instructions, tools, reasoning, prompt_cache_key, prompt_cache_retention, service_tier }),
+    verbosity, prefix: structuredClone(declarationPrefix(payload.input)),
+  };
+}
+
+/** Reuse wire declarations only with an unchanged source prefix and request configuration. */
+export function providerRequestFor(
+  snapshots: RequestSnapshots, sessionId: string, target: CapableModel, current: readonly AgentMessage[], inputs: ProviderRequestInputs,
+): ProviderRequestSnapshot | undefined {
+  const snapshot = snapshotFor(snapshots.providerRequest, sessionId, target);
+  return snapshot && matchingSource(current, snapshot) &&
+    snapshot.inputsKey === requestInputsKey(target, inputs) ? snapshot : undefined;
+}
+
+/** Replace only declarations and cache-related fields; Pi still owns the current input, transport, and output limits. */
+export function applyProviderRequest(
+  payload: JsonObject, target: CapableModel, snapshot: ProviderRequestSnapshot | undefined,
+): JsonObject {
+  if (!snapshot || !sameBackend(snapshot.identity, target.identity) || !sameModel(snapshot.identity, target.model) ||
+    payload.model !== target.model.id || !Array.isArray(payload.input) || !payload.input.every(isObject)) return payload;
+  const updated: JsonObject = { ...payload, ...structuredClone(snapshot.fields),
+    input: [...structuredClone(snapshot.prefix), ...payload.input.slice(declarationPrefix(payload.input).length)] };
+  if (isObject(payload.text) || snapshot.verbosity !== undefined) {
+    const text = { ...(isObject(payload.text) ? payload.text : {}) };
+    delete text.verbosity;
+    if (snapshot.verbosity !== undefined) text.verbosity = snapshot.verbosity;
+    updated.text = Object.keys(text).length ? text : undefined;
+  }
+  return updated;
+}
+
 /** The snapshots that the latest ordinary request left for compaction. */
 export interface RequestSnapshots {
   readonly promptOverride?: PromptOverride;
   readonly context?: ContextSnapshot;
+  readonly providerRequest?: ProviderRequestSnapshot;
 }
 
 interface TrackedSnapshots {
@@ -121,6 +210,7 @@ interface TrackedSnapshots {
   pendingSource?: { readonly sessionId: string; readonly fingerprints: readonly string[] };
   pendingContext?: ContextSnapshot;
   context?: ContextSnapshot;
+  providerRequest?: ProviderRequestSnapshot;
 }
 
 /**
@@ -172,10 +262,17 @@ export class RequestSnapshotTracker {
     target: CapableModel | undefined,
     canonical: () => AgentMessage[],
     systemPrompt: () => string,
+    observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs },
   ): void {
     this.state.promptOverride = target && capturePromptOverride(canonical(), sessionId, target, systemPrompt());
     // Keep the pending snapshot for retries that prepare a payload without running context hooks again.
     this.state.context = this.state.pendingContext;
+    this.state.providerRequest = undefined;
+    const context = target && snapshotFor(this.state.context, sessionId, target);
+    if (context && target) {
+      const { payload, inputs } = observation();
+      this.state.providerRequest = captureProviderRequest(context, target, payload, inputs);
+    }
   }
 }
 

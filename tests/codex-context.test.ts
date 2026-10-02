@@ -45,7 +45,7 @@ if (!process.execArgv.includes(mockFlag)) {
     });
     const { createCodexCompactionExtension } = await import("../src/index.js");
     const supported: Model<"openai-responses"> = {
-      id: "summary", name: "Summary", provider: "custom-codex", api: "openai-responses",
+      id: "gpt-6.1-sol", name: "GPT-6.1 Sol", provider: "custom-codex", api: "openai-responses",
       baseUrl: "https://codex-gateway.example/v1", reasoning: true, input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 10_000,
       compat: { supportsLongCacheRetention: true, ...{ remoteCompaction: { protocol: "v2" } } },
@@ -59,6 +59,7 @@ if (!process.execArgv.includes(mockFlag)) {
       const pi = {
         on(name: string, handler: Hook) { hooks.set(name, handler); },
         registerCommand() {}, registerEntryRenderer() {},
+        getThinkingLevel: () => "low", getSettings: () => ({}), getActiveTools: () => [], getAllTools: () => [],
       } as unknown as ExtensionAPI;
       createCodexCompactionExtension()(pi);
       const tracker = latestTracker;
@@ -150,7 +151,7 @@ if (!process.execArgv.includes(mockFlag)) {
       tracker.recordContext("session", undefined, structuredClone(canonical));
       assert.equal(fingerprint.mock.callCount(), 0);
       tracker.recordProviderRequest("session", undefined, () => assert.fail("canonical must stay lazy"),
-        () => assert.fail("prompt must stay lazy"));
+        () => assert.fail("prompt must stay lazy"), () => assert.fail("payload must stay lazy"));
       assert.equal(tracker.current().context, undefined, "unsupported context clears a pending projected snapshot");
       assert.equal(tracker.current().promptOverride, undefined);
       tracker.recordProjectedRequest("session", target, () => assert.fail("unsupported context clears its pending source"),

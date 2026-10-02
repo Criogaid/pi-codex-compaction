@@ -7,6 +7,7 @@ import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
 import { CodexCompactionProtocolError, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload } from "./protocol.js";
+import { applyProviderRequest, type ProviderRequestSnapshot } from "./request-snapshot.js";
 
 const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 const REQUEST_TIMEOUT_MS = 300_000;
@@ -27,6 +28,7 @@ export interface RemoteCompactionRequest {
   /** Pi origins of the context's user messages, used to align provider user items with Pi roles. */
   userItemOrigins?: readonly UserItemOrigin[];
   priorCheckpoint?: { identity: ProviderIdentity; marker: string; replacementHistory: readonly JsonObject[] };
+  providerRequest?: ProviderRequestSnapshot;
   onPrepared?: () => void;
   fetch?: typeof globalThis.fetch;
 }
@@ -108,6 +110,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       if (prior && !sameBackend(prior, identity)) {
         throw new CodexCompactionProtocolError("The active opaque checkpoint belongs to a different resolved provider backend");
       }
+      if (isObject(payload)) payload = applyProviderRequest(payload, resolved, request.providerRequest);
       const contextItems = contextUserItems(isObject(payload) ? payload.input : undefined, request.userItemOrigins);
       const payloadItems = isObject(payload) && Array.isArray(payload.input) ? payload.input.filter(isObject) : [];
       const estimates = await estimateImages([...payloadItems, ...request.priorCheckpoint?.replacementHistory ?? []], request.signal);

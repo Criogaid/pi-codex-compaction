@@ -35,7 +35,7 @@ import { requestRemoteCompaction } from "./remote.js";
 import { requestFallbackCompaction } from "./fallback.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH, loadCompactionSettings, type CompactionConfiguration } from "./fallback-settings.js";
 import { registerCompactionCommand } from "./fallback-command.js";
-import { compactionRequest, RequestSnapshotTracker, type RequestSnapshots } from "./request-snapshot.js";
+import { compactionRequest, providerRequestFor, RequestSnapshotTracker, type ProviderRequestInputs, type RequestSnapshots } from "./request-snapshot.js";
 
 const STATUS_KEY = "codex-compaction";
 const COMPLETION_ENTRY_TYPE = "pi-codex-compaction-completed";
@@ -73,6 +73,13 @@ function activeTools(pi: ExtensionAPI): Tool[] {
       description: tool.description,
       parameters: tool.parameters,
     }));
+}
+
+function providerRequestInputs(pi: ExtensionAPI, ctx: ExtensionContext): ProviderRequestInputs {
+  return {
+    systemPrompt: ctx.getSystemPrompt(), thinkingLevel: pi.getThinkingLevel(), settings: pi.getSettings(),
+    activeTools: pi.getActiveTools(), tools: pi.getAllTools(),
+  };
 }
 
 function canonicalMessages(ctx: ExtensionContext): AgentMessage[] {
@@ -198,6 +205,7 @@ async function compactRemotely(
       ctx.ui.notify("Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", "warning");
     }
     const current = projectedCurrentMessages(event, supported.identity);
+    const inputs = providerRequestInputs(pi, ctx);
     const request = compactionRequest(snapshots, sessionId, supported, current.messages, {
       blockImages: settings.images?.blockImages ?? false,
       systemPrompt: () => ctx.getSystemPrompt(),
@@ -208,6 +216,7 @@ async function compactRemotely(
       model: supported.model,
       context: request.context,
       userItemOrigins: userItemOrigins(request.messages),
+      providerRequest: providerRequestFor(snapshots, sessionId, supported, current.messages, inputs),
       reasoning,
       sessionId,
       thinkingBudgets: settings.thinkingBudgets,
@@ -341,6 +350,7 @@ export function createCodexCompactionExtension(
         capableModel(ctx.model),
         () => canonicalMessages(ctx),
         () => ctx.getSystemPrompt(),
+        () => ({ payload: payload ?? event.payload, inputs: providerRequestInputs(pi, ctx) }),
       );
       return payload;
     });

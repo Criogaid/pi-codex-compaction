@@ -111,7 +111,7 @@ export async function sessionFixture(options: {
     await loader.reload();
     const { session, extensionsResult } = await createAgentSession({
       cwd: directory, agentDir: directory, model, modelRuntime: runtime, sessionManager: manager,
-      resourceLoader: loader, settingsManager, thinkingLevel: "low", tools: [],
+      resourceLoader: loader, settingsManager, thinkingLevel: "low", noTools: "builtin",
     });
     assert.deepEqual(extensionsResult.errors, []);
     await session.bindExtensions({ mode: "print", onError: (error) => errors.push(error.error) });

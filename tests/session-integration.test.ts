@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createCodexCompactionExtension } from "../src/index.js";
 import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { isObject } from "../src/protocol.js";
@@ -59,3 +60,74 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     }
   });
 }
+
+function requestTransform(onReady?: (pi: ExtensionAPI) => void): ExtensionFactory {
+  return (pi) => {
+    const parameters = { type: "object", properties: {} };
+    for (const name of ["router", "internal_read"]) {
+      pi.registerTool({
+        name, label: name, description: `Fixture ${name}`, parameters,
+        prepareLoadout: name === "router" ? () => ({ hiddenDeclarations: ["internal_read"] }) : undefined,
+        execute: async () => ({ content: [{ type: "text", text: "fixture-result" }], details: {} }),
+      });
+    }
+    pi.on("session_start", () => { pi.setActiveTools(["router", "internal_read"]); onReady?.(pi); });
+    pi.on("before_provider_request", (event) => {
+      assert.ok(isObject(event.payload));
+      return { ...event.payload, instructions: "fixture-wire-instructions",
+        reasoning: { effort: "medium", summary: "auto" }, prompt_cache_key: "fixture-cache-key",
+        prompt_cache_retention: "24h", service_tier: "priority", text: { verbosity: "low" },
+        previous_response_id: "fixture-response-anchor", max_output_tokens: 123,
+      };
+    });
+  };
+}
+
+for (const api of ["openai-responses", "openai-codex-responses"] as const) {
+  test(`real ${api} compaction reuses observed declarations and cache fields without old response state`, { timeout: 20_000 }, async () => {
+    const fixture = await sessionFixture({ api, extensions: [requestTransform(), createCodexCompactionExtension()] });
+    try {
+      for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Preserve the implementation constraints. ".repeat(60)}`);
+      const ordinary = fixture.requests.at(-1)?.payload;
+      assert.ok(ordinary);
+      await fixture.session.compact();
+      const compacting = fixture.requests.at(-1)?.payload;
+      assert.ok(compacting && Array.isArray(compacting.input));
+      assert.ok(compacting.input.some((item) => isObject(item) && item.type === "compaction_trigger"));
+      for (const field of ["instructions", "tools", "reasoning", "prompt_cache_key", "prompt_cache_retention", "service_tier", "text"]) {
+        assert.deepEqual(compacting[field], ordinary[field], `Compaction must preserve the observed ${field}`);
+      }
+      assert.ok(!JSON.stringify(compacting.tools).includes("internal_read"));
+      assert.ok(Array.isArray(ordinary.input));
+      assert.deepEqual(compacting.input.slice(0, ordinary.input.length), ordinary.input);
+      assert.equal(compacting.previous_response_id, undefined);
+      assert.notEqual(compacting.max_output_tokens, ordinary.max_output_tokens);
+      assert.deepEqual(fixture.errors, []);
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test("real session drops observed request fields when thinking or active tools change", { timeout: 20_000 }, async () => {
+  for (const change of ["thinking", "tools"] as const) {
+    let controls: ExtensionAPI | undefined;
+    const fixture = await sessionFixture({ extensions: [requestTransform((pi) => { controls = pi; }), createCodexCompactionExtension()] });
+    try {
+      for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the current decisions. ".repeat(80)}`);
+      assert.ok(controls);
+      if (change === "thinking") fixture.session.setThinkingLevel("high");
+      else controls.setActiveTools(["router"]);
+      await fixture.session.compact();
+      const payload = fixture.requests.at(-1)?.payload;
+      assert.ok(payload && Array.isArray(payload.input));
+      assert.ok(payload.input.some((item) => isObject(item) && item.type === "compaction_trigger"));
+      assert.equal(payload.service_tier, undefined);
+      assert.notEqual(payload.prompt_cache_key, "fixture-cache-key");
+      if (change === "thinking") assert.deepEqual(payload.reasoning, { effort: "high", summary: "auto" });
+      assert.deepEqual(fixture.errors, []);
+    } finally {
+      await fixture.close();
+    }
+  }
+});

@@ -4,11 +4,11 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Model, Tool, UserMessage, SystemMessage } from "@earendil-works/pi-ai";
 import type { CapableModel } from "../src/capability.js";
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, fingerprintMessage } from "../src/checkpoint.js";
-import { compactionRequest, RequestSnapshotTracker, type RequestDeclarations } from "../src/request-snapshot.js";
+import { applyProviderRequest, compactionRequest, providerRequestFor, RequestSnapshotTracker, type ProviderRequestInputs, type RequestDeclarations } from "../src/request-snapshot.js";
 
 const sessionId = "snapshot-session";
 const model: Model<"openai-responses"> = {
-  id: "summary", name: "Summary", provider: "custom-codex", api: "openai-responses",
+  id: "gpt-6.1-sol", name: "GPT-6.1 Sol", provider: "custom-codex", api: "openai-responses",
   baseUrl: "https://codex-gateway.example/v1", reasoning: true, input: ["text", "image"],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 10_000,
 };
@@ -24,6 +24,11 @@ const declarationsInTranscript: RequestDeclarations = {
   systemPrompt: () => assert.fail("the transcript already declares its prompt"),
   tools: () => assert.fail("the transcript already declares its tools"),
 };
+const inputs: ProviderRequestInputs = {
+  systemPrompt: "canonical prompt", thinkingLevel: "low", settings: {}, activeTools: ["read"],
+  tools: [{ ...tools[0], exposure: "direct", sourceInfo: { path: "<inline:test>", source: "inline", scope: "temporary", origin: "top-level" } }],
+};
+const noPayload = () => ({ payload: undefined, inputs });
 
 function preparedTracker(canonical: AgentMessage[], projected: AgentMessage[] = canonical) {
   const tracker = new RequestSnapshotTracker();
@@ -41,7 +46,7 @@ test("current returns live published snapshots and provider retries preserve the
   tracker.recordProjectedRequest(sessionId, target, () => canonical, () => undefined, projected);
   assert.deepEqual(live.context, undefined);
   assert.deepEqual(live.promptOverride, undefined);
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt", noPayload);
   assert.equal(tracker.current(), live);
   const snapshot = tracker.current().context;
   assert.ok(snapshot);
@@ -50,7 +55,7 @@ test("current returns live published snapshots and provider retries preserve the
   assert.deepEqual(snapshot.sourceFingerprints, canonical.map(fingerprintMessage));
   assert.deepEqual(live.promptOverride, { sessionId, identity: target.identity,
     sourceFingerprint: fingerprintMessage(canonical[0]), text: "forced prompt" });
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "retry prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "retry prompt", noPayload);
   assert.equal(live.context, snapshot);
   assert.equal(tracker.current().promptOverride?.text, "retry prompt");
   assert.equal(tracker.current(), live);
@@ -59,7 +64,7 @@ test("current returns live published snapshots and provider retries preserve the
 test("reset clears pending and published state without changing a previously returned view", () => {
   const canonical = [system(), user()];
   const tracker = preparedTracker(canonical);
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt", noPayload);
   const previous = tracker.current();
   const snapshot = previous.context;
   const override = previous.promptOverride;
@@ -68,7 +73,7 @@ test("reset clears pending and published state without changing a previously ret
   assert.notEqual(tracker.current(), previous);
   assert.deepEqual(tracker.current(), {});
   tracker.recordProviderRequest(sessionId, undefined, () => assert.fail("unsupported provider must not read canonical"),
-    () => assert.fail("unsupported provider must not read prompt"));
+    () => assert.fail("unsupported provider must not read prompt"), () => assert.fail("unsupported provider must not observe payload"));
   assert.equal(tracker.current().context, undefined);
   assert.equal(tracker.current().promptOverride, undefined);
   assert.equal(previous.context, snapshot);
@@ -78,7 +83,7 @@ test("reset clears pending and published state without changing a previously ret
   const next = [system("next prompt"), user("next source", 2)];
   tracker.recordContext(sessionId, target, [next[1]]);
   tracker.recordProjectedRequest(sessionId, target, () => next, () => undefined, next);
-  tracker.recordProviderRequest(sessionId, target, () => next, () => "next forced prompt");
+  tracker.recordProviderRequest(sessionId, target, () => next, () => "next forced prompt", noPayload);
   assert.deepEqual(tracker.current().context?.messages, next);
   assert.equal(previous.context, snapshot);
   assert.equal(previous.promptOverride, override);
@@ -99,7 +104,7 @@ for (const scenario of ["no source", "no target", "different session", "changed 
     assert.equal(readCanonical.mock.callCount(), ["changed text", "changed timestamp", "extra message"].includes(scenario) ? 1 : 0);
     assert.equal(readCheckpoint.mock.callCount(), 0);
     tracker.recordProjectedRequest(sessionId, target, () => assert.fail("a rejected source is consumed"), readCheckpoint, canonical);
-    tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt");
+    tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt", noPayload);
     assert.equal(tracker.current().context, undefined);
   });
 }
@@ -108,11 +113,11 @@ test("canonical matching ignores interleaved system messages and captures a sing
   const canonical = [system("first prompt"), user("first"), system("latest prompt", 2), user("second", 3)];
   const projected = [system("provider prompt", 2), user("projected conversation", 3)];
   const tracker = preparedTracker(canonical, projected);
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "latest prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "latest prompt", noPayload);
   assert.deepEqual(tracker.current().context?.messages, projected);
   tracker.recordProjectedRequest(sessionId, target, () => assert.fail("a projected source is consumed once"),
     () => assert.fail("no second checkpoint read"), projected);
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "latest prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "latest prompt", noPayload);
   assert.equal(tracker.current().context, undefined);
 });
 
@@ -130,7 +135,7 @@ test("a checkpoint projects the source before binding and reusing the ordinary r
   const tracker = new RequestSnapshotTracker();
   tracker.recordContext(sessionId, target, [summary, kept, after]);
   tracker.recordProjectedRequest(sessionId, target, () => canonical, () => details, projected);
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt", noPayload);
   assert.deepEqual(tracker.current().context?.sourceFingerprints, source.map(fingerprintMessage));
   const result = compactionRequest(tracker.current(), sessionId, target, source, declarationsInTranscript);
   assert.deepEqual(result.messages, projected);
@@ -144,7 +149,7 @@ test("an invalid checkpoint projection cannot publish an ordinary context snapsh
   const tracker = new RequestSnapshotTracker();
   tracker.recordContext(sessionId, target, canonical.filter((message) => message.role !== "system"));
   tracker.recordProjectedRequest(sessionId, target, () => canonical, () => details, canonical);
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt", noPayload);
   assert.equal(tracker.current().context, undefined);
 });
 
@@ -152,7 +157,7 @@ test("compaction reuses the projected prefix, appends new messages, and does not
   const canonical = [system(), user()];
   const projected = [system(), user("projected source")];
   const tracker = preparedTracker(canonical, projected);
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt", noPayload);
   const current = [...canonical, user("new suffix", 2)];
   const saved = structuredClone({ current, projected });
   const result = compactionRequest(tracker.current(), sessionId, target, current, declarationsInTranscript);
@@ -166,7 +171,7 @@ for (const scenario of ["session", "model", "backend", "changed prefix", "shorte
   test(`compaction rejects a snapshot with a mismatched ${scenario}`, () => {
     const canonical = [system(), user()];
     const tracker = preparedTracker(canonical, [system(), user("must not be reused")]);
-    tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt");
+    tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt", noPayload);
     const requestTarget = scenario === "model" ? { ...target, model: { ...model, id: "other" }, identity: { ...target.identity, modelId: "other" } }
       : scenario === "backend" ? { ...target, identity: { ...target.identity, endpoint: "https://other.example/responses" } } : target;
     const current = scenario === "changed prefix" ? [system(), user("edited")]
@@ -182,7 +187,7 @@ test("a prompt override replaces the system text while retaining transcript tool
   const head: SystemMessage = { ...system(), toolsAdded: tools };
   const canonical = [head, user()];
   const tracker = preparedTracker(canonical);
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt", noPayload);
   const result = compactionRequest(tracker.current(), sessionId, target, canonical, declarationsInTranscript);
   assert.deepEqual(result.context, { messages: [{ ...head, content: "forced prompt" }, canonical[1]] });
   assert.deepEqual(canonical[0], head);
@@ -191,7 +196,7 @@ test("a prompt override replaces the system text while retaining transcript tool
 test("a changed system head invalidates a saved prompt override", () => {
   const canonical = [system(), user()];
   const tracker = new RequestSnapshotTracker();
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt");
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt", noPayload);
   const current = [system("edited canonical prompt"), user()];
   const result = compactionRequest(tracker.current(), sessionId, target, current, declarationsInTranscript);
   assert.deepEqual(result.context, { messages: current });
@@ -226,3 +231,100 @@ for (const blockImages of [true, false]) {
     assert.deepEqual(current, saved);
   });
 }
+
+function observedRequest(canonical: AgentMessage[], payload: unknown, state = inputs) {
+  const tracker = preparedTracker(canonical);
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => state.systemPrompt, () => ({ payload, inputs: state }));
+  return tracker;
+}
+
+const wirePayload = () => ({
+  model: model.id, instructions: "wire-prompt", tools: [{ type: "function", name: "router", parameters: { type: "object" } }],
+  reasoning: { effort: "medium" }, prompt_cache_key: "wire-cache-key", prompt_cache_retention: "24h", service_tier: "priority",
+  text: { verbosity: "low", format: { type: "json_object" } },
+  input: [{ type: "message", role: "developer", content: [{ type: "input_text", text: "wire-prefix" }] },
+    { type: "additional_tools", tools: [] }, { type: "message", role: "user", content: [{ type: "input_text", text: "source" }] }],
+  previous_response_id: "old-response", max_output_tokens: 123, store: true, stream: false, metadata: { private: "not-copied" },
+});
+
+test("observed fields and declaration prefix survive newer conversation messages without copying transient state", () => {
+  const canonical = [system(), user()];
+  const observed = wirePayload();
+  const tracker = observedRequest(canonical, observed);
+  const current = [...canonical, user("new turn", 2)];
+  const snapshot = providerRequestFor(tracker.current(), sessionId, target, current, inputs);
+  assert.ok(snapshot);
+  observed.tools[0].name = "mutated-after-capture";
+  observed.input[0].content?.push({ type: "input_text", text: "mutated-after-capture" });
+  const fresh = { model: model.id, input: [{ role: "system", content: "fresh prompt" }, { role: "user", content: "new turn" }],
+    tools: [], text: { verbosity: "high" }, max_output_tokens: 4_096, store: false, stream: true };
+  const result = applyProviderRequest(fresh, target, snapshot);
+  const original = wirePayload();
+  assert.deepEqual(result.tools, original.tools);
+  assert.deepEqual(result.reasoning, original.reasoning);
+  assert.equal(result.prompt_cache_key, original.prompt_cache_key);
+  assert.equal(result.prompt_cache_retention, original.prompt_cache_retention);
+  assert.equal(result.service_tier, original.service_tier);
+  assert.deepEqual(result.text, { verbosity: original.text.verbosity });
+  assert.deepEqual(result.input, [...original.input.slice(0, 2), fresh.input[1]]);
+  assert.equal(result.previous_response_id, undefined);
+  assert.equal(result.metadata, undefined);
+  assert.equal(result.max_output_tokens, fresh.max_output_tokens);
+  assert.equal(result.store, fresh.store);
+  assert.equal(result.stream, fresh.stream);
+  assert.deepEqual(fresh.tools, []);
+});
+
+test("wire snapshots reject session, backend, source, prompt, tool, thinking and settings changes", () => {
+  const canonical = [system(), user()];
+  const tracker = observedRequest(canonical, wirePayload());
+  const snapshots = tracker.current();
+  assert.equal(providerRequestFor(snapshots, "different-session", target, canonical, inputs), undefined);
+  const otherBackend = { ...target, identity: { ...target.identity, baseUrl: "https://other.example", endpoint: "https://other.example/responses" } };
+  assert.equal(providerRequestFor(snapshots, sessionId, otherBackend, canonical, inputs), undefined);
+  assert.equal(providerRequestFor(snapshots, sessionId, target, [system(), user("edited")], inputs), undefined);
+  assert.equal(providerRequestFor(snapshots, sessionId, target, [system()], inputs), undefined);
+  for (const changed of [
+    { ...inputs, systemPrompt: "updated" },
+    { ...inputs, thinkingLevel: "high" as const },
+    { ...inputs, activeTools: ["new-tool"] },
+    { ...inputs, tools: inputs.tools.map((tool) => ({ ...tool, parameters: { type: "object", properties: { path: { type: "string" } } } })) },
+    { ...inputs, settings: { transport: "websocket" as const } },
+  ]) assert.equal(providerRequestFor(snapshots, sessionId, target, canonical, changed), undefined);
+  const snapshot = providerRequestFor(snapshots, sessionId, target, canonical, inputs);
+  const fresh = wirePayload();
+  assert.equal(applyProviderRequest(fresh, otherBackend, snapshot), fresh);
+});
+
+test("missing wire fields remove obsolete defaults and malformed observations discard earlier snapshots", () => {
+  const canonical = [system(), user()];
+  const payload = { model: model.id, input: [{ role: "user", content: "source" }] };
+  const tracker = observedRequest(canonical, payload);
+  const snapshot = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+  assert.ok(snapshot);
+  const actual = applyProviderRequest(wirePayload(), target, snapshot);
+  assert.equal(actual.tools, undefined);
+  assert.equal(actual.instructions, undefined);
+  assert.equal(actual.prompt_cache_key, undefined);
+  assert.deepEqual(actual.text, { format: { type: "json_object" } });
+  for (const invalid of [null, {}, { ...payload, tools: "invalid" }, { ...payload, input: [null] },
+    { ...payload, reasoning: false }, { ...payload, text: { verbosity: 2 } }, { ...payload, prompt_cache_key: 1 }]) {
+    tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt, () => ({ payload: invalid, inputs }));
+    assert.equal(tracker.current().providerRequest, undefined);
+  }
+});
+
+test("retry observations replace wire fields and reset detaches a captured compaction view", () => {
+  const canonical = [system(), user()];
+  const tracker = observedRequest(canonical, wirePayload());
+  const view = tracker.current();
+  const first = view.providerRequest;
+  assert.ok(first);
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt,
+    () => ({ payload: { ...wirePayload(), prompt_cache_key: "retried-cache-key" }, inputs }));
+  assert.notEqual(view.providerRequest, first);
+  assert.equal(view.providerRequest?.fields.prompt_cache_key, "retried-cache-key");
+  tracker.reset();
+  assert.equal(tracker.current().providerRequest, undefined);
+  assert.equal(view.providerRequest?.fields.prompt_cache_key, "retried-cache-key");
+});
