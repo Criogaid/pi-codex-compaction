@@ -7,6 +7,7 @@
 - Write repository documentation in Simplified Chinese. Write code comments, tests, prompts, and maintainer instructions in English.
 - Use the changed functional module as the commit scope. Preserve the upstream attribution in `LICENSE`.
 - Record pending user-visible changes under the unreleased section of `CHANGELOG.md`; preserve released entries as historical records.
+- Publish `@criogaid/pi-codex-compaction` through `.github/workflows/publish.yml` using a `v<package-version>` tag for a stable version. Keep the manifest and lockfile versions aligned and record release notes before tagging.
 
 ## Ownership
 

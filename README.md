@@ -12,7 +12,13 @@
 pi install git:github.com/Criogaid/pi-codex-compaction
 ```
 
-请使用这个 Git 地址。npm 上的同名包 `pi-codex-compaction` 指向另一个仓库。
+npm 发布包名为 `@criogaid/pi-codex-compaction`。首次发布前请使用上面的 Git 地址；发布后可执行：
+
+```bash
+pi install npm:@criogaid/pi-codex-compaction
+```
+
+不要安装不带作用域的 `pi-codex-compaction`，它属于另一个仓库。
 
 ## 开始使用
 
@@ -149,7 +155,17 @@ npm run pack:check
 
 运行代码在 `src/`，入口是 `src/index.ts`；测试在 `tests/`，编译结果写入 Git 忽略的 `dist/`。Pi 直接加载 TypeScript 源码。打包检查同时验证发布文件清单和 Pi 的实际入口加载。
 
-[CI](.github/workflows/ci.yml) 在 Ubuntu 24.04 和 Windows 上使用 Node 24 执行验证，不自动发布。变更记录见 [CHANGELOG.md](CHANGELOG.md)，维护规则见 [AGENTS.md](AGENTS.md)。
+[CI](.github/workflows/ci.yml) 在 Ubuntu 24.04 和 Windows 上使用 Node 24 执行验证。变更记录见 [CHANGELOG.md](CHANGELOG.md)，维护规则见 [AGENTS.md](AGENTS.md)。
+
+## 发布
+
+[Publish](.github/workflows/publish.yml) 在推送 `v*` 标签时运行。标签必须与 `package.json` 的版本一致，例如版本 `0.2.2` 对应标签 `v0.2.2`。流程目前只发布正式版本，不接受带 `-beta`、`-rc` 等后缀的预发布版本。
+
+首次发布前，在本仓库的 **Settings → Secrets and variables → Actions** 中添加 `NPM_TOKEN`。按 [npm 文档](https://docs.npmjs.com/creating-and-viewing-access-tokens)创建 granular access token，授予 `@criogaid` 作用域的发布权限（Read and write / publish and stage），并启用 Bypass two-factor authentication。包创建后，可以将 token 权限缩小到该包。
+
+准备版本时，运行 `npm version <版本号> --no-git-tag-version` 同步更新 `package.json` 和 `package-lock.json`，将本次改动从 CHANGELOG 的“未发布”整理到对应版本下。运行上面的三项验证命令，通过后提交，再为该提交创建并推送 `v<版本号>` 标签。
+
+工作流会核对版本，重新安装依赖，执行类型检查、测试和打包检查，全部通过后才发布公开 npm 包，并附带可追溯到源码提交和工作流的来源证明（provenance）。普通分支推送不会发布；已经发布的 npm 版本不能覆盖，后续修改需要使用新版本号。
 
 ## 许可证
 
