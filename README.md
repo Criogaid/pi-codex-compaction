@@ -143,7 +143,7 @@ Pi 原生压缩（文字摘要） <----------------------------+
 
 模型是否尝试 V2 由 `compat.remoteCompaction` 决定：有配置时按配置判断；没有配置时，API 类型为 `openai-responses` 或 `openai-codex-responses` 且模型 ID 包含 `gpt`（不区分大小写）即尝试 V2。其他 API 的请求格式无法携带 V2 压缩，未配置时直接使用 Pi 原生压缩。服务商名称和是否使用官方地址不参与启用判断。显示名称不参与匹配。
 
-显式配置须指定 `protocol: "v2"`，可同时指定 `endpoint`。配置无效时不尝试 V2，也不会退回名称匹配。非 GPT 模型、其他 API 类型或需要覆盖端点时，可以在 Pi 的 `models.json` 中添加：
+显式配置须指定 `protocol: "v2"`，可同时指定 `endpoint`。配置无效时不尝试 V2，也不会退回名称匹配。非 GPT 模型或需要覆盖端点时，可以在 Pi 的 `models.json` 中添加：
 
 ```json
 {
