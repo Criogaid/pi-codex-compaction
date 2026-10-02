@@ -20,6 +20,7 @@ import {
 
 export const CHECKPOINT_KIND = "pi-codex-compaction";
 export const CHECKPOINT_VERSION = 1;
+const EXTENSION_PACKAGE = "@criogaid/pi-codex-compaction";
 
 export interface CodexCheckpointDetails extends ProviderIdentity {
   kind: typeof CHECKPOINT_KIND;
@@ -62,12 +63,21 @@ export function fingerprintMessage(message: AgentMessage): string {
 export function checkpointMarker(checkpointId: string): string {
   return [
     `[PI_CODEX_REMOTE_CHECKPOINT:${checkpointId}]`,
-    "Opaque checkpoint injection failed. Do not infer missing history; tell the user to re-enable",
-    "@oipsanthony/pi-codex-compaction with the checkpoint's provider and model.",
+    "The compressed chat history could not be loaded. Do not infer missing details.",
+    `Ask the user to enable ${EXTENSION_PACKAGE} and reconnect to the model service that created it.`,
   ].join(" ");
 }
 
 export function fallbackSummary(checkpointId: string): string {
+  return [
+    `Earlier chat history was compressed by Codex Remote Compaction V2 (checkpoint ${checkpointId}).`,
+    `To use it, keep ${EXTENSION_PACKAGE} enabled and connected to the original model service.`,
+    "If it cannot be loaded, only Pi's retained recent messages are available; do not guess missing details.",
+  ].join(" ");
+}
+
+// The persisted v1 summary identifies checkpoints written before the package was renamed.
+function legacyFallbackSummary(checkpointId: string): string {
   return [
     `Codex Remote Compaction V2 checkpoint ${checkpointId} stores the older history opaquely.`,
     "Full replay requires @oipsanthony/pi-codex-compaction and the original provider endpoint and model.",
@@ -202,9 +212,9 @@ export function projectCheckpointContext(
   messages: readonly AgentMessage[],
   details: CodexCheckpointDetails,
 ): AgentMessage[] | undefined {
-  const summary = fallbackSummary(details.checkpointId);
+  const summaries = new Set([fallbackSummary(details.checkpointId), legacyFallbackSummary(details.checkpointId)]);
   const summaryIndex = messages.findIndex(
-    (message) => message.role === "compactionSummary" && message.summary === summary,
+    (message) => message.role === "compactionSummary" && summaries.has(message.summary),
   );
   if (summaryIndex < 0) return undefined;
   const keptStart = summaryIndex + 1;

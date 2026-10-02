@@ -139,3 +139,10 @@ export async function sessionFixture(options: {
     },
   };
 }
+
+/** Saved v1 input fixture; keep it independent of the current summary formatter. */
+export function legacyCheckpointSummary(checkpointId: string): string {
+  return `Codex Remote Compaction V2 checkpoint ${checkpointId} stores the older history opaquely. ` +
+    "Full replay requires @oipsanthony/pi-codex-compaction and the original provider endpoint and model. " +
+    "Without them, only Pi's retained recent messages remain available.";
+}

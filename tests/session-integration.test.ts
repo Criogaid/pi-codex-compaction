@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { readFile, writeFile } from "node:fs/promises";
 import { createCodexCompactionExtension } from "../src/index.js";
 import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { isObject } from "../src/protocol.js";
-import { isolateAgentConfig, sessionFixture } from "./helpers.js";
+import { isolateAgentConfig, legacyCheckpointSummary, sessionFixture } from "./helpers.js";
 
 isolateAgentConfig();
 
@@ -129,5 +130,36 @@ test("real session drops observed request fields when thinking or active tools c
     } finally {
       await fixture.close();
     }
+  }
+});
+
+test("a saved v1 checkpoint resumes through a real session after the package rename", { timeout: 20_000 }, async () => {
+  const fixture = await sessionFixture({ extensions: [createCodexCompactionExtension()] });
+  try {
+    for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the existing history. ".repeat(80)}`);
+    await fixture.session.compact();
+    const file = fixture.session.sessionManager.getSessionFile();
+    assert.ok(file);
+    const persisted = await readFile(file, "utf8");
+    let changed = 0;
+    const legacy = persisted.split("\n").map((line) => {
+      if (!line.trim()) return line;
+      const entry: unknown = JSON.parse(line);
+      if (!isObject(entry) || entry.type !== "compaction") return line;
+      const details = parseCheckpointDetails(entry.details);
+      assert.ok(details);
+      changed++;
+      return JSON.stringify({ ...entry, summary: legacyCheckpointSummary(details.checkpointId) });
+    }).join("\n");
+    assert.equal(changed, 1);
+    await writeFile(file, legacy);
+    await fixture.reopen();
+    await fixture.session.prompt("Continue using the saved history.");
+    const payload = fixture.requests.at(-1)?.payload;
+    assert.ok(payload && Array.isArray(payload.input));
+    assert.ok(payload.input.some((item) => isObject(item) && item.type === "compaction"));
+    assert.deepEqual(fixture.errors, []);
+  } finally {
+    await fixture.close();
   }
 });

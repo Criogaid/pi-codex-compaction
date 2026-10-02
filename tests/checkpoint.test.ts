@@ -20,11 +20,12 @@ import {
   projectCheckpointContext,
   withoutSystemMessages,
 } from "../src/checkpoint.js";
+import { legacyCheckpointSummary } from "./helpers.js";
 
 const identity: ProviderIdentity = {
   provider: "custom-codex",
   api: "openai-codex-responses",
-  modelId: "gpt-5.6",
+  modelId: "gpt-6.1-sol",
   baseUrl: "https://codex-gateway.example/v1",
   endpoint: "https://codex-gateway.example/v1/responses",
 };
@@ -354,4 +355,13 @@ test("withoutSystemMessages handles empty and all-system transcripts and only fi
   const result = withoutSystemMessages(input);
   assert.deepEqual(result, input);
   assert.notEqual(result, input);
+});
+
+test("persisted legacy summaries restore only their own unchanged checkpoint history", () => {
+  const kept = user("kept", 2);
+  const details = checkpoint([kept]);
+  const summary: AgentMessage = { role: "compactionSummary", summary: legacyCheckpointSummary(details.checkpointId), tokensBefore: 100, timestamp: 1 };
+  assert.ok(projectCheckpointContext([summary, kept], details));
+  assert.equal(projectCheckpointContext([summary, user("edited", 2)], details), undefined);
+  assert.equal(projectCheckpointContext([{ ...summary, summary: legacyCheckpointSummary("different-checkpoint") }, kept], details), undefined);
 });
