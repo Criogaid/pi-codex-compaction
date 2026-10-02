@@ -26,12 +26,15 @@ const configuredCompat = {
   },
 };
 
-test("defaults to a case-insensitive GPT substring in the model ID regardless of provider or API", () => {
-  for (const api of ["openai-responses", "openai-codex-responses", "openai-completions", "custom-api"]) {
+test("defaults to a case-insensitive GPT substring in the model ID on Responses APIs regardless of provider", () => {
+  for (const api of ["openai-responses", "openai-codex-responses"]) {
     for (const id of ["gpt-example", "gateway/GPT-example", "example-gPt-alias"]) {
       const current = model({ id, name: "Custom display name", api, compat: { supportsToolSearch: true } });
       assert.equal(capableModel(current)?.model, current);
     }
+  }
+  for (const api of ["openai-completions", "anthropic-messages", "azure-openai-responses", "custom-api"]) {
+    assert.equal(capableModel(model({ api, compat: undefined })), undefined);
   }
   assert.equal(capableModel(undefined), undefined);
   assert.equal(capableModel(model({ id: "other-model", name: "GPT display name" })), undefined);

@@ -340,21 +340,18 @@ test("does not notify when a session starts", async () => {
   assert.deepEqual(current.notifications, []);
 });
 
-test("compacts GPT models without metadata through the registered provider regardless of API name", async () => {
-  for (const api of ["openai-responses", "custom-api"]) {
-    const mock = mockPi();
-    createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
-    const compact = mock.events.get("session_before_compact")?.[0];
-    const current = await context({ model: { ...model, api, compat: undefined } });
-    const result = await compact?.(compactEvent(), current.ctx) as {
-      compaction: { details: unknown; usage: unknown };
-    };
-    const details = parseCheckpointDetails(result.compaction.details);
-    assert.ok(details);
-    assert.equal(details.api, api);
-    assert.equal(details.modelId, model.id);
-    assert.deepEqual(result.compaction.usage, usage);
-  }
+test("compacts GPT models without metadata through the registered provider", async () => {
+  const mock = mockPi();
+  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  const compact = mock.events.get("session_before_compact")?.[0];
+  const current = await context({ model: { ...model, compat: undefined } });
+  const result = await compact?.(compactEvent(), current.ctx) as {
+    compaction: { details: unknown; usage: unknown };
+  };
+  const details = parseCheckpointDetails(result.compaction.details);
+  assert.ok(details);
+  assert.equal(details.modelId, model.id);
+  assert.deepEqual(result.compaction.usage, usage);
 });
 
 test("creates and resumes a checkpoint for a configured custom provider", async () => {
@@ -559,7 +556,7 @@ for (const interruption of ["abort", "session-switch"] as const) {
   });
 }
 
-test("non-GPT models without metadata and models with invalid metadata use Pi compaction silently", async () => {
+test("non-GPT models, GPT models outside Responses APIs, and invalid metadata use Pi compaction silently", async () => {
   const mock = mockPi();
   createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
@@ -571,6 +568,10 @@ test("non-GPT models without metadata and models with invalid metadata use Pi co
   const unconfigured = await context({ model: { ...model, id: "other-model", compat: undefined } });
   assert.equal(await compact?.(compactEvent(), unconfigured.ctx), undefined);
   assert.deepEqual(unconfigured.notifications, []);
+
+  const chatCompletions = await context({ model: { ...model, api: "openai-completions", compat: undefined } });
+  assert.equal(await compact?.(compactEvent(), chatCompletions.ctx), undefined);
+  assert.deepEqual(chatCompletions.notifications, []);
 });
 
 test("inherits the runtime thinking level and active session for every compaction", async () => {
