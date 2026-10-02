@@ -29,10 +29,12 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 | 设置 | 用途 |
 | --- | --- |
 | Remote Compaction V2 | 是否优先尝试远程压缩，默认 On |
-| Fallback model | 是否使用指定的文本压缩模型，默认 Off |
-| Model and thinking level | 选择文本压缩模型及其思考等级 |
+| Use separate summary model | 是否使用独立模型生成文本摘要，默认 Off |
+| Summary model and thinking level | 选择摘要模型及其思考等级 |
 
-首次选择模型后，还需要打开 `Fallback model`。如果想始终使用指定模型做文本压缩，同时关闭 `Remote Compaction V2`。
+首次选择模型后，还需要打开 `Use separate summary model`。如果想始终使用指定模型做文本压缩，同时关闭 `Remote Compaction V2`。
+
+TUI 选中设置时，列表下方会说明它与其他设置的关系；RPC 将文本压缩条件和当前模型状态显示在选择框标题中。
 
 TUI 中按回车或空格切换开关，修改立即保存，菜单停留在原来的行。模型可以按 Provider、ID 或名称搜索。关闭 fallback 会保留已选模型；取消模型选择不会保存。RPC 模式使用选择框，每次操作后退出菜单。
 

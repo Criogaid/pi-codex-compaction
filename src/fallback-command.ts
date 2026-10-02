@@ -5,7 +5,9 @@ import { Container, fuzzyFilter, Input, SelectList, SettingsList, Text } from "@
 import { loadCompactionSettings, type FallbackConfiguration } from "./fallback-settings.js";
 
 const COMMAND_NAME = "codex-compaction";
-const CHANGE_MODEL = "Choose fallback model and thinking level";
+const SUMMARY_SWITCH_LABEL = "Use separate summary model";
+const SUMMARY_MODEL_LABEL = "Summary model and thinking level";
+const TEXT_SUMMARY_DESCRIPTION = "Text summaries are used when V2 is off, unsupported, or fails.";
 const MAX_VISIBLE_MODELS = 10;
 type SettingsAction = "model" | "toggle" | "remote";
 
@@ -28,9 +30,9 @@ function fallbackModelLabel(selection: FallbackConfiguration | undefined): strin
 
 function describeFallback(selection: FallbackConfiguration | undefined): string {
   const model = fallbackModelLabel(selection);
-  if (model === undefined) return "No fallback model configured; inactive. Pi uses the chat model.";
-  return selection?.enabled ? `Fallback text compaction will use ${model}. The chat model is unchanged.`
-    : `Fallback model is Off. Pi will use the chat model for text compaction. Saved model: ${model}.`;
+  if (model === undefined) return "No separate summary model configured; inactive. Pi uses the chat model.";
+  return selection?.enabled ? `Text summaries will use ${model}. The chat model is unchanged.`
+    : `Separate summary model is Off. Pi will use the chat model for text compaction. Saved model: ${model}.`;
 }
 
 async function chooseAction(
@@ -41,24 +43,24 @@ async function chooseAction(
 ): Promise<SettingsAction | undefined> {
   const current = fallback.value;
   const invalid = fallback.error !== undefined;
-  const description = fallback.error ?? describeFallback(current);
+  const description = fallback.error ?? `${TEXT_SUMMARY_DESCRIPTION} ${describeFallback(current)}`;
   const remoteValue = remoteCompactionEnabled ? "On" : "Off";
   const switchValue = invalid ? "Invalid" : current?.enabled ? "On" : "Off";
   if (ctx.mode !== "tui") {
-    const switchLabel = `Fallback model: ${switchValue}`;
+    const switchLabel = `${SUMMARY_SWITCH_LABEL}: ${switchValue}`;
     const remoteLabel = `Remote Compaction V2: ${remoteValue}`;
-    const action = await ctx.ui.select(description, [remoteLabel, switchLabel, CHANGE_MODEL]);
+    const action = await ctx.ui.select(description, [remoteLabel, switchLabel, SUMMARY_MODEL_LABEL]);
     if (action === undefined) return undefined;
-    if (action === CHANGE_MODEL) return "model";
+    if (action === SUMMARY_MODEL_LABEL) return "model";
     if (action === switchLabel) return "toggle";
     if (action === remoteLabel) return "remote";
     throw new Error("Select a listed compaction setting");
   }
   return ctx.ui.custom<SettingsAction | undefined>((tui, _theme, _keys, done) => {
     const list = new SettingsList([
-      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When Off, use the configured fallback or Pi's chat-model text compaction. Existing checkpoints still replay." },
-      { id: "toggle", label: "Fallback model", currentValue: switchValue, values: invalid ? ["Invalid"] : ["Off", "On"], description },
-      { id: "model", label: "Model and thinking level", currentValue: invalid ? "Invalid" : fallbackModelLabel(current) ?? "Not configured", values: ["Choose"], description: invalid ? "Choose a model to replace the invalid fallback settings." : "Choose a model; this does not change the switch." },
+      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When On, try V2 with the chat model. When Off, unsupported, or failed, use text summaries. The settings below choose their model. Existing checkpoints still replay." },
+      { id: "toggle", label: SUMMARY_SWITCH_LABEL, currentValue: switchValue, values: invalid ? ["Invalid"] : ["Off", "On"], description },
+      { id: "model", label: SUMMARY_MODEL_LABEL, currentValue: invalid ? "Invalid" : fallbackModelLabel(current) ?? "Not configured", values: ["Choose"], description: invalid ? "Choose a model to replace the invalid fallback settings." : `Choose the model and thinking level used when "${SUMMARY_SWITCH_LABEL}" is On. Choosing a model does not enable the switch or change the chat model. ${TEXT_SUMMARY_DESCRIPTION}` },
     ], 3, getSettingsListTheme(), (id) => done(id === "toggle" ? "toggle" : id === "remote" ? "remote" : "model"), () => done(undefined));
     list.selectItem(selected);
     return {
@@ -75,10 +77,10 @@ function modelLabel(model: Model<Api>): string {
 
 async function chooseModel(ctx: ExtensionCommandContext, models: readonly Model<Api>[]): Promise<Model<Api> | undefined> {
   if (ctx.mode !== "tui") {
-    const query = await ctx.ui.input("Search fallback models (provider, ID, or name)", "Leave empty to show all models");
+    const query = await ctx.ui.input("Search summary models (provider, ID, or name)", "Leave empty to show all models");
     if (query === undefined) return undefined;
     const matches = fuzzyFilter([...models], query, modelLabel);
-    const chosen = await ctx.ui.select("Choose the model for fallback text compaction", matches.map(modelLabel));
+    const chosen = await ctx.ui.select("Choose the model for text summaries", matches.map(modelLabel));
     if (chosen === undefined) return undefined;
     const model = matches.find((candidate) => modelLabel(candidate) === chosen);
     if (!model) throw new Error("Select a listed fallback model");
@@ -94,7 +96,7 @@ async function chooseModel(ctx: ExtensionCommandContext, models: readonly Model<
       list.onSelect = (item) => done(matches[Number(item.value)]);
       list.onCancel = () => done(undefined);
       container.clear();
-      container.addChild(new Text("Fallback model — type to search by provider, ID, or name", 0, 0));
+      container.addChild(new Text("Summary model: type to search by provider, ID, or name", 0, 0));
       container.addChild(input);
       container.addChild(list);
     };

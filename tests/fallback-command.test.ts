@@ -103,7 +103,7 @@ test("fallback can be switched off and back on without losing the saved model or
   await writeSettings();
   const disabled = await fixture([switchChoice]);
   await disabled.run();
-  assert.equal(disabled.dialogs[0].options[1], "Fallback model: On");
+  assert.equal(disabled.dialogs[0].options[1], "Use separate summary model: On");
   assert.equal(disabled.dialogs.length, 1);
   const selection = { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "low" };
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, remoteCompaction: { enabled: true }, fallback: selection });
@@ -111,7 +111,7 @@ test("fallback can be switched off and back on without losing the saved model or
 
   const enabled = await fixture([switchChoice]);
   await enabled.run();
-  assert.equal(enabled.dialogs[0].options[1], "Fallback model: Off");
+  assert.equal(enabled.dialogs[0].options[1], "Use separate summary model: Off");
   assert.equal(enabled.dialogs.length, 1);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, remoteCompaction: { enabled: true }, fallback: { ...selection, enabled: true } });
   assert.match(enabled.notices[0].message, /cheap\/cheap\/model \(low\)/);
@@ -122,7 +122,7 @@ test("enabling without a model saves only the switch and remains inactive", asyn
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true } });
   assert.equal(current.dialogs.length, 1);
-  assert.match(current.notices[0].message, /No fallback model configured; inactive/);
+  assert.match(current.notices[0].message, /No separate summary model configured; inactive/);
 });
 
 test("configuring a model after enabling the switch preserves the on state", async () => {
@@ -293,7 +293,7 @@ test("TUI Enter toggles twice on the same settings row without a secondary scree
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
     version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
   });
-  assert.match(rendered.join("\n"), /Fallback model/);
+  assert.match(rendered.join("\n"), /Use separate summary model/);
 });
 
 test("TUI fuzzy search filters models by name while keeping the switch off", async () => {
@@ -327,7 +327,7 @@ test("RPC V2 toggle saves the switch and preserves the fallback selection", asyn
   const current = await fixture([firstChoice]);
   await current.run();
   assert.deepEqual(current.dialogs[0].options, [
-    "Remote Compaction V2: On", "Fallback model: On", "Choose fallback model and thinking level",
+    "Remote Compaction V2: On", "Use separate summary model: On", "Summary model and thinking level",
   ]);
   assert.equal(current.dialogs.length, 1);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
@@ -357,8 +357,35 @@ test("TUI V2 Enter toggles twice on the same row without opening a secondary scr
     version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
   });
   const menu = rendered.join("\n");
-  assert.ok(menu.indexOf("Remote Compaction V2") < menu.indexOf("Fallback model"));
-  assert.ok(menu.indexOf("Fallback model") < menu.indexOf("Model and thinking level"));
+  assert.ok(menu.indexOf("Remote Compaction V2") < menu.indexOf("Use separate summary model"));
+  assert.ok(menu.indexOf("Use separate summary model") < menu.indexOf("Summary model and thinking level"));
+});
+
+test("native settings descriptions explain V2 routing and the separate summary model switch", async () => {
+  const current = await fixture([]);
+  const frames: string[] = [];
+  driveTui(current, [["\u001b[B", "\u001b[B", "\u001b"]], (lines) => {
+    frames.push(lines.map(stripVTControlCharacters).join("\n"));
+  });
+  await current.run();
+  assert.match(frames[0], /When On, try V2 with the chat model/);
+  assert.match(frames[0], /The settings below choose their model/);
+  assert.match(frames[1], /Text summaries are used when V2 is off, unsupported, or fails/);
+  assert.match(frames[1], /No separate summary model configured; inactive/);
+  assert.match(frames[2], /used when "Use separate summary model" is On/);
+  assert.match(frames[2], /Choosing a model does not enable the switch or change the chat model/);
+  await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
+});
+
+test("RPC settings explain when the separate summary model is used", async () => {
+  await writeSettings();
+  const current = await fixture([undefined]);
+  await current.run();
+  assert.match(current.dialogs[0].title, /Text summaries are used when V2 is off, unsupported, or fails/);
+  assert.match(current.dialogs[0].title, /Text summaries will use/);
+  assert.deepEqual(current.dialogs[0].options, [
+    "Remote Compaction V2: On", "Use separate summary model: On", "Summary model and thinking level",
+  ]);
 });
 
 test("changing the fallback model preserves the V2 off switch", async () => {
@@ -411,8 +438,8 @@ const invalidFallbackError = `Could not read compaction settings at ${settingsPa
 
 function assertInvalidTuiMenu(rendered: readonly string[]) {
   const lines = rendered.map(stripVTControlCharacters);
-  assert.match(lines.join("\n"), /Fallback model\s+Invalid/);
-  assert.match(lines.join("\n"), /Model and thinking level\s+Invalid/);
+  assert.match(lines.join("\n"), /Use separate summary model\s+Invalid/);
+  assert.match(lines.join("\n"), /Summary model and thinking level\s+Invalid/);
   assert.ok(lines.some((line) => line.trim() === invalidFallbackError), "the fallback row describes the exact settings error");
 }
 
@@ -422,7 +449,7 @@ test("RPC opens an invalid fallback menu with its validation error and leaves ca
   await current.run();
   assert.deepEqual(current.dialogs, [{
     title: invalidFallbackError,
-    options: ["Remote Compaction V2: On", "Fallback model: Invalid", "Choose fallback model and thinking level"],
+    options: ["Remote Compaction V2: On", "Use separate summary model: Invalid", "Summary model and thinking level"],
   }]);
   assert.deepEqual(current.notices, []);
   assert.equal(await readFile(settingsPath, "utf8"), invalidFallbackSettings);
@@ -454,7 +481,7 @@ for (const mode of ["rpc", "tui"] as const) {
       if (rendered) assertInvalidTuiMenu(rendered);
       else {
         assert.equal(current.dialogs[0].title, invalidFallbackError);
-        assert.equal(current.dialogs[0].options[1], "Fallback model: Invalid");
+        assert.equal(current.dialogs[0].options[1], "Use separate summary model: Invalid");
       }
     });
   }
@@ -484,7 +511,7 @@ for (const mode of ["rpc", "tui"] as const) {
     });
     assert.equal(current.notices.length, 1);
     assert.equal(current.notices[0].level, "info");
-    assert.match(current.notices[0].message, /Fallback model is Off/);
+    assert.match(current.notices[0].message, /Separate summary model is Off/);
   });
 
   test(`${mode} toggling V2 writes a normalized valid legacy fallback with explicit enabled`, async () => {
@@ -507,7 +534,7 @@ test("TUI invalid fallback model row explains how to replace the invalid setting
   driveTui(current, [["\u001b[B", "\u001b[B", "\u001b"]], (frame) => { selectedFrame = frame; });
   await current.run();
   const lines = selectedFrame.map(stripVTControlCharacters);
-  assert.match(lines.join("\n"), /Model and thinking level\s+Invalid/);
+  assert.match(lines.join("\n"), /Summary model and thinking level\s+Invalid/);
   const description = "Choose a model to replace the invalid fallback settings.";
   assert.ok(lines.some((line) => line.trim() === description),
     `Expected the model row to describe: ${description}\nRendered menu:\n${lines.join("\n")}`);
