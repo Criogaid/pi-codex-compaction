@@ -202,3 +202,53 @@ test("clones and appends compaction items without validating or normalizing them
     assert.notEqual(result[1].metadata, item.metadata);
   }
 });
+
+test("optional retention budgets preserve the default ceiling and allow opaque-only history", async () => {
+  const newest = user("x".repeat(RETAINED_MESSAGE_TOKEN_BUDGET * 4));
+  const prepared = await prepareRetention([user("older"), newest], new AbortController().signal);
+  const expected = [newest, opaque];
+  assert.deepEqual(buildReplacementHistory(prepared, opaque), expected);
+  assert.deepEqual(buildReplacementHistory(prepared, opaque, RETAINED_MESSAGE_TOKEN_BUDGET), expected);
+  assert.deepEqual(buildReplacementHistory(prepared, opaque, RETAINED_MESSAGE_TOKEN_BUDGET + 1), expected);
+  assert.deepEqual(buildReplacementHistory(prepared, opaque, Number.MAX_SAFE_INTEGER), expected);
+  const empty = buildReplacementHistory(prepared, opaque, 0);
+  assert.deepEqual(empty, [opaque]);
+  assert.notEqual(empty[0], opaque, "opaque-only history remains independently owned");
+});
+
+test("rejects invalid optional retention budgets instead of silently disabling the bound", async () => {
+  const prepared = await prepareRetention([user("retained")], new AbortController().signal);
+  for (const budget of [-1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => buildReplacementHistory(prepared, opaque, budget), /Invalid retained-message token budget/);
+  }
+});
+
+test("a smaller optional budget keeps the newest message and truncates an older Unicode boundary safely", async () => {
+  const boundary = user(`HEAD${"😀".repeat(12)}TAIL`);
+  const newest = user("lastlast");
+  const input = [user("excluded older input"), boundary, newest];
+  const saved = structuredClone(input);
+  const prepared = await prepareRetention(input, new AbortController().signal);
+  const retained = buildReplacementHistory(prepared, opaque, 6);
+  assert.equal(retained.length, 3);
+  assert.deepEqual(content(retained[0]), [{ type: "input_text", text: "HEAD😀…10 tokens truncated…😀TAIL" }]);
+  assert.deepEqual(retained.slice(1), [newest, opaque]);
+  assert.doesNotMatch(JSON.stringify(retained), /\uFFFD/);
+  assert.deepEqual(input, saved);
+});
+
+test("small optional budgets include or discard an image and both labels atomically without backfilling", async () => {
+  const image = { type: "input_image", file_id: "original", detail: "original" };
+  const boundary = { role: "user", content: [
+    { type: "input_text", text: "<image>" }, image, { type: "input_text", text: "</image>" },
+  ] };
+  const newest = user("last");
+  const input = [user("old"), boundary, newest];
+  const saved = structuredClone(input);
+  const prepared = await prepareRetention(input, new AbortController().signal, { images: { bytes: () => 20 } });
+  // The five-token image needs four additional tokens for its two labels, plus the newest user token.
+  assert.deepEqual(buildReplacementHistory(prepared, opaque, 10), [boundary, newest, opaque]);
+  assert.deepEqual(buildReplacementHistory(prepared, opaque, 9), [newest, opaque]);
+  assert.deepEqual(buildReplacementHistory(prepared, opaque, 1), [newest, opaque]);
+  assert.deepEqual(input, saved, "repeated preparation attempts do not mutate the source or its labels");
+});

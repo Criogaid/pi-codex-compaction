@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { after } from "node:test";
 import { zstdDecompressSync } from "node:zlib";
 import assert from "node:assert/strict";
-import { InMemoryCredentialStore, InMemoryModelsStore, type AuthResult, type Provider } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, InMemoryModelsStore, type Api, type AuthResult, type Model, type Provider } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
@@ -43,7 +43,9 @@ export interface SessionRequest {
 /** Exercise real Pi sessions and provider serialization; replace only network I/O with bounded SSE fixtures. */
 export async function sessionFixture(options: {
   readonly api?: "openai-responses" | "openai-codex-responses";
-  readonly extensions: readonly ExtensionFactory[];
+  readonly extensions: readonly ExtensionFactory[] | ((fetch: typeof globalThis.fetch) => readonly ExtensionFactory[]);
+  readonly models?: (base: Model<Api>) => readonly Model<Api>[];
+  readonly settings?: Parameters<typeof SettingsManager.inMemory>[0];
   readonly respond?: (request: SessionRequest) => Response | undefined | Promise<Response | undefined>;
 }) {
   const directory = await mkdtemp(join(tmpdir(), "pi-compaction-session-"));
@@ -53,11 +55,15 @@ export async function sessionFixture(options: {
   const provider: Provider = api === "openai-responses" ? openaiProvider() : openaiCodexProvider();
   const catalogModel = provider.getModels().find((model) => model.id === "gpt-6.1-sol");
   assert.ok(catalogModel);
-  const model = { ...catalogModel, contextWindow: 32_000, maxTokens: 4_096,
+  const baseModel = { ...catalogModel, contextWindow: 32_000, maxTokens: 4_096,
     compat: { ...catalogModel.compat, supportsStore: false, remoteCompaction: { protocol: "v2" } } };
+  const models = options.models?.(baseModel) ?? [baseModel];
+  const model = models[0];
+  assert.ok(model);
   const fetch: typeof globalThis.fetch = async (input, init) => {
     assert.ok(requests.length < 40, "Fixture request limit exceeded");
     const request = new Request(input, init);
+    request.signal.throwIfAborted();
     const bytes = Buffer.from(await request.arrayBuffer());
     const body = request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
     const payload: unknown = JSON.parse(body.toString("utf8"));
@@ -93,23 +99,25 @@ export async function sessionFixture(options: {
   });
   const accessToken = `fixture.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.signature`;
   runtime.registerNativeProvider({
-    ...provider, getModels: () => [model], getAllModels: () => [model],
+    ...provider, getModels: () => [...models], getAllModels: () => [...models],
     auth: { apiKey: { name: "Fixture", resolve: async () => ({ auth: { apiKey: accessToken } }) } },
     streamSimple(current, context, settings) {
-      return provider.streamSimple(current, context, { ...settings, fetch });
+      return provider.streamSimple(current, context, { ...settings,
+        fetch: typeof options.extensions === "function" ? settings?.fetch ?? fetch : fetch });
     },
   });
   const settingsManager = SettingsManager.inMemory({
     transport: "sse",
     compaction: { enabled: false, reserveTokens: 1_024, keepRecentTokens: 128 },
     retry: { enabled: false, provider: { maxRetries: 0 } },
+    ...options.settings,
   });
   async function start(manager: SessionManager) {
     const loader = new DefaultResourceLoader({
       cwd: directory, agentDir: directory, settingsManager,
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       systemPromptOverride: () => "You are a fixture assistant. Preserve the task's constraints.",
-      extensionFactories: [...options.extensions],
+      extensionFactories: [...(typeof options.extensions === "function" ? options.extensions(fetch) : options.extensions)],
     });
     await loader.reload();
     const { session, extensionsResult } = await createAgentSession({
@@ -129,7 +137,7 @@ export async function sessionFixture(options: {
   }
   return {
     get session() { return session; },
-    model, runtime, requests, errors,
+    model, models, runtime, requests, errors,
     async reopen() {
       const path = session.sessionManager.getSessionFile();
       assert.ok(path);

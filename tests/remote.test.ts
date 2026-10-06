@@ -223,7 +223,7 @@ for (const [configured, retries] of [[undefined, 2], [0, 0], [1, 1], [2, 2], [9,
         });
       },
     }), Error);
-    assert.equal(observed?.maxRetries, retries);
+    assert.equal(observed?.maxRetries, 0, "The complete-stream retry loop owns the only retry budget");
     assert.equal(observed?.maxRetryDelayMs, 1);
     assert.equal(attempts, retries + 1);
   });

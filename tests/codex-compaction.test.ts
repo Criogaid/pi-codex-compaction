@@ -209,9 +209,14 @@ async function context(overrides: Record<string, unknown> = {}) {
   const notifications: Array<{ message: string; level: string }> = [];
   const statuses = new Map<string, string | undefined>();
   const entries = (overrides.entries as SessionEntry[] | undefined) ?? branch();
+  let requestController = new AbortController();
+  let abortCount = 0;
   const ctx = {
     model,
     hasUI: true,
+    get signal() { return requestController.signal; },
+    abort() { abortCount++; requestController.abort(); },
+    isIdle: () => true,
     getSystemPrompt: () => "system",
     ui: {
       notify: (message: string, level: string) => notifications.push({ message, level }),
@@ -224,7 +229,11 @@ async function context(overrides: Record<string, unknown> = {}) {
     modelRegistry: await testRegistry(fakeProvider()),
     ...overrides,
   };
-  return { ctx: ctx as unknown as ExtensionContext, notifications, statuses };
+  return {
+    ctx: ctx as unknown as ExtensionContext, notifications, statuses,
+    get abortCount() { return abortCount; },
+    beginRequest() { requestController = new AbortController(); },
+  };
 }
 
 function sseResponse() {
@@ -435,7 +444,7 @@ test("creates and resumes a checkpoint for a configured custom provider", async 
   assert.match(JSON.stringify(rewritten.input.at(-1)), /later/);
 });
 
-test("provider switches do not replay opaque history", async () => {
+test("provider switches stop requests before replay and preserve the opaque checkpoint", async () => {
   const mock = mockPi();
   createCodexCompactionExtension()(mock.pi);
   const details = parseCheckpointDetails({
@@ -465,11 +474,28 @@ test("provider switches do not replay opaque history", async () => {
   };
   const switchedModel = { ...model, provider: "other" };
   const switched = await context({ model: switchedModel, entries: [entry] });
-  const project = mock.events.get("context")?.[0];
-  assert.equal(await project?.({ type: "context", messages: [] }, switched.ctx), undefined);
+  const savedEntry = structuredClone(entry);
   const select = mock.events.get("model_select")?.[0];
   await select?.({ type: "model_select", model: switchedModel }, switched.ctx);
+  assert.equal(switched.abortCount, 0, "an idle selection warns without aborting a request");
   assert.equal(switched.notifications[0]?.level, "warning");
+  assert.match(switched.notifications[0].message, /incompatible/);
+  const project = mock.events.get("context")?.[0];
+  assert.ok(project);
+  await assert.rejects(async () => project({ type: "context", messages: [] }, switched.ctx), /incompatible/);
+  assert.equal(switched.abortCount, 1);
+  assert.equal(switched.ctx.signal?.aborted, true, "abort is required because Pi catches hook exceptions");
+  switched.beginRequest();
+  const rewrite = mock.events.get("before_provider_request")?.[0];
+  assert.ok(rewrite);
+  await assert.rejects(async () => rewrite({ type: "before_provider_request", payload: {
+    model: switchedModel.id,
+    input: [{ role: "user", content: [{ type: "input_text", text: checkpointMarker(details.checkpointId) }] }],
+  } }, switched.ctx), /incompatible/);
+  assert.equal(switched.abortCount, 2);
+  assert.equal(switched.ctx.signal?.aborted, true);
+  assert.deepEqual(switched.notifications.map((notice) => notice.level), ["warning", "error", "error"]);
+  assert.deepEqual(entry, savedEntry);
 });
 
 test("configured auth failures fall back to native Pi compaction", async () => {
@@ -902,7 +928,7 @@ for (const blockImages of [true, false]) {
   });
 }
 
-test("preserves Pi reasoning and retry settings while fixing V2 transport to SSE", async () => {
+test("preserves Pi reasoning and retry delay while V2 owns retries and uses SSE", async () => {
   const settings: TestSettings = { transport: "websocket", thinkingBudgets: { minimal: 16, low: 32, medium: 64, high: 128 },
     retry: { maxRetries: 17, provider: { maxRetries: 9, maxRetryDelayMs: 321 } }, websocketConnectTimeoutMs: 0 };
   const observed: SimpleStreamOptions[] = [];
@@ -915,7 +941,7 @@ test("preserves Pi reasoning and retry settings while fixing V2 transport to SSE
   assert.ok(await compact(compactEvent(), current.ctx));
   assert.equal(observed[0].transport, "sse");
   assert.deepEqual(observed[0].thinkingBudgets, settings.thinkingBudgets);
-  assert.equal(observed[0].maxRetries, 2);
+  assert.equal(observed[0].maxRetries, 0, "the V2 retry loop owns the request budget; provider retries must not multiply it");
   assert.equal(observed[0].maxRetryDelayMs, 321);
   assert.equal(observed[0].websocketConnectTimeoutMs, undefined);
   settings.transport = "sse";
@@ -984,7 +1010,7 @@ test("falls back to text classification when a provider inserts an extra user it
   ]);
 });
 
-test("warns about failed projection once per session and checkpoint and resets on session start", async () => {
+test("stops every failed projection request across sessions and checkpoints", async () => {
   const mock = mockPi();
   createCodexCompactionExtension()(mock.pi);
   const session = SessionManager.inMemory();
@@ -1000,40 +1026,53 @@ test("warns about failed projection once per session and checkpoint and resets o
   const current = await context({ sessionManager: { getSessionId: () => sessionId, getBranch: () => session.getBranch() } });
   const project = mock.events.get("context")?.[0];
   assert.ok(project);
+  let failures = 0;
   const failProjection = async () => {
+    current.beginRequest();
+    const savedBranch = structuredClone(session.getBranch());
     const messages = session.buildSessionProjection().messages.filter((message) => message.role !== "system")
       .map((message) => message.role === "user" ? { ...message, content: "changed by another context hook" } : message);
-    assert.equal(await project({ type: "context", messages }, current.ctx), undefined);
+    await assert.rejects(async () => project({ type: "context", messages }, current.ctx), /no longer matches the retained messages/);
+    failures++;
+    assert.equal(current.abortCount, failures);
+    assert.equal(current.ctx.signal?.aborted, true);
+    assert.equal(current.notifications.length, failures);
+    assert.ok(current.notifications.every((notice) => notice.level === "error"));
+    assert.deepEqual(session.getBranch(), savedBranch);
   };
   await failProjection();
   await failProjection();
-  assert.equal(current.notifications.length, 1);
-  assert.equal(current.notifications[0].level, "warning");
   sessionId = "second-session";
   await failProjection();
-  assert.equal(current.notifications.length, 2);
   append();
   await failProjection();
   await failProjection();
-  assert.equal(current.notifications.length, 3);
   await mock.events.get("session_start")?.[0]?.({ type: "session_start" }, current.ctx);
   await failProjection();
-  assert.equal(current.notifications.length, 4);
+  assert.equal(current.abortCount, 6);
 });
 
-test("keeps projection failures silent without a UI or a compatible model identity", async () => {
+test("stops invalid checkpoint requests without a UI and on incompatible model identities", async () => {
   const session = SessionManager.inMemory();
   const message: AgentMessage = { role: "user", content: "kept", timestamp: 1 };
   const firstKept = session.appendMessage(message);
   const details = createCheckpointDetails({ identity: { ...capability, modelId: model.id },
     replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }], keptMessages: [message] });
   session.appendCompaction(fallbackSummary(details.checkpointId), firstKept, 100, details);
+  const savedBranch = structuredClone(session.getBranch());
   for (const overrides of [{ hasUI: false }, { model: { ...model, provider: "other" } }, { model: { ...model, api: "openai-completions" } }]) {
     const mock = mockPi();
     createCodexCompactionExtension()(mock.pi);
     const current = await context({ sessionManager: session, ...overrides });
-    assert.equal(await mock.events.get("context")?.[0]?.({ type: "context", messages: [] }, current.ctx), undefined);
-    assert.deepEqual(current.notifications, []);
+    const project = mock.events.get("context")?.[0];
+    assert.ok(project);
+    await assert.rejects(async () => project({ type: "context", messages: [] }, current.ctx),
+      overrides.hasUI === false ? /no longer matches the retained messages/ : /incompatible/);
+    assert.equal(current.abortCount, 1);
+    assert.equal(current.ctx.signal?.aborted, true);
+    if (overrides.hasUI === false) assert.deepEqual(current.notifications, []);
+    else assert.deepEqual(current.notifications.map((notice) => notice.level), ["error"]);
+    assert.deepEqual(session.getBranch(), savedBranch);
   }
 });
 

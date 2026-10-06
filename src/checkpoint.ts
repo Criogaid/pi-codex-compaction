@@ -12,7 +12,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { isObject, type JsonObject, REMOTE_COMPACTION_PROTOCOL, validateCompactionItem } from "./protocol.js";
 import {
+  normalizeCompactionModelMetadata,
   normalizeUrl,
+  type CompactionModelMetadata,
   type ProviderIdentity,
 } from "./capability.js";
 
@@ -20,7 +22,7 @@ export const CHECKPOINT_KIND = "pi-codex-compaction";
 export const CHECKPOINT_VERSION = 1;
 const EXTENSION_PACKAGE = "@criogaid/pi-codex-compaction";
 
-export interface CodexCheckpointDetails extends ProviderIdentity {
+export interface CodexCheckpointDetails extends ProviderIdentity, CompactionModelMetadata {
   kind: typeof CHECKPOINT_KIND;
   version: typeof CHECKPOINT_VERSION;
   checkpointId: string;
@@ -135,7 +137,12 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
   }
   try {
     const item = validateCompactionItem(value.replacementHistory.at(-1));
-    const parsed = structuredClone(value) as unknown as CodexCheckpointDetails;
+    const normalized = { ...value };
+    // Sanitize before cloning: invalid optional fields must not invalidate existing v1 history.
+    delete normalized.modelContextWindow;
+    delete normalized.compactionModelHash;
+    Object.assign(normalized, normalizeCompactionModelMetadata(value));
+    const parsed = structuredClone(normalized) as unknown as CodexCheckpointDetails;
     parsed.replacementHistory[parsed.replacementHistory.length - 1] = item;
     return parsed;
   } catch {
@@ -249,6 +256,7 @@ export function projectCheckpointRequest(
 
 export function createCheckpointDetails(input: {
   identity: ProviderIdentity;
+  modelMetadata?: CompactionModelMetadata;
   replacementHistory: JsonObject[];
   keptMessages: readonly AgentMessage[];
   checkpointId?: string;
@@ -259,6 +267,7 @@ export function createCheckpointDetails(input: {
     version: CHECKPOINT_VERSION,
     checkpointId: input.checkpointId ?? randomUUID(),
     ...input.identity,
+    ...normalizeCompactionModelMetadata(input.modelMetadata),
     protocol: REMOTE_COMPACTION_PROTOCOL,
     replacementHistory: structuredClone(input.replacementHistory),
     keptMessageFingerprints: input.keptMessages.map(fingerprintMessage),

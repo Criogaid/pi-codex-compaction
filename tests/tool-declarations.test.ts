@@ -78,8 +78,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         return toolCallResponse();
       } });
       try {
-        if (change === "tool search") Object.assign(fixture.model.compat, { supportsAdditionalTools: false, supportsToolSearch: true });
-        if (change === "thinking") Object.assign(fixture.model.compat, { supportsOpenAIGrammarTools: true });
+        if (change === "tool search") Object.assign(fixture.model.compat ??= {}, { supportsAdditionalTools: false, supportsToolSearch: true });
+        if (change === "thinking") Object.assign(fixture.model.compat ??= {}, { supportsOpenAIGrammarTools: true });
         await fixture.session.prompt(prompt(1));
         assert.ok(controls);
         if (change !== "thinking") controls.setActiveTools(["router", "internal_read", "visible_read"]);
