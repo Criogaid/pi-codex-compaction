@@ -29,7 +29,7 @@
 | 启用条件 | 默认关闭 TokenBudget 的通常路径按 provider capability 选择 V2/local；配置型 provider 的 OpenAI、识别为 Azure Responses 的 provider 支持 V2。这里没有模型 ID 包含 `gpt` 的规则。 | 显式 `compat.remoteCompaction` 优先；否则按两个 Responses API 和 `gpt` 子串决定是否尝试；允许自定义 provider 和同源端点。 | 有意扩展的 Pi 启用策略，不能说复制了原生模型门控。 |
 | 功能请求头 | 会话构造时无条件把 `remote_compaction_v2` 加入 beta feature 列表，正常 Responses 传输使用这份列表；配置中的旧 feature 开关已经移除。 | 通过 Pi 请求头变换器为压缩请求合并该 feature，固定 SSE，避免 Pi 既有 WebSocket 握手缺少新头。 | 压缩请求携带同一标识；头的生命周期和传输策略不同。 |
 | 端点与 V2 触发 | provider 的正常 `/responses` 路由；在输入末尾附加 `CompactionTrigger`。 | 根据 Pi API 推导正常 Responses/Codex Responses 地址，可同源覆盖；精确替换旧 checkpoint marker 后，追加唯一末尾 trigger。 | 核心 V2 形状一致；不是单独调用 `/responses/compact` 的实现。 |
-| 请求声明 | 从冻结的 step/tool router 取得模型可见工具与基础指令；走正常 ModelClient，沿用 reasoning、service tier、prompt cache key 等构造。 | 由 Pi ModelRegistry 序列化与认证，按会话、模型、后端、历史前缀及当前设置约束复用普通请求的工具声明和缓存字段；保留历史工具加载项。 | 可复用观察到的声明前缀；Pi 未公开隐藏状态修订号，不能等同于 Codex 的当前工具路由状态。 |
+| 请求声明 | 从冻结的 step/tool router 取得模型可见工具与基础指令；走正常 ModelClient，沿用 reasoning、service tier、prompt cache key 等构造。 | 由 Pi ModelRegistry 序列化与认证，按会话、模型、后端、历史前缀及当前设置约束复用普通请求的完整 wire 前缀和缓存相关字段。 | 覆盖已观察到的中途声明及历史投影；Pi 未公开隐藏状态修订号，不能等同于 Codex 的当前工具路由状态。 |
 | 思考等级 | `reasoning_effort_for_request(..., Compaction)` 可复用该窗口已经固定的原始 effort；失败不改变 live pin。 | 使用 Pi 当前 thinking level；满足条件时复用观察到的 reasoning 字段。Pi 没有移植 Codex 的 configuration-update/effort-pin 状态机。 | 普通情况相近；动态 effort override 状态机不同。 |
 | 压缩前容量裁剪 | 粗估模型可见内容，计入基础指令；从末尾开始替换工具输出，删掉附属 resize notice；遇到非输出项停止。有效窗口百分比默认 95，来自模型配置。 | 相同方向、替换文案、停止条件、notice 分组和主要估算项；直接采用 Pi `contextWindow × 95%`。 | 支持的 Pi 数据子集内移植程度高；95% 为固定默认，未读取 Codex 模型专有调整。 |
 | 文本估算与截断 | UTF-8 字节数除以 4 向上取整；保留头尾、删除中间，加入省略标记。 | 采用同一估算和中间截断策略，避免切断 Unicode 字符。 | 对正常有效文本可直接对应；这是启发式预算，不是真实 tokenizer。 |
@@ -59,7 +59,9 @@
 
 插件采用 Pi 的模型注册器，保留 Pi 的认证与序列化职责，并在会话、模型、后端、历史前缀、提示词、工具配置及设置满足约束时复用已观察的工具声明和请求字段。这不能导出 Codex 完整的工具路由、namespace、executed-tool metadata、环境/权限 contributor 或 MCP attribution。
 
-V2 保留顶层 `tools`、输入中的 `additional_tools` 和工具搜索声明及配对记录，避免主动删除声明改变普通请求的缓存前缀。内部 `Context.tools` 和系统工具元数据也用于正确序列化历史 custom-tool 调用及结果。没有可用快照时，由 Pi 根据会话声明构造请求。
+V2 保留顶层 `tools`、输入中的 `additional_tools` 和工具搜索声明及配对记录。快照匹配时直接复用完整 wire 前缀，包括中途隐藏工具的投影和 provider 钩子改写的历史，再拼接 Pi 序列化的新增尾部；本地边界项在发送前移除，已有 checkpoint 只展开一次。内部 `Context.tools` 和系统工具元数据用于序列化历史 custom-tool 调用及结果。没有可用快照时，由 Pi 根据会话声明构造请求。
+
+临时提示词结束后恢复到未改变的源提示词时，快照仍使用同一有效提示词匹配。复用字段包含 `parallel_tool_calls`、完整 `text` 和 `prompt_cache_options` 的模式/TTL；预热操作、诊断响应 ID、旧输出上限和传输开关不被复制。依赖服务端会话引用的 input 不作为完整前缀复用，仍由 Pi 重建本地历史。
 
 Pi 在 context hook 之后应用隐藏工具投影，且未公开可见性修订号。只改变隐藏状态而公开工具列表、选择和设置不变时，旧快照仍可能被复用；没有快照时，序列化后的声明也未必等于普通请求经过隐藏投影后的声明。本扩展没有完整移植 Codex 的工具与权限状态刷新。
 
@@ -158,7 +160,7 @@ main 已有额外的生命周期变化，应独立列出：
 | --- | --- |
 | 文字回退与检查点 | 两种 Responses API × V2 失败/关闭 × 启用/未启用独立摘要模型；已有检查点仍能生成文字摘要，旧持久化记录保持不变。 |
 | 图片读取设置 | 普通重放与递归压缩均不发送被阻止的明文图片；在下一次压缩前重新开启读取可再次使用旧记录中的图片；旧 checkpoint details 不被修改。 |
-| 工具声明与请求前缀 | 两种 API 下复用普通请求的声明与完整历史前缀；覆盖增删工具、工具搜索、思考变化、恢复会话、hide-only 变化及旧 checkpoint 展开；保留普通/custom-tool 调用与结果，不过滤工具加载记录。 |
+| 工具声明与请求前缀 | 两种 API 下复用完整 wire 前缀；覆盖临时提示词结束、中途隐藏工具、历史文本投影和显式缓存断点、缓存相关字段、恢复后再次压缩、隐藏上下文保留及重试时单次 checkpoint 展开；另覆盖工具/思考变更、hide-only 变化及普通/custom-tool 调用。 |
 | Codex 终止事件 | 实际 Codex adapter 的成功 response.done；拒绝未完成、失败和取消的 terminal status；仍要求唯一 compaction 输出项。 |
 | 配置竞争 | 已存在与首次创建的配置均只有一个基于旧版本的保存成功；持锁期间拒绝写入；释放后可保存；文件权限及临时文件清理。 |
 

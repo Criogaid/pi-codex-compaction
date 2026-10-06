@@ -25,7 +25,7 @@ const user = (content = "source", timestamp = 1): UserMessage => ({ role: "user"
 const system = (content = "canonical prompt", timestamp = 0): SystemMessage => ({ role: "system", content, timestamp });
 const declarationsInTranscript: RequestDeclarations = {
   blockImages: false,
-  systemPrompt: () => assert.fail("the transcript already declares its prompt"),
+  systemPrompt: () => "canonical prompt",
   tools: () => assert.fail("the transcript already declares its tools"),
 };
 const inputs: ProviderRequestInputs = {
@@ -255,7 +255,7 @@ const wirePayload = () => ({
   input: [{ type: "message", role: "developer", content: [{ type: "input_text", text: "wire-prefix" }] },
     { type: "additional_tools", tools: [{ type: "function", name: "internal_read", parameters: { type: "object" } }] },
     { type: "message", role: "user", content: [{ type: "input_text", text: "source" }] }],
-  previous_response_id: "old-response", max_output_tokens: 123, store: true, stream: false, metadata: { private: "not-copied" },
+  max_output_tokens: 123, store: true, stream: false, metadata: { private: "not-copied" },
 });
 
 test("observed declarations and cache fields survive newer messages without copying transient state", () => {
@@ -264,20 +264,21 @@ test("observed declarations and cache fields survive newer messages without copy
   const tracker = observedRequest(canonical, observed);
   const current = [...canonical, user("new turn", 2)];
   const snapshot = providerRequestFor(tracker.current(), sessionId, target, current, inputs);
-  assert.ok(snapshot);
+  assert.ok(snapshot?.prefix);
   observed.tools[0].name = "mutated-after-capture";
   observed.input[0].content?.push({ type: "input_text", text: "mutated-after-capture" });
-  const fresh = { model: model.id, input: [{ role: "system", content: "fresh prompt" }, { role: "user", content: "new turn" }],
+  const fresh = { model: model.id, input: [{ role: "system", content: "fresh prompt" },
+    { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] }, { role: "user", content: "new turn" }],
     tools: [], text: { verbosity: "high" }, max_output_tokens: 4_096, store: false, stream: true };
-  const result = applyProviderRequest(fresh, target, snapshot);
+  const { payload: result } = applyProviderRequest(fresh, target, snapshot);
   const original = wirePayload();
   assert.deepEqual(result.tools, original.tools);
   assert.deepEqual(result.reasoning, original.reasoning);
   assert.equal(result.prompt_cache_key, original.prompt_cache_key);
   assert.equal(result.prompt_cache_retention, original.prompt_cache_retention);
   assert.equal(result.service_tier, original.service_tier);
-  assert.deepEqual(result.text, { verbosity: original.text.verbosity });
-  assert.deepEqual(result.input, [...original.input.slice(0, 2), fresh.input[1]]);
+  assert.deepEqual(result.text, original.text);
+  assert.deepEqual(result.input, [...original.input, fresh.input[2]]);
   assert.equal(result.previous_response_id, undefined);
   assert.equal(result.metadata, undefined);
   assert.equal(result.max_output_tokens, fresh.max_output_tokens);
@@ -303,8 +304,12 @@ test("wire snapshots reject session, backend, source, prompt, tool, thinking and
     { ...inputs, settings: { transport: "websocket" as const } },
   ]) assert.equal(providerRequestFor(snapshots, sessionId, target, canonical, changed), undefined);
   const snapshot = providerRequestFor(snapshots, sessionId, target, canonical, inputs);
+  assert.ok(snapshot?.prefix);
   const fresh = wirePayload();
-  assert.equal(applyProviderRequest(fresh, otherBackend, snapshot), fresh);
+  const marked = { ...fresh, input: [...fresh.input, { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] }] };
+  assert.deepEqual(applyProviderRequest(marked, otherBackend, snapshot).payload, fresh);
+  assert.throws(() => applyProviderRequest(fresh, target, snapshot), /boundary/);
+  assert.throws(() => applyProviderRequest({ ...marked, input: [...marked.input, marked.input.at(-1)] }, target, snapshot), /boundary/);
 });
 
 test("missing wire fields remove obsolete defaults and malformed observations discard earlier snapshots", () => {
@@ -312,14 +317,18 @@ test("missing wire fields remove obsolete defaults and malformed observations di
   const payload = { model: model.id, input: [{ role: "user", content: "source" }] };
   const tracker = observedRequest(canonical, payload);
   const snapshot = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
-  assert.ok(snapshot);
-  const actual = applyProviderRequest(wirePayload(), target, snapshot);
+  assert.ok(snapshot?.prefix);
+  const fresh = wirePayload();
+  const actual = applyProviderRequest({ ...fresh, input: [...fresh.input,
+    { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] }] }, target, snapshot).payload;
   assert.equal(actual.instructions, undefined);
   assert.equal(actual.tools, undefined);
   assert.equal(actual.prompt_cache_key, undefined);
-  assert.deepEqual(actual.text, { format: { type: "json_object" } });
+  assert.equal(actual.text, undefined);
   for (const invalid of [null, {}, { ...payload, tools: "invalid" }, { ...payload, input: [null] },
-    { ...payload, reasoning: false }, { ...payload, text: { verbosity: 2 } }, { ...payload, prompt_cache_key: 1 }]) {
+    { ...payload, reasoning: false }, { ...payload, text: { verbosity: 2 } }, { ...payload, prompt_cache_key: 1 },
+    { ...payload, parallel_tool_calls: "false" }, { ...payload, text: { format: false } },
+    { ...payload, prompt_cache_options: true }, { ...payload, prompt_cache_options: { mode: false } }]) {
     tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt, () => ({ payload: invalid, inputs }));
     assert.equal(tracker.current().providerRequest, undefined);
   }
@@ -373,5 +382,38 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     assert.equal(calls[0].call_id, calls[1].call_id);
     assert.deepEqual(request.messages, canonical);
     assert.deepEqual(canonical, saved);
+  });
+}
+
+test("settled prompt overrides reuse matching wire state but reject a new effective prompt", () => {
+  const canonical = [system(), user()];
+  const tracker = observedRequest(canonical, wirePayload(), { ...inputs, systemPrompt: "forced prompt" });
+  assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, inputs));
+  assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, { ...inputs, systemPrompt: "forced prompt" }));
+  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, { ...inputs, systemPrompt: "new configured prompt" }), undefined);
+  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, { ...inputs, thinkingLevel: "high" }), undefined);
+  const request = compactionRequest(tracker.current(), sessionId, target, canonical,
+    { ...declarationsInTranscript, systemPrompt: () => "new configured prompt" });
+  assert.deepEqual(request.context.messages, canonical);
+});
+
+for (const reference of [
+  { previous_response_id: "server-response" },
+  { conversation: "server-conversation" },
+  { input: [{ type: "item_reference", id: "server-item" }] },
+]) {
+  test(`server history references preserve locally reconstructed history for ${Object.keys(reference)[0]}`, () => {
+    const canonical = [system(), user("full local history")];
+    const tracker = observedRequest(canonical, { ...wirePayload(), ...reference });
+    const snapshot = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+    assert.ok(snapshot);
+    assert.equal(snapshot.prefix, undefined);
+    const fresh = { model: model.id, input: [{ role: "user", content: "full local history" }] };
+    const { payload } = applyProviderRequest(fresh, target, snapshot);
+    assert.deepEqual(payload.input, fresh.input);
+    assert.equal(payload.previous_response_id, undefined);
+    assert.equal(payload.conversation, undefined);
+    assert.deepEqual(payload.tools, wirePayload().tools);
+    assert.equal(payload.prompt_cache_key, wirePayload().prompt_cache_key);
   });
 }

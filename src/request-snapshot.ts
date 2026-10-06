@@ -1,11 +1,13 @@
 // Own ordinary-request prompt and context snapshots that let compaction reuse Pi's projected request prefix,
 // and build compaction's provider context the way Pi 0.99 builds an ordinary request.
+import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, getSystemMessageText, type Context, type Message, type Tool } from "@earendil-works/pi-ai";
 import { convertToLlm, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
 import { type CodexCheckpointDetails, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
-import { isObject, type JsonObject } from "./protocol.js";
+import { CodexCompactionProtocolError, isObject, type JsonObject } from "./protocol.js";
+import { contextUserItems, userItemOrigins } from "./retention-input.js";
 
 const BLOCKED_IMAGE_TEXT = "Image reading is disabled.";
 
@@ -73,10 +75,12 @@ export function promptOverrideFor(
   sessionId: string,
   target: CapableModel,
   messages: readonly AgentMessage[],
+  currentPrompt: string,
 ): PromptOverride | undefined {
   const scoped = snapshotFor(override, sessionId, target);
   const head = scoped && sourceHead(messages);
-  return head && fingerprintMessage(head) === scoped.sourceFingerprint ? scoped : undefined;
+  return head && fingerprintMessage(head) === scoped.sourceFingerprint &&
+    (currentPrompt === scoped.text || currentPrompt === getSystemMessageText(head)) ? scoped : undefined;
 }
 
 export function captureContextSnapshot(
@@ -127,6 +131,9 @@ interface ProviderRequestFields {
   readonly instructions?: string;
   readonly tools?: readonly JsonObject[];
   readonly reasoning?: JsonObject;
+  readonly parallel_tool_calls?: boolean;
+  readonly text?: JsonObject;
+  readonly prompt_cache_options?: { readonly mode?: string; readonly ttl?: string };
   readonly prompt_cache_key?: string;
   readonly prompt_cache_retention?: string;
   readonly service_tier?: string;
@@ -136,14 +143,13 @@ export interface ProviderRequestSnapshot extends SnapshotScope {
   readonly sourceFingerprints: readonly string[];
   readonly inputsKey: string;
   readonly fields: ProviderRequestFields;
-  readonly verbosity?: string;
-  readonly prefix: readonly JsonObject[];
-}
-
-function declarationPrefix(input: readonly JsonObject[]): readonly JsonObject[] {
-  const end = input.findIndex((item) => item.type !== "additional_tools" &&
-    !((item.type === undefined || item.type === "message") && (item.role === "system" || item.role === "developer")));
-  return end < 0 ? input : input.slice(0, end);
+  /** Absent when the observed input depends on server-side conversation state. */
+  readonly prefix?: {
+    readonly boundary: string;
+    readonly contextLength: number;
+    readonly input: readonly JsonObject[];
+    readonly contextual: readonly boolean[];
+  };
 }
 
 function requestInputsKey(target: CapableModel, inputs: ProviderRequestInputs): string {
@@ -155,20 +161,36 @@ function captureProviderRequest(
 ): ProviderRequestSnapshot | undefined {
   if (!isObject(payload) || payload.model !== target.model.id ||
     !Array.isArray(payload.input) || !payload.input.every(isObject)) return undefined;
-  const { instructions, tools, reasoning, prompt_cache_key, prompt_cache_retention, service_tier, text } = payload;
+  const { instructions, tools, reasoning, parallel_tool_calls, prompt_cache_key, prompt_cache_retention, prompt_cache_options, service_tier, text } = payload;
   const verbosity = isObject(text) ? text.verbosity : undefined;
+  const format = isObject(text) ? text.format : undefined;
+  const mode = isObject(prompt_cache_options) ? prompt_cache_options.mode : undefined;
+  const ttl = isObject(prompt_cache_options) ? prompt_cache_options.ttl : undefined;
   if ((instructions !== undefined && typeof instructions !== "string") ||
     (tools !== undefined && (!Array.isArray(tools) || !tools.every(isObject))) ||
     (reasoning !== undefined && !isObject(reasoning)) ||
+    (parallel_tool_calls !== undefined && typeof parallel_tool_calls !== "boolean") ||
+    (format !== undefined && !isObject(format)) ||
+    (prompt_cache_options !== undefined && !isObject(prompt_cache_options)) ||
+    (mode !== undefined && typeof mode !== "string") || (ttl !== undefined && typeof ttl !== "string") ||
     (prompt_cache_key !== undefined && typeof prompt_cache_key !== "string") ||
     (prompt_cache_retention !== undefined && typeof prompt_cache_retention !== "string") ||
     (service_tier !== undefined && typeof service_tier !== "string") ||
     (text !== undefined && !isObject(text)) || (verbosity !== undefined && typeof verbosity !== "string")) return undefined;
+  const contextual = contextUserItems(payload.input, userItemOrigins(context.messages));
+  // Copy policy only: a diagnostic response ID or prewarm operation belongs to the observed request.
+  const cachePolicy = mode !== undefined || ttl !== undefined ? { mode, ttl } : undefined;
+  const serverHistory = payload.previous_response_id != null || payload.conversation != null ||
+    payload.input.some((item) => item.type === "item_reference");
   return {
     sessionId: context.sessionId, identity: context.identity, sourceFingerprints: context.sourceFingerprints,
     inputsKey: requestInputsKey(target, inputs),
-    fields: structuredClone({ instructions, tools, reasoning, prompt_cache_key, prompt_cache_retention, service_tier }),
-    verbosity, prefix: structuredClone(declarationPrefix(payload.input)),
+    fields: structuredClone({ instructions, tools, reasoning, parallel_tool_calls, text, prompt_cache_key,
+      prompt_cache_retention, prompt_cache_options: cachePolicy, service_tier }),
+    prefix: serverHistory ? undefined : {
+      boundary: `PI_CODEX_REQUEST_BOUNDARY_${randomUUID()}`, contextLength: context.messages.length,
+      input: structuredClone(payload.input), contextual: payload.input.map((item) => contextual.has(item)),
+    },
   };
 }
 
@@ -177,25 +199,38 @@ export function providerRequestFor(
   snapshots: RequestSnapshots, sessionId: string, target: CapableModel, current: readonly AgentMessage[], inputs: ProviderRequestInputs,
 ): ProviderRequestSnapshot | undefined {
   const snapshot = snapshotFor(snapshots.providerRequest, sessionId, target);
+  const override = promptOverrideFor(snapshots.promptOverride, sessionId, target, current, inputs.systemPrompt);
+  const effectiveInputs = override ? { ...inputs, systemPrompt: override.text } : inputs;
   return snapshot && matchingSource(current, snapshot) &&
-    snapshot.inputsKey === requestInputsKey(target, inputs) ? snapshot : undefined;
+    snapshot.inputsKey === requestInputsKey(target, effectiveInputs) ? snapshot : undefined;
 }
 
-/** Replace only declarations and cache-related fields; Pi owns transport, output limits, and response state. */
+/** Replace the serialized prefix up to the private boundary; never let that boundary reach the provider. */
 export function applyProviderRequest(
   payload: JsonObject, target: CapableModel, snapshot: ProviderRequestSnapshot | undefined,
-): JsonObject {
-  if (!snapshot || !sameBackend(snapshot.identity, target.identity) || !sameModel(snapshot.identity, target.model) ||
-    payload.model !== target.model.id || !Array.isArray(payload.input) || !payload.input.every(isObject)) return payload;
-  const updated: JsonObject = { ...payload, ...structuredClone(snapshot.fields),
-    input: [...structuredClone(snapshot.prefix), ...payload.input.slice(declarationPrefix(payload.input).length)] };
-  if (isObject(payload.text) || snapshot.verbosity !== undefined) {
-    const text = { ...(isObject(payload.text) ? payload.text : {}) };
-    delete text.verbosity;
-    if (snapshot.verbosity !== undefined) text.verbosity = snapshot.verbosity;
-    updated.text = Object.keys(text).length ? text : undefined;
+  contextItems: ReadonlySet<JsonObject> = new Set(),
+): { readonly payload: JsonObject; readonly contextual: readonly boolean[] } {
+  const input = Array.isArray(payload.input) && payload.input.every(isObject) ? payload.input : undefined;
+  if (!snapshot) return { payload, contextual: input?.map((item) => contextItems.has(item)) ?? [] };
+  const compatible = sameBackend(snapshot.identity, target.identity) && sameModel(snapshot.identity, target.model) && payload.model === target.model.id;
+  const prefix = snapshot.prefix;
+  if (!prefix) return { payload: compatible ? { ...payload, ...structuredClone(snapshot.fields) } : payload,
+    contextual: input?.map((item) => contextItems.has(item)) ?? [] };
+  if (!input) throw new CodexCompactionProtocolError("Prepared request cannot locate the snapshot boundary");
+  const matches = input.flatMap((item, index) => item.role === "user" && Array.isArray(item.content) &&
+    item.content.length === 1 && isObject(item.content[0]) && item.content[0].type === "input_text" &&
+    item.content[0].text === prefix.boundary ? [index] : []);
+  if (matches.length !== 1) throw new CodexCompactionProtocolError("Prepared request must contain exactly one snapshot boundary");
+  const boundaryIndex = matches[0];
+  const suffix = input.slice(boundaryIndex + 1);
+  if (!compatible) {
+    const unmarked = [...input.slice(0, boundaryIndex), ...suffix];
+    return { payload: { ...payload, input: unmarked }, contextual: unmarked.map((item) => contextItems.has(item)) };
   }
-  return updated;
+  return {
+    payload: { ...payload, ...structuredClone(snapshot.fields), input: [...structuredClone(prefix.input), ...suffix] },
+    contextual: [...prefix.contextual, ...suffix.map((item) => contextItems.has(item))],
+  };
 }
 
 /** The snapshots that the latest ordinary request left for compaction. */
@@ -306,9 +341,18 @@ export function compactionRequest(
   target: CapableModel,
   current: AgentMessage[],
   declarations: RequestDeclarations,
+  providerRequest?: ProviderRequestSnapshot,
 ): { readonly context: Context; readonly messages: AgentMessage[] } {
-  const override = promptOverrideFor(snapshots.promptOverride, sessionId, target, current);
-  const messages = reuseContextSnapshot(current, snapshotFor(snapshots.context, sessionId, target));
+  const override = snapshots.promptOverride && promptOverrideFor(snapshots.promptOverride, sessionId, target, current, declarations.systemPrompt());
+  const reused = reuseContextSnapshot(current, snapshotFor(snapshots.context, sessionId, target));
+  // The provider serializes the full transcript so grammar declarations and historical IDs keep their context.
+  // This private user item marks the join; applyProviderRequest removes it and everything before it.
+  const prefix = providerRequest?.prefix;
+  const messages: AgentMessage[] = prefix ? [
+    ...reused.slice(0, prefix.contextLength),
+    { role: "user", content: prefix.boundary, timestamp: 0 },
+    ...reused.slice(prefix.contextLength),
+  ] : reused;
   const converted = convertToLlm(messages);
   const llmMessages = declarations.blockImages ? withoutImages(converted) : converted;
   const overridden = override && applyPromptOverride(llmMessages, override);

@@ -164,3 +164,54 @@ test("a saved v1 checkpoint resumes through a real session after the package ren
     await fixture.close();
   }
 });
+
+for (const api of ["openai-responses", "openai-codex-responses"] as const) {
+  test(`${api} keeps the wire prefix after a forced prompt settles and across repeated checkpoints`, { timeout: 20_000 }, async () => {
+    let hiddenMessages = 0;
+    const projectRequest: ExtensionFactory = (pi) => {
+      pi.on("before_agent_start", (event) => ({
+        systemPrompt: `${event.systemPrompt}\n\nKeep the per-run memory instructions.`,
+        message: { customType: "hidden-context", content: `Private context ${++hiddenMessages}`, display: false },
+      }));
+      pi.on("before_provider_request", (event) => {
+        assert.ok(isObject(event.payload) && Array.isArray(event.payload.input));
+        return { ...event.payload, previous_response_id: undefined, parallel_tool_calls: false,
+          text: { verbosity: "medium", format: { type: "json_object" } },
+          prompt_cache_options: { mode: "explicit", ttl: "30m", comparison_response_id: "old-diagnostic-response", prewarm: false },
+          input: event.payload.input.map((item) => {
+            if (!isObject(item) || item.role !== "user" || !Array.isArray(item.content)) return item;
+            return { ...item, content: item.content.map((part) => isObject(part) && part.type === "input_text" &&
+              typeof part.text === "string" && part.text.startsWith("Task ")
+              ? { ...part, text: `Projected ${part.text}`, prompt_cache_breakpoint: { mode: "explicit" } } : part) };
+          }),
+        };
+      });
+    };
+    const fixture = await sessionFixture({ api, extensions: [requestTransform(), projectRequest, createCodexCompactionExtension()] });
+    try {
+      for (let cycle = 0; cycle < 2; cycle++) {
+        for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${cycle}/${turn}. ${"Keep the decisions. ".repeat(80)}`);
+        const ordinary = fixture.requests.at(-1)?.payload;
+        assert.ok(ordinary && Array.isArray(ordinary.input));
+        await fixture.session.compact();
+        const compact = fixture.requests.at(-1)?.payload;
+        assert.ok(compact && Array.isArray(compact.input));
+        for (const field of ["tools", "instructions", "parallel_tool_calls", "text", "reasoning", "prompt_cache_key", "service_tier"]) {
+          assert.deepEqual(compact[field], ordinary[field], `Compaction preserves ${field} after the run settles`);
+        }
+        assert.deepEqual(compact.prompt_cache_options, { mode: "explicit", ttl: "30m" });
+        assert.deepEqual(compact.input.slice(0, ordinary.input.length), ordinary.input);
+        assert.equal(compact.input.filter((item) => isObject(item) && item.type === "compaction").length, cycle);
+        assert.equal(compact.input.filter((item) => isObject(item) && item.type === "compaction_trigger").length, 1);
+        assert.ok(JSON.stringify(compact.input.slice(ordinary.input.length)).includes(`Fixture reply ${fixture.requests.length - 1}.`), "The newest assistant reply is appended once");
+        const saved = fixture.session.sessionManager.getBranch().findLast((entry) => entry.type === "compaction");
+        assert.ok(saved);
+        assert.ok(!JSON.stringify(saved.details).includes("Private context"), "Hidden extension messages stay out of plaintext retention");
+        if (cycle === 0) await fixture.reopen();
+      }
+      assert.deepEqual(fixture.errors, []);
+    } finally {
+      await fixture.close();
+    }
+  });
+}

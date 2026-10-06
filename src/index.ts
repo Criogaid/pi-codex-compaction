@@ -217,17 +217,18 @@ async function compactRemotely(
     }
     const current = projectedCurrentMessages(event, supported.identity);
     const inputs = providerRequestInputs(pi, ctx);
+    const providerRequest = providerRequestFor(snapshots, sessionId, supported, current.messages, inputs);
     const request = compactionRequest(snapshots, sessionId, supported, current.messages, {
       blockImages: settings.images?.blockImages ?? false,
       systemPrompt: () => ctx.getSystemPrompt(),
       tools: () => activeTools(pi),
-    });
+    }, providerRequest);
     const response = await requestRemoteCompaction({
       modelRegistry: ctx.modelRegistry,
       model: supported.model,
       context: request.context,
       userItemOrigins: userItemOrigins(request.messages),
-      providerRequest: providerRequestFor(snapshots, sessionId, supported, current.messages, inputs),
+      providerRequest,
       reasoning,
       sessionId,
       thinkingBudgets: settings.thinkingBudgets,
@@ -360,7 +361,8 @@ export function createCodexCompactionExtension(
         capableModel(ctx.model),
         () => canonicalMessages(ctx),
         () => ctx.getSystemPrompt(),
-        () => ({ payload: payload ?? event.payload, inputs: providerRequestInputs(pi, ctx) }),
+        // Keep the wire marker in the snapshot; ordinary requests and V2 each replay it exactly once.
+        () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx) }),
       );
       return payload;
     });

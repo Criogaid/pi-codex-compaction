@@ -71,7 +71,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         : change === "removal" ? ["router", "internal_read", "retired_read"] : ["router", "internal_read", "grammar_read"];
       let calledTools = false;
       const fixture = await sessionFixture({ api, extensions: [
-        hiddenLoadout(initial, (pi) => { controls = pi; }, () => !additive), createCodexCompactionExtension(),
+        hiddenLoadout(initial, (pi) => { controls = pi; }), createCodexCompactionExtension(),
       ], respond: () => {
         if (change !== "thinking" || calledTools) return undefined;
         calledTools = true;
@@ -87,7 +87,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         await fixture.session.prompt(prompt(3));
         const ordinaryPayload = fixture.requests.at(-1)!.payload;
         const ordinary = declarations(ordinaryPayload);
-        if (!additive) assert.doesNotMatch(JSON.stringify(ordinary), /internal_read/);
+        assert.doesNotMatch(JSON.stringify(ordinary), /internal_read/);
         if (change !== "thinking") assert.match(JSON.stringify(ordinary), /visible_read/);
         if (additive) {
           assert.equal(ordinary.additions.length, 1, "ordinary tool additions stay anchored in history");

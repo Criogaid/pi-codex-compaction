@@ -254,19 +254,29 @@ test("the final V2 payload preserves declarations through snapshot reuse and che
   const savedPrior = structuredClone(prior);
   const identity = { provider: model.provider, api: model.api, modelId: model.id,
     baseUrl: model.baseUrl, endpoint: `${model.baseUrl}/responses` };
-  const registry = await testRegistry(providerInput(input));
-  let sent: unknown;
+  const boundary = "snapshot boundary";
+  const registry = await testRegistry(providerInput([markerItem,
+    { role: "user", content: [{ type: "input_text", text: boundary }] }, ...input.slice(1)]));
+  const attempts: unknown[] = [];
   const result = await requestRemoteCompaction({ ...request(registry),
+    maxRetries: 1, maxRetryDelayMs: 1,
     context: { messages: [{ role: "user", content: marker, timestamp: 1 }],
       tools: [{ name: "internal_read", description: "private-schema", parameters: { type: "object", properties: {} } }],
     },
     providerRequest: { sessionId: "session", identity, sourceFingerprints: [], inputsKey: "fixture",
       fields: { instructions: "Keep the effective prompt", tools: [schema], prompt_cache_key: "same-session" },
-      prefix: [{ type: "additional_tools", role: "developer", tools: [schema] }],
+      prefix: { boundary, contextLength: 1, contextual: [false, false],
+        input: [{ type: "additional_tools", role: "developer", tools: [schema] }, markerItem] },
     },
     priorCheckpoint: { identity, marker, replacementHistory: prior },
-    fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
+    fetch: async (input, init) => {
+      attempts.push(await new Request(input, init).json());
+      return attempts.length === 1 ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } }) : response();
+    },
   });
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[1], attempts[0], "Retries preserve the fully spliced request body");
+  const sent = attempts[0];
   assert.ok(isObject(sent));
   assert.deepEqual(sent.tools, [schema]);
   assert.equal(sent.tool_choice, undefined);

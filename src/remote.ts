@@ -151,17 +151,18 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
               request.onPrepared?.();
               return structuredClone(preparedPayload);
             }
-            if (isObject(payload)) payload = applyProviderRequest(payload, resolved, request.providerRequest);
-            if (request.blockImages && isObject(payload)) {
-              payload = { ...payload, input: withoutInputImages(objectItems(payload.input)) };
-            }
+            if (!isObject(payload)) throw new CodexCompactionProtocolError("Prepared compaction payload must be an object");
+            const applied = applyProviderRequest(payload, resolved, request.providerRequest,
+              contextUserItems(payload.input, request.userItemOrigins));
+            const adapted = request.blockImages
+              ? { ...applied.payload, input: withoutInputImages(objectItems(applied.payload.input)) } : applied.payload;
             const checkpoint = request.priorCheckpoint && request.blockImages
               ? { ...request.priorCheckpoint, replacementHistory: withoutInputImages(request.priorCheckpoint.replacementHistory) }
               : request.priorCheckpoint;
-            const contextItems = contextUserItems(isObject(payload) ? payload.input : undefined, request.userItemOrigins);
-            const payloadItems = isObject(payload) && Array.isArray(payload.input) ? payload.input.filter(isObject) : [];
+            const payloadItems = objectItems(adapted.input);
+            const contextItems = new Set(payloadItems.filter((_, index) => applied.contextual[index]));
             const estimates = await estimateImages([...payloadItems, ...checkpoint?.replacementHistory ?? []], request.signal);
-            const prepared = prepareRemoteCompactionPayload(payload, checkpoint, (history) => ({
+            const prepared = prepareRemoteCompactionPayload(adapted, checkpoint, (history) => ({
               ...history,
               input: trimToolOutputsToContextWindow(objectItems(history.input), history.instructions, preparedModel.contextWindow, estimates),
             }));
