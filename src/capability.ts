@@ -17,37 +17,6 @@ export interface CapableModel {
   readonly model: Model<Api>;
   readonly identity: ProviderIdentity;
 }
-export interface CompactionModelMetadata {
-  /** The producing model's physical window, when its catalogue exposes a valid value. */
-  readonly modelContextWindow?: number;
-  /** An explicitly configured opaque compatibility identifier, never inferred from model identity. */
-  readonly compactionModelHash?: string;
-}
-
-/** Ignore malformed optional metadata without rejecting an otherwise valid v1 checkpoint. */
-export function normalizeCompactionModelMetadata(value: unknown): CompactionModelMetadata {
-  if (!isObject(value)) return {};
-  const modelContextWindow = value.modelContextWindow;
-  const compactionModelHash = value.compactionModelHash;
-  return {
-    ...(typeof modelContextWindow === "number" && Number.isSafeInteger(modelContextWindow) && modelContextWindow > 0
-      ? { modelContextWindow } : {}),
-    ...(typeof compactionModelHash === "string" && compactionModelHash.length > 0 &&
-      compactionModelHash.length <= 1024 && !/[\s\u0000-\u001f\u007f-\u009f]/u.test(compactionModelHash)
-      ? { compactionModelHash } : {}),
-  };
-}
-
-/** Pi exposes no server comp_hash; operators may supply an explicit V2 compatibility identifier. */
-export function compactionModelMetadata(model: Model<Api>): CompactionModelMetadata {
-  const compat: unknown = model.compat;
-  const configured = isObject(compat) ? compat.remoteCompaction : undefined;
-  return normalizeCompactionModelMetadata({
-    modelContextWindow: model.contextWindow,
-    compactionModelHash: isObject(configured) && configured.protocol === "v2"
-      ? configured.compactionModelHash : undefined,
-  });
-}
 
 export function normalizeUrl(value: string): string {
   const url = new URL(value);
@@ -116,7 +85,10 @@ export function sameModel(
   return sameProvider(left, right) && left.modelId === right.id;
 }
 
-/** Compare endpoint identity only; matching backends do not prove opaque model compatibility. */
+/**
+ * Codex keeps compaction items across model switches on one backend and narrows that only by
+ * the server's comp_hash, which Pi does not expose. Checkpoints therefore bind to the backend.
+ */
 export function sameBackend(left: ProviderIdentity, right: ProviderIdentity): boolean {
   return sameProvider(left, right) && left.baseUrl === right.baseUrl && left.endpoint === right.endpoint;
 }

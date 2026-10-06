@@ -1,12 +1,12 @@
 # Codex Remote Compaction V2 源码对照
 
-> 审计基于本扩展 `0.4.1` 的 commit `17365cbf69a36b0b4b0cd41fae6e3995414afba1`、第一轮安全修复及第二轮重试/模型切换补丁。上游引用固定到先前已核对的 commit，以下区分原有行为和两轮补丁后的行为。本次验证未调用真实模型服务；上游版本查询时间不因本文更新而改变。
+> 上游引用沿用补丁报告固定的 commit 和查询时间；本扩展一栏描述当前实现。客户端回归使用可控 fixture，未调用真实模型服务；上游版本查询时间不因本文更新而改变。
 
 ## 结论与审计边界
 
 本扩展实现了 **Codex Remote Compaction V2 的请求与不透明结果重放协议，并把 Codex 面向普通用户消息的文本、图片保留算法移植到 Pi**。这具有真实源码依据：它在正常 Responses 请求的历史末尾加入 `compaction_trigger`，收集唯一的 compaction 输出项，把预算内的用户历史放在新的不透明项之前，并在后续请求中恢复这份历史。[上游请求构造][attempt]、[输出收集和历史安装][v2]与本扩展的 `remote.ts`、`protocol.ts`、`retention.ts` 可以逐项对应。
 
-第二轮补丁进一步加入整次 SSE 请求重试、显式模型兼容性元数据，以及通过 Pi 公共 API 完成的小窗口准备与容量保护。它们补齐了先前对照中的部分差异，但“完全复刻 Codex”仍超出了可证实范围。Pi 不会自动提供 Codex 的服务端 `comp_hash`；WebSocket 切换、窗口状态、工具与权限状态刷新、生命周期钩子、多智能体元数据和统计流程也没有被整体移植。服务端怎样生成、加密和解释 `encrypted_content` 不在本次可见的客户端源码和离线测试范围内。不能由协议相同推导出摘要内容、长期记忆质量、缓存命中、费用或延迟相同。
+本扩展包含整次 SSE 请求重试，并保持 Pi 的文字回退、普通请求路由和模型切换方式。“完全复刻 Codex”超出了可证实范围。Pi 不会自动提供 Codex 的服务端 `comp_hash`；WebSocket 切换、窗口状态、模型切换前压缩、工具与权限状态刷新、生命周期钩子、多智能体元数据和统计流程没有被整体移植。服务端怎样生成、加密和解释 `encrypted_content` 不在本次可见的客户端源码和离线测试范围内，不能由协议相同推导出摘要内容、长期记忆质量、缓存命中、费用或延迟相同。
 
 更准确的项目描述是：**采用 Codex Remote Compaction V2 协议、移植其主要历史保留规则的 Pi 适配器**。
 
@@ -24,7 +24,7 @@
 
 ## 逐项对照
 
-| 范围 | Codex `rust-v0.159.2` | 本扩展及两轮补丁 | 判断 |
+| 范围 | Codex `rust-v0.159.2` | 本扩展 | 判断 |
 | --- | --- | --- | --- |
 | 启用条件 | 默认关闭 TokenBudget 的通常路径按 provider capability 选择 V2/local；配置型 provider 的 OpenAI、识别为 Azure Responses 的 provider 支持 V2。这里没有模型 ID 包含 `gpt` 的规则。 | 显式 `compat.remoteCompaction` 优先；否则按两个 Responses API 和 `gpt` 子串决定是否尝试；允许自定义 provider 和同源端点。 | 有意扩展的 Pi 启用策略，不能说复制了原生模型门控。 |
 | 功能请求头 | 会话构造时无条件把 `remote_compaction_v2` 加入 beta feature 列表，正常 Responses 传输使用这份列表；配置中的旧 feature 开关已经移除。 | 通过 Pi 请求头变换器为压缩请求合并该 feature，固定 SSE，避免 Pi 既有 WebSocket 握手缺少新头。 | 压缩请求携带同一标识；头的生命周期和传输策略不同。 |
@@ -34,13 +34,13 @@
 | 压缩前容量裁剪 | 粗估模型可见内容，计入基础指令；从末尾开始替换工具输出，删掉附属 resize notice；遇到非输出项停止。有效窗口百分比默认 95，来自模型配置。 | 相同方向、替换文案、停止条件、notice 分组和主要估算项；直接采用 Pi `contextWindow × 95%`。 | 支持的 Pi 数据子集内移植程度高；95% 为固定默认，未读取 Codex 模型专有调整。 |
 | 文本估算与截断 | UTF-8 字节数除以 4 向上取整；保留头尾、删除中间，加入省略标记。 | 采用同一估算和中间截断策略，避免切断 Unicode 字符。 | 对正常有效文本可直接对应；这是启发式预算，不是真实 tokenizer。 |
 | 图片预算 | 普通图片按 7,373 字节估计；original detail 按 32px patches，最多 10,000；original 文件引用取上限，解码失败回退普通估值；跨请求 32 项 SHA-1 LRU 缓存。 | 常量、规则和 32 项跨请求 LRU 策略相同，图片解码通过 Pi 的 `resizeImage`，另外在一次请求内复用 URL 估值。 | 主要估算与缓存策略对应；解码器、格式支持和并发初始化机制不保证完全相同。 |
-| 保留顺序与预算 | 普通用户/HookPrompt 组在固定 64,000 token 预算内从新向旧选择，最终恢复原顺序，最后追加新 compaction 项；图片边界与标签原子保留。 | 默认采用同样预算和选择规则；第二轮仅在小窗口准备时允许降低明文预算，最低可只保留新 opaque 项。 | 默认核心算法对应；小窗口降低预算是额外的 Pi 容量保护。 |
+| 保留顺序与预算 | 普通用户/HookPrompt 组在固定 64,000 token 预算内从新向旧选择，最终恢复原顺序，最后追加新 compaction 项；图片边界与标签原子保留。 | 采用同样的固定预算和选择规则。 | 普通 Pi 用户消息的核心保留算法对应。 |
 | 特殊上下文与元数据 | 通过 Codex context fragment 与 HookPrompt 解析判断；还有 `AgentMessage`、来源与权限元数据，以及可选的 client-authored developer retention。 | 标记文本启发式加 Pi 消息来源映射；剥离 Pi skill 前缀；只有普通用户消息保留路径，未移植完整 AgentMessage/来源元数据系统。XML 解析使用 saxes，源码列出与 quick-xml 的差异。 | 只覆盖 Pi 可表达子集，存在明示的解析差异。 |
 | 输出校验 | 消费输出项完成事件，必须恰好一项 compaction，再收到 completed；其他输出项可忽略，不能把最终 response.output 再计数一次。 | 相同计数原则，验证非空 encrypted_content，支持 compaction_summary 别名。本轮修复额外适配 Pi Codex raw event 的成功 response.done 别名。 | 核心不变量一致；response.done 是 Pi 边界兼容扩展。 |
-| 重试与传输 | 对可重试错误，每种传输最多额外重试 `min(provider stream retry, 2)` 次，覆盖建流和收流失败；WebSocket 重试耗尽后可切到 HTTP 并重置计数。 | 第二轮以外层循环覆盖整次 SSE 请求和收流，额外次数取 Pi 配置与 2 的较小值，内层 HTTP 重试为 0；请求体和后端固定，暂时错误需有明确证据。 | SSE 分支的尝试边界和总预算已补齐；未实现 WebSocket→HTTP 切换及计数重置，错误分类仍是 Pi 适配。 |
-| 失败与回退 | V2 失败不会改走本地文字摘要；特定换模型场景可换当前模型继续尝试 V2。请求未成功时不安装新历史。 | 原实现对未取消且仍属当前会话的 V2 错误进入 Pi 文字回退。本轮修复：存在 opaque checkpoint 时取消并保留旧 checkpoint；没有 opaque checkpoint 时仍支持 Pi 文字回退。 | 修复恢复关键的“无法读旧记录时不覆盖它”约束；首次文字回退仍是扩展产品行为。 |
-| Opaque 重放与模型兼容 | 持久化 replacement history、compaction response ID、模型 comp_hash、窗口/来源信息；hash 变化或模型窗口缩小时可先用旧模型再压缩。 | v1 检查点可保存创建模型的有效窗口及显式 `compactionModelHash`；已知 hash/后端冲突停止请求，同后端跨模型缺少可比较 hash 时提示未知并允许继续。 | 增加了兼容性证据区分；显式配置不是自动取得的 Codex comp_hash，未知仍不构成兼容证明。 |
-| 小窗口准备与检查 | 原模型和目标模型、压缩触发原因、模型窗口及历史预算共同参与换模型准备流程。 | 空闲 `model_select` 可用同后端的上一/创建模型先做 V2；按目标完整帧估算降低明文保留，保留实际 producer 身份，并在普通请求展开后再检查容量。 | 通过 Pi 公共 API 实现保守准备；后选择事件、启发式预算及已知 hash 冲突停止策略不能视为 Codex 状态机复刻。 |
+| 重试与传输 | 对可重试错误，每种传输最多额外重试 `min(provider stream retry, 2)` 次，覆盖建流和收流失败；WebSocket 重试耗尽后可切到 HTTP 并重置计数。 | 外层循环覆盖整次 SSE 请求和收流，额外次数取 Pi 配置与 2 的较小值，内层 HTTP 重试为 0；请求体和后端固定，暂时错误需有明确证据。 | 未实现 WebSocket→HTTP 切换及计数重置，错误分类仍是 Pi 适配。 |
+| 失败与回退 | V2 失败不会改走本地文字摘要；特定换模型场景可换当前模型继续尝试 V2。 | 未取消且仍属当前会话和模型的 V2 错误进入 Pi 文字回退，包括已有 opaque checkpoint 的会话。 | 文字回退是本扩展的产品行为，不能包含加密历史。 |
+| Opaque 重放与模型兼容 | 持久化 replacement history、compaction response ID、模型 comp_hash、窗口/来源信息；hash 变化或模型窗口缩小时可先用旧模型再压缩。 | v1 检查点绑定后端身份与保留消息指纹，同后端允许模型切换；不检查 comp_hash。 | 后端隔离不证明任意同后端模型均兼容。 |
+| 小窗口准备与检查 | 原模型和目标模型、压缩触发原因、模型窗口及历史预算共同参与换模型准备流程。 | 模型切换不发起压缩；后续 V2 使用当前模型，普通请求窗口处理由 Pi 和 provider 决定。 | 未移植 Codex 的模型切换准备流程。 |
 | 生命周期、状态刷新与用量 | 执行 PreCompact/PostCompact hooks；成功后更新窗口，按注入模式插入上下文或延后重建，保存或保留 world-state baseline，重置 reasoning pin，并重新估计 active usage、记录 telemetry。 | 接入 Pi `session_before_compact` 等事件；使用 Pi 的系统声明与 checkpoint；返回 Pi provider Usage/原 tokensBefore。本轮修复应用 Pi 图片阻止设置到 opaque history 的明文图片部分。 | Pi 生命周期适配，不具备 Codex 全量状态刷新、钩子语义或统计口径。 |
 
 各项证据与重要限制如下。
@@ -75,8 +75,6 @@
 
 64,000 token 预算定义见 [compact_remote_v2.rs 75–79][v2-constants]；选择次序、附属 notice 的费用、边界截断和最后添加 compaction 的逻辑分别见 [compact_remote_v2.rs 504–532、620–752][v2]、[compact_remote_v2_images.rs 31–104][image-retention]。插件对应的是启用 `CompactionImageBudget` 的默认路径；基线的 client-authored developer retention 默认关闭，见 [features.rs 1836–1853][features]。
 
-第二轮在 [retention.ts](../../src/retention.ts) 增加可选的较小明文预算，默认值与 64,000 上限不变，仅由小窗口准备路径传入。预算为 0 时返回新 opaque 项；负数、非整数及非有限值拒绝处理。降低预算仍保持从新向旧选择、恢复原顺序、图片与标签原子保留、Unicode 边界和不修改来源消息。截断文案与请求结构也占空间，因此准备流程还会用完整帧重新估算，不能把保留预算本身解释为完整请求的上限。
-
 “保留用户消息”也不是简单的 role 判断。Codex 使用 [contextual_user_message.rs 23–120][contextual] 及 [event_mapping.rs 101 起][event-mapping]；插件用 Pi 的消息来源补偿 bash/隐藏 custom 消息，并以文本标记近似上下文分类。它还用 saxes 近似 quick-xml HookPrompt；部分 XML 输入（例如声明、DOCTYPE、某些命名空间/不规范字符）行为有明示差异。其 `retention-input.ts` 已有差异注释，测试只覆盖列出的样例，不能声称两个 XML parser 等价。
 
 Codex 还会按作者/接收者关系、消息类型和 10,000 token 上限保留部分 AgentMessage，见 [上限常量][v2-constants]及 [compact_remote_v2.rs 555–583][v2]。插件没有对应的 Codex AgentMessage 数据模型；这属于尚未移植的功能域，不应被普通 user-history 测试覆盖率掩盖。
@@ -87,49 +85,31 @@ Codex 还会按作者/接收者关系、消息类型和 10,000 token 上限保�
 
 上游重试包住整个“发起请求 + 收集流”过程，仅对可重试错误执行重试，每种传输最多额外重试 `min(provider stream retry, 2)` 次；这里的 2 不是请求总次数。常量见 [compact_remote_v2.rs 75–79][v2-constants]；[请求循环][retry-loop]和[重试策略][retry-policy]还处理 WebSocket 到 HTTP 的切换，并在切换成功后重置重试计数。普通重试会等待 server retry advice 指定的时间或本地 backoff；但 WS→HTTPS 切换的首次请求尚未等待该建议，源码 L98 对此留有 TODO。
 
-第一轮审计时，插件只是把 Pi provider 的请求级 `maxRetries` 限制为 2。离线复现显示，成功 HTTP response 的 SSE 在终止事件前断开时仍只 fetch 一次。**第二轮已改为整个 V2 attempt 的外层重试**，见 [remote.ts](../../src/remote.ts) 和 [remote-retry.ts](../../src/remote-retry.ts)：默认最多额外 2 次，Pi 配置较小时按较小值；provider 内层 `maxRetries` 固定为 0，每次 attempt 最多一次 fetch，避免重试层数相乘。
+插件通过整个 V2 attempt 的外层重试覆盖 SSE 中途断开，见 [remote.ts](../../src/remote.ts) 和 [remote-retry.ts](../../src/remote-retry.ts)：默认最多额外 2 次，Pi 配置较小时按较小值；provider 内层 `maxRetries` 固定为 0，每次 attempt 最多调用一次 fetch，避免重试层数相乘。
 
-每次 attempt 使用独立输出收集器。首次准备完成后固定请求体、输入估值、后端及 Pi 实际解析出的模型窗口/兼容标识，后续重新认证并复核这些信息及会话/所选模型归属，不把失败 attempt 的半成品或下一次序列化差异混入结果。实际发送层设置 `redirect: "error"`，防止自动重定向绕过端点检查。成功仍要求完整终止事件及唯一有效 compaction 项；新检查点的模型元数据来自实际准备请求的模型，配置和旧检查点中已知的标识与它冲突时在发送前拒绝。
+每次 attempt 使用独立输出收集器。首次准备完成后固定请求体、输入估值和后端，后续重新认证并复核后端及会话/所选模型归属，不把失败 attempt 的半成品或下一次序列化差异混入结果。HTTP 重定向沿用 provider 和 fetch 的处理，不另外禁止跳转。成功仍要求完整终止事件及唯一有效 compaction 项；末尾工具输出按 Pi 实际准备请求的模型窗口裁剪。
 
 可重试证据在 Pi 将错误简化为字符串之前收集，包括明确的暂时 HTTP 状态、白名单网络错误码、显式暂时服务端错误码，以及已经出现 Responses 进展后尚未收到终止事件的 EOF。权限、额度耗尽、内容/上下文限制等永久错误，冲突或畸形错误字段、无效完整 SSE 帧、重复/无效 compaction 输出、取消和后端漂移会阻止重试；不能只凭错误消息包含某个词就重试。SSE 旁路观察只负责分类证据，输出校验仍由收集器完成。
 
 等待遵循可用的 `Retry-After`、`retry-after-ms`，或明确 rate-limit 错误中的受支持等待提示；没有提示时采用本地退避。单次等待上限为 Pi 的有效正数上限与 60 秒的较小值；要求等待超过上限时停止，不提前重发。这里仍固定 SSE，**没有实现 Codex 的 WebSocket→HTTP 切换、切换后的预算重置或完整 ResponsesRetryPolicy 状态机**。新增测试检查的是列出的 Pi transport/error 边界，不能据此声称所有线上故障行为等同。
 
-原实现会将未取消、仍属当前会话的 V2 错误转到 Pi 文字回退，这不同于 Codex。上游 [tasks/compact.rs 35–74][task] 在 TokenBudget 专用分支之后根据 capability 选择 V2 或 local；V2 内部仅在特定旧模型→当前模型场景继续尝试 V2，失败返回，见 [compact_remote_v2.rs 253–294][fallback-v2]，没有把它转成文字摘要。
+插件将未取消、仍属当前会话和模型的 V2 错误转到 Pi 文字回退，这不同于 Codex。上游 [tasks/compact.rs 35–74][task] 在 TokenBudget 专用分支之后根据 capability 选择 V2 或 local；V2 内部仅在特定旧模型→当前模型场景继续尝试 V2，失败返回，见 [compact_remote_v2.rs 253–294][fallback-v2]，没有把它转成文字摘要。
 
-第一轮增加了已有 opaque checkpoint 的保护：文字摘要模型无法解读已存在的 encrypted_content，因而在 V2 失败、关闭或不适用时继续覆盖 checkpoint 会丢弃不可重建的信息。修复后会取消这次压缩并保留原 checkpoint；没有 opaque checkpoint 时，Pi 文字回退仍作为本扩展的独立功能存在。第二轮把所选模型、显式端点及兼容性元数据变化也纳入安装和重试前的归属检查；为小窗口进行的准备失败时同样保留已有历史。
+已有 opaque checkpoint 时也允许文字回退。文字摘要模型无法解读 `encrypted_content`，只能根据 Pi 仍可读取的摘要和近期消息生成新摘要；成功后新摘要成为活动上下文，原始会话文件中的旧检查点不被改写。所选模型或会话在异步压缩期间改变时，旧请求结果不安装。
 
 “失败不覆盖旧 checkpoint”只适用于安装前的失败。上游 PostCompact hook 发生在成功执行与历史安装之后，hook 要求停止时会返回 TurnAborted，但这不意味着已经安装的压缩历史回滚。[compact_remote_v2.rs 160–195][hooks]
 
 ## 5. 后端身份、comp_hash 与持久化并不等价
 
-插件使用 provider、API、认证解析后的 base URL 和 endpoint 绑定 opaque checkpoint，并对 Pi 保留近期消息做精确指纹校验，解决 Pi 的重复消息/恢复边界。第二轮把模型兼容性证据与后端身份分开判断，具体见 [capability.ts](../../src/capability.ts)、[model-transition.ts](../../src/model-transition.ts) 和 [checkpoint.ts](../../src/checkpoint.ts)。
+插件使用 provider、API、认证解析后的 base URL 和 endpoint 绑定 opaque checkpoint，并对 Pi 保留近期消息做精确指纹校验，解决重复消息/恢复边界。实现见 [capability.ts](../../src/capability.ts) 和 [checkpoint.ts](../../src/checkpoint.ts)。
 
 Codex 自身还记录 `compaction_model_hash`、compaction response ID、窗口 ID、来源、MCP 和 world-state 信息；安装与持久化操作见 [session/mod.rs 4099–4208][install]。模型切换时，两个已知 `comp_hash` 不同，或切到更小窗口且预算不足，会尝试用前一模型先压缩，见 [session/turn.rs 1309–1441][model-switch]。某些消费者（例如 Guardian 的 checkpoint 复用）还有严格的 producer/reviewer hash 校验，见 [history/compaction_checkpoint.rs 14–56][checkpoint-hash]。后者不应被概括为所有普通请求都要求非空 hash。
 
-Pi 0.99.1 的公开模型目录没有提供服务端 `comp_hash`。本扩展仅从 `compat.remoteCompaction` 中读取 `protocol: "v2"` 下的可选 `compactionModelHash`，由提供方显式配置；不会推导模型名称、窗口或 URL 的哈希，也不检查 opaque 的内部明文。该值必须是 1–1024 个无空白/控制字符的字符，按大小写敏感的原值比较。相同标识是配置提供的兼容性声明，不是本扩展从服务端独立验证出的事实。
+Pi 0.99.1 的公开模型目录没有提供服务端 `comp_hash`，本扩展不解析或保存模型兼容性标识及创建窗口。v1 检查点格式、marker、历史摘要和指纹保持不变。同后端允许切换模型，服务端决定它是否接受旧 opaque 项。
 
-| 检查点与目标模型关系 | 第二轮行为 |
-| --- | --- |
-| provider/API/实际 base URL/endpoint 不同 | 停止请求；相同 hash 不能覆盖后端隔离。 |
-| 同后端，双方已知 hash 不同 | 停止请求；同一 model ID 的 hash 修订也优先判为冲突。 |
-| 同后端，双方已知 hash 相同 | 按显式配置判为兼容，继续独立容量检查。 |
-| 同后端，model ID 改变但 hash 缺失或只有一边可用 | 标为未知并提示，保留允许继续的行为；不能声称兼容已被证明。 |
-| 仍为创建检查点的模型，且无已知 hash 冲突 | 保留同模型恢复行为；缺失 hash 仍不等于已验证的匹配。 |
+后端不匹配或保留消息投影失败时，扩展跳过加密历史，普通请求继续使用 Pi 可读取的上下文。普通请求的 payload 模型路由保持不变；扩展不因路由后的模型 ID 不同而取消请求。
 
-v1 检查点可增加 `modelContextWindow` 与 `compactionModelHash`，来源是实际执行本次压缩的模型。前者只保存有效的正安全整数。缺失或无效的可选元数据不会让旧检查点无法解析，也不改变 marker、历史摘要、消息指纹或 legacy 修复规则。对旧检查点，可以从当前目录查询原模型窗口来辅助预检，但不能据此补写它创建时的 hash。没有可比较 hash 的同后端重放仍可能被服务端拒绝，恢复原模型的路径必须保留。
-
-### 小窗口准备的具体范围
-
-Pi 的 `model_select` 在选择完成后触发。插件观察到窗口变小且估算容量不足时，只在会话空闲、V2 开启、原模型可用、后端相同且无已知 hash 冲突的条件下，通过公共 `ctx.compact()` 回调请求准备；不会从活跃 provider hook 内启动压缩。会话正在运行时提示稍后手动 `/compact`，可用时由上一模型或检查点创建模型执行。用户选中的对话模型保持不变。
-
-[model-budget.ts](../../src/model-budget.ts) 的输入预算为 `max(0, floor(0.95 × contextWindow) - max(model.maxTokens, Pi reserveTokens))`。无效窗口或预留值返回 0。估算覆盖完整 JSON 的提示词、工具、结构和未知字段；已识别图片/opaque 字段用现有 item 估值代替，不把 base64 再当成同量明文收费。无法估算时返回有限的最大安全整数，让容量判断停止通过。
-
-准备时另扣 `min(4096, ceil(0.05 × contextWindow))`，给下一轮与请求结构留余量。只有这条路径会降低明文 retention 预算；反复估算后仍超出时可退到 opaque-only，连 opaque、当前提示词及工具都放不下则不安装。新记录保留实际 producer 身份及其元数据，不会把旧模型结果改标成由目标模型生成，也不会声称旧模型再压缩解决了已知 hash 冲突。
-
-普通请求在 marker 展开后会针对较小目标窗口再次估算当前完整 payload；超过预算则调用 `ctx.abort()` 停止发送。后端/hash 冲突、精确消息投影失败、marker 缺失，或 payload 的 `model` 与当前选择不同也停止请求。Pi 会吞掉扩展钩子异常，因此取消必须先于抛错。检查发生在本扩展的钩子位置：后续扩展仍可改写请求，Pi 未公开的隐藏/路由状态也不能从最后一次快照推断出来。
-
-这是一条可恢复的 Pi 准备流程及启发式容量保护，不是 Codex 完整换模型状态机或真实 tokenizer；相同预算、显式 hash 和离线测试都不能保证任意线上模型接受同一 opaque 项。
+模型切换本身不发起压缩，也不依赖原模型准备更小窗口。后续 V2 使用当前对话模型；明文保留使用固定预算，普通上下文窗口处理由 Pi 和 provider 决定。这些边界与 Codex 的完整模型切换状态机不同。
 
 ## 6. 钩子、上下文刷新和 usage
 
@@ -172,23 +152,21 @@ main 已有额外的生命周期变化，应独立列出：
 
 ## 9. 本轮验证与复现边界
 
-**第一轮安全修复**的完整测试记录为 **408 项通过，0 项失败、取消或跳过**；相对审计基线的 364 项测试新增 44 项，并更新了与修复行为相关的原有断言。这是第一轮历史结果，不是第二轮补丁的最终测试总数。验证通过真实的 Pi 会话、模型注册器和 provider adapter 发送请求，网络层使用可控 fixture；跨进程配置测试使用独立 Node 子进程竞争同一文件。
+测试通过真实的 Pi 会话、模型注册器和 provider adapter 构造请求，模型响应使用可控 fixture。跨进程配置测试使用独立 Node 子进程竞争同一文件，重定向集成测试使用本机 HTTP 服务。
 
 | 修复 | 关键回归场景 |
 | --- | --- |
-| 保留已有 opaque checkpoint | 两种 Responses API × V2 失败/关闭 × 启用/未启用独立摘要模型；确认没有文字摘要请求、后续普通请求仍重放旧记录，并能在服务恢复后再次 V2 压缩。 |
+| 文字回退与检查点 | 两种 Responses API × V2 失败/关闭 × 启用/未启用独立摘要模型；已有检查点仍能生成文字摘要，旧持久化记录保持不变。 |
 | 图片读取设置 | 普通重放与递归压缩均不发送被阻止的明文图片；在下一次压缩前重新开启读取可再次使用旧记录中的图片；旧 checkpoint details 不被修改。 |
 | 隐藏工具声明 | 两种 API 下改变 thinking、增删工具、恢复会话、仅改变隐藏状态而公共工具状态不变，以及旧 checkpoint 再展开后的声明过滤；V2 最终请求省略全部结构化工具声明，保留普通/custom-tool 调用与结果；删除 Pi 合成的工具加载搜索配对，保留真实搜索历史并清空 tools 数组。 |
 | Codex 终止事件 | 实际 Codex adapter 的成功 response.done；拒绝未完成、失败和取消的 terminal status；仍要求唯一 compaction 输出项。 |
 | 配置竞争 | 已存在与首次创建的配置均只有一个基于旧版本的保存成功；持锁期间拒绝写入；释放后可保存；文件权限及临时文件清理。 |
 
-第二轮新增整次重试、模型兼容性、完整预算和小预算保留的验证。验证重点包括：两种 Responses API 的建流与收流暂时失败、明确永久错误与取消、固定请求体/后端、内外重试总数；旧 v1 元数据兼容、同 ID 的 hash 冲突、未知 hash 不冒充兼容；新旧窗口、当前工具/提示词与 opaque 的完整估算，以及小预算下 Unicode 和图片标签的边界。模型切换集成验证关注准备模型与保存的实际来源、空闲回调、失败时保留历史及普通请求的最终停止行为。**第二轮累计补丁最终完整回归为 511 项通过，0 项失败、取消或跳过，相比第一轮增加 103 项；包含 54 项新的真实 provider 重试/元数据回归和 20 项模型切换及重试会话集成回归。**
+整次重试覆盖两种 Responses API 的建流和收流暂时故障、永久错误、取消、固定请求体/后端及请求次数。模型切换测试确认跨后端继续普通请求、同后端重放、普通 payload 路由、被动切换小窗口，以及手动压缩使用当前模型。
 
-类型检查和测试编译使用 **TypeScript 6.0.3**，执行环境为 **Node 24.19.0**。仓库固定的 TypeScript 7.0.2 原生编译器在本次执行环境无法读取 `/proc/self/exe`，因此使用外置便携编译器完成验证；没有修改仓库的 TypeScript 版本，也没有把这次结果标记成原始 TS7 命令通过。第二轮单独执行无输出类型检查、编译和编译后的完整测试，包含 npm 发布文件清单检查和 Pi 的真实入口加载检查；`git diff --check` 也通过。
+这些测试不推断线上模型兼容性或服务端摘要效果。之后执行的扩展仍可能改写载荷，当前钩子看到的内容也不等于 provider 最终处理结果。
 
-普通请求钩子只提供载荷，不提供 V2 调用中可取得的实际 `preparedModel`。因此普通重放能检查 Pi 公开的所选模型元数据及序列化后的 `model`，却不能完整核验同一 ID 下的隐藏路由是否另换了窗口/哈希。V2 压缩会额外核验实际准备模型并保存它的元数据。这一可见性差异，以及后续钩子仍可改写载荷的限制，保留为与 Codex 完整客户端的差距。
-
-在正常开发/CI 环境仍应使用仓库固定版本运行：
+使用仓库固定版本运行验证：
 
 ```bash
 npm ci --ignore-scripts

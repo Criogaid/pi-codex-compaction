@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import {
-  capableModel, compactionModelMetadata, deriveEndpoint, normalizeCompactionModelMetadata,
-  normalizeUrl, sameBackend, sameModel,
-} from "../src/capability.js";
+import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel } from "../src/capability.js";
 
 function model(overrides: Record<string, unknown> = {}): Model<Api> {
   return {
@@ -145,50 +142,6 @@ test("accepts capabilities inherited from providers or applied by modelOverrides
   const overridden = model({ compat: { ...configuredCompat, supportsToolSearch: true } });
   assert.ok(capableModel(inherited));
   assert.ok(capableModel(overridden));
-});
-
-test("reads the actual model window and only an explicit V2 compaction compatibility identifier", () => {
-  for (const api of ["openai-responses", "openai-codex-responses"]) {
-    const current = model({ api, contextWindow: 256_000, compat: {
-      remoteCompaction: { protocol: "v2", compactionModelHash: "provider:family-A_v2" },
-    } });
-    assert.deepEqual(compactionModelMetadata(current), {
-      modelContextWindow: 256_000,
-      compactionModelHash: "provider:family-A_v2",
-    });
-    assert.equal(capableModel(current)?.model, current);
-  }
-  assert.deepEqual(compactionModelMetadata(model()), { modelContextWindow: 100_000 });
-  for (const compat of [
-    { compactionModelHash: "unrelated" },
-    { remoteCompaction: { protocol: "v2", comp_hash: "unrelated", compactionHash: "unrelated" } },
-    { remoteCompaction: { compactionModelHash: "missing-protocol" } },
-    { remoteCompaction: { protocol: "v3", compactionModelHash: "unsupported-protocol" } },
-  ]) {
-    assert.deepEqual(compactionModelMetadata(model({ compat })), { modelContextWindow: 100_000 });
-  }
-});
-
-test("ignores malformed optional model metadata without inventing or normalizing a hash", () => {
-  const valid = { modelContextWindow: 100_000, compactionModelHash: "hash-A" };
-  for (const modelContextWindow of [undefined, null, "100000", 0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
-    assert.deepEqual(normalizeCompactionModelMetadata({ ...valid, modelContextWindow }), {
-      compactionModelHash: "hash-A",
-    });
-  }
-  for (const compactionModelHash of [undefined, null, 42, {}, "", " ", " hash-A", "hash-A ", "hash A", "hash\u0000A", "x".repeat(1025)]) {
-    assert.deepEqual(normalizeCompactionModelMetadata({ ...valid, compactionModelHash }), {
-      modelContextWindow: 100_000,
-    });
-    const current = model({ compat: { remoteCompaction: { protocol: "v2", compactionModelHash } } });
-    assert.ok(capableModel(current), "invalid optional metadata does not disable valid V2 capability");
-    assert.deepEqual(compactionModelMetadata(current), { modelContextWindow: 100_000 });
-  }
-  assert.deepEqual(normalizeCompactionModelMetadata(valid), valid);
-  assert.deepEqual(normalizeCompactionModelMetadata({ modelContextWindow: 1, compactionModelHash: "x".repeat(1024) }), {
-    modelContextWindow: 1, compactionModelHash: "x".repeat(1024),
-  });
-  assert.deepEqual(normalizeCompactionModelMetadata(undefined), {});
 });
 
 test("rejects malformed, cross-origin, and unsupported capability metadata without name fallback", () => {

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { once } from "node:events";
+import { createServer } from "node:http";
 import { zstdDecompressSync } from "node:zlib";
 import type { Api, AuthResult, Context, Model, Provider, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { requestRemoteCompaction, type RemoteCompactionRequest } from "../src/remote.js";
-import { capableModel } from "../src/capability.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 import { testRegistry } from "./helpers.js";
 
@@ -78,7 +79,6 @@ async function fixture(api: ResponsesApi, resolve?: () => Promise<AuthResult | u
     return async (input, init) => {
       assert.ok(payloads.length < 8, "Fixture request limit exceeded");
       const outgoing = new Request(input, init);
-      assert.equal(outgoing.redirect, "error", "redirects must not bypass backend identity validation");
       const bytes = Buffer.from(await outgoing.arrayBuffer());
       const body = outgoing.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
       const payload: unknown = JSON.parse(body.toString("utf8"));
@@ -102,16 +102,10 @@ async function fixture(api: ResponsesApi, resolve?: () => Promise<AuthResult | u
   return { request, context, payloads, urls, options, fetchReplies, assertAttempts };
 }
 
-function withMetadata(model: Model<Api>, contextWindow: number, hash?: string): Model<Api> {
-  const compat = { ...model.compat, supportsStore: false,
-    remoteCompaction: { protocol: "v2", ...(hash ? { compactionModelHash: hash } : {}) },
-  };
-  return { ...model, contextWindow, compat };
-}
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
-  test(`${api}: returns actual producer metadata and trims to its physical window`, async () => {
-    const f = await fixture(api, undefined, false, (model) => withMetadata(model, 512, "actual-family"));
+  test(`${api}: trims tool output to the actual prepared model's physical window`, async () => {
+    const f = await fixture(api, undefined, false, (model) => ({ ...model, contextWindow: 512 }));
     const output = "x".repeat(16_000);
     f.context.messages.push({
       role: "assistant", api, provider: f.request.model.provider, model: f.request.model.id,
@@ -124,7 +118,6 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       content: [{ type: "text", text: output }], isError: false, timestamp: 3,
     });
     const result = await requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(success) });
-    assert.deepEqual(result.modelMetadata, { modelContextWindow: 512, compactionModelHash: "actual-family" });
     const retainedOutput = result.promptInput.find((item) => item.type === "function_call_output");
     assert.ok(retainedOutput);
     assert.equal(typeof retainedOutput.output, "string");
@@ -134,48 +127,6 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     f.assertAttempts(1);
   });
 
-  test(`${api}: rejects a configured versus actual producer hash mismatch before fetch`, async () => {
-    const f = await fixture(api, undefined, false, (model) => withMetadata(model, model.contextWindow, "actual-family"));
-    await assert.rejects(requestRemoteCompaction({ ...f.request,
-      model: withMetadata(f.request.model, f.request.model.contextWindow, "configured-family"),
-      fetch: f.fetchReplies(success),
-    }), /hash|compatib|metadata/i);
-    assert.equal(f.payloads.length, 0);
-    assert.equal(f.options.length, 1);
-  });
-
-  test(`${api}: rejects a prior checkpoint versus actual producer hash mismatch before fetch`, async () => {
-    const f = await fixture(api, undefined, false, (model) => withMetadata(model, model.contextWindow, "actual-family"));
-    const capable = capableModel(f.request.model);
-    assert.ok(capable);
-    const identity = { ...capable.identity, compactionModelHash: "prior-family" };
-    const marker = "checkpoint-metadata-marker";
-    await assert.rejects(requestRemoteCompaction({ ...f.request,
-      context: { messages: [{ role: "user", content: marker, timestamp: 1 }] },
-      priorCheckpoint: { identity, marker, replacementHistory: [{ type: "compaction", encrypted_content: "prior" }] },
-      fetch: f.fetchReplies(success),
-    }), /hash|compatib|metadata/i);
-    assert.equal(f.payloads.length, 0);
-    assert.equal(f.options.length, 1);
-  });
-
-  test(`${api}: cannot change producer hash presence or physical window between attempts`, async () => {
-    for (const [firstHash, secondHash, secondWindow] of [
-      ["first-family", "other-family", 100_000],
-      [undefined, "new-family", 100_000],
-      ["first-family", undefined, 100_000],
-      ["first-family", "first-family", 80_000],
-    ] as const) {
-      const f = await fixture(api, undefined, false, (model, attempt) => withMetadata(model,
-        attempt === 1 ? 100_000 : secondWindow, attempt === 1 ? firstHash : secondHash));
-      await assert.rejects(requestRemoteCompaction({ ...f.request,
-        fetch: f.fetchReplies(() => sse([created])),
-      }), /hash|compatib|metadata|window/i);
-      assert.equal(f.payloads.length, 1, "changed producer metadata must be rejected before retry transport");
-      assert.equal(f.options.length, 2);
-      for (const option of f.options) assert.equal(option?.maxRetries, 0);
-    }
-  });
 
   for (const stage of ["created", "compaction-output"] as const) {
     test(`${api}: retries EOF after ${stage} with a fresh collector and unchanged request`, async () => {
@@ -331,18 +282,56 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     f.assertAttempts(1);
   });
 
-  test(`${api}: Request transports and endpoint overrides reject redirects before any retry`, async () => {
+  test(`${api}: preserves redirect mode for Request transports and endpoint overrides`, async () => {
     for (const endpoint of [undefined, "https://retry.example/custom/responses"]) {
       const f = await fixture(api, undefined, true);
-      const model = endpoint ? { ...f.request.model, compat: { ...f.request.model.compat, supportsStore: false,
-        ...{ remoteCompaction: { protocol: "v2", endpoint } },
-      } } : f.request.model;
-      await assert.rejects(requestRemoteCompaction({ ...f.request, model,
-        fetch: f.fetchReplies(() => new Response("Fixture redirect", {
-          status: 307, headers: { location: "https://different-backend.example/responses" },
-        })) }), Error);
+      const model = { ...f.request.model, compat: { ...f.request.model.compat, supportsStore: false,
+        remoteCompaction: { protocol: "v2", ...(endpoint ? { endpoint } : {}) } } };
+      const replies = f.fetchReplies(success);
+      await requestRemoteCompaction({ ...f.request, model, fetch: (input, init) => {
+        const outgoing = new Request(input, init);
+        assert.equal(outgoing.redirect, "follow");
+        return replies(outgoing);
+      } });
       if (endpoint) assert.equal(f.urls[0], endpoint);
       f.assertAttempts(1);
+    }
+  });
+
+  test(`${api}: follows redirects for provider URLs and endpoint overrides`, { timeout: 10_000 }, async (t) => {
+    const successfulBody = await success().text();
+    const paths: string[] = [];
+    const server = createServer((request, response) => {
+      paths.push(request.url ?? "");
+      request.resume();
+      if (request.url === "/final") {
+        response.writeHead(200, streamHeaders);
+        response.end(successfulBody);
+      } else {
+        response.writeHead(307, { location: "/final" });
+        response.end();
+      }
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    t.after(() => {
+      server.closeAllConnections();
+      return new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    });
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const origin = `http://127.0.0.1:${address.port}`;
+    for (const endpoint of [undefined, `${origin}/custom/responses`]) {
+      paths.length = 0;
+      const f = await fixture(api);
+      const model = { ...f.request.model, baseUrl: `${origin}/backend-api`,
+        compat: { ...f.request.model.compat, supportsStore: false,
+          remoteCompaction: { protocol: "v2", ...(endpoint ? { endpoint } : {}) } } };
+      const result = await requestRemoteCompaction({ ...f.request, model });
+      assert.equal(result.item.encrypted_content, "fresh-successful-checkpoint");
+      assert.equal(f.options.length, 1, "Following a redirect is still one provider attempt");
+      assert.deepEqual(paths, [endpoint ? "/custom/responses" : api === "openai-responses"
+        ? "/backend-api/responses" : "/backend-api/codex/responses", "/final"]);
     }
   });
 

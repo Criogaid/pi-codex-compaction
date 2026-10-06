@@ -79,14 +79,9 @@ function truncateImageMessage(item: JsonObject, maxTokens: number, images: Image
   return reversed.length ? { ...item, content: reversed.reverse() } : undefined;
 }
 
-/** Keep newest user groups, optionally reducing Codex's default budget for a smaller target model. */
-export function buildReplacementHistory(
-  { groups, images }: RetentionInput,
-  compactionItem: JsonObject,
-  maxTokens = RETAINED_MESSAGE_TOKEN_BUDGET,
-): JsonObject[] {
-  if (!Number.isSafeInteger(maxTokens) || maxTokens < 0) throw new Error("Invalid retained-message token budget");
-  let remaining = Math.min(RETAINED_MESSAGE_TOKEN_BUDGET, maxTokens);
+/** Keep newest user groups within Codex's fixed budget, preserving image/label groups atomically. */
+export function buildReplacementHistory({ groups, images }: RetentionInput, compactionItem: JsonObject): JsonObject[] {
+  let remaining = RETAINED_MESSAGE_TOKEN_BUDGET;
   const reversed: JsonObject[] = [];
   for (let index = groups.length - 1; index >= 0 && remaining > 0; index--) {
     const { source, notice } = groups[index];

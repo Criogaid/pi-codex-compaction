@@ -72,39 +72,6 @@ test("persists and validates the complete provider endpoint identity", () => {
   assert.doesNotMatch(JSON.stringify(details), /authorization|apiKey|token/i);
 });
 
-test("persists optional producing-model metadata without changing v1 history or fingerprints", () => {
-  const original = checkpoint();
-  const modelMetadata = { modelContextWindow: 200_000, compactionModelHash: "producer-family-A" };
-  const details = createCheckpointDetails({
-    identity,
-    modelMetadata,
-    replacementHistory: original.replacementHistory,
-    keptMessages: [user("kept", 2)],
-    checkpointId: original.checkpointId,
-    createdAt: original.createdAt,
-  });
-  assert.deepEqual(details, { ...original, ...modelMetadata });
-  assert.equal(details.version, 1);
-  assert.deepEqual(parseCheckpointDetails(JSON.parse(JSON.stringify(details))), details);
-  assert.deepEqual(parseCheckpointDetails(original), original);
-  assert.equal(Object.hasOwn(original, "modelContextWindow"), false);
-  assert.equal(Object.hasOwn(original, "compactionModelHash"), false);
-});
-
-test("ignores malformed optional v1 metadata while preserving every required checkpoint field", () => {
-  const original = checkpoint();
-  for (const modelContextWindow of [undefined, null, "200000", 0, -1, 0.5, NaN, Infinity, () => 200_000]) {
-    const saved = { ...original, modelContextWindow, compactionModelHash: "valid-hash" };
-    assert.deepEqual(parseCheckpointDetails(saved), { ...original, compactionModelHash: "valid-hash" });
-    assert.equal(saved.modelContextWindow, modelContextWindow, "persisted entry is not mutated");
-  }
-  for (const compactionModelHash of [undefined, null, 1, {}, "", "hash with spaces", "hash\nA", "x".repeat(1025), () => "hash-A"]) {
-    const saved = { ...original, modelContextWindow: 200_000, compactionModelHash };
-    assert.deepEqual(parseCheckpointDetails(saved), { ...original, modelContextWindow: 200_000 });
-    assert.equal(saved.compactionModelHash, compactionModelHash, "persisted entry is not mutated");
-  }
-});
-
 
 test("projects exact retained messages for resume and rejects corrupt state", () => {
   const kept = user("kept", 2);

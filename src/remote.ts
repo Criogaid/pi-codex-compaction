@@ -2,7 +2,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Context, Model, ProviderHeaders, ThinkingBudgets, Usage } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { capableModel, compactionModelMetadata, deriveEndpoint, normalizeCompactionModelMetadata, normalizeUrl, sameBackend, sameModel, type CompactionModelMetadata, type ProviderIdentity } from "./capability.js";
+import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, type ProviderIdentity } from "./capability.js";
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
@@ -29,7 +29,7 @@ export interface RemoteCompactionRequest {
   signal: AbortSignal;
   /** Pi origins of the context's user messages, used to align provider user items with Pi roles. */
   userItemOrigins?: readonly UserItemOrigin[];
-  priorCheckpoint?: { identity: ProviderIdentity & CompactionModelMetadata; marker: string; replacementHistory: readonly JsonObject[] };
+  priorCheckpoint?: { identity: ProviderIdentity; marker: string; replacementHistory: readonly JsonObject[] };
   providerRequest?: ProviderRequestSnapshot;
   onPrepared?: () => void;
   fetch?: typeof globalThis.fetch;
@@ -39,8 +39,6 @@ export interface RemoteCompactionResponse {
   item: JsonObject;
   promptInput: JsonObject[];
   identity: ProviderIdentity;
-  /** Metadata exposed by the actual prepared producer, frozen across retry attempts. */
-  modelMetadata?: CompactionModelMetadata;
   usage: Usage;
   images: ImageEstimates;
   /** Whether each promptInput item came from Pi context that Codex would not retain. */
@@ -71,12 +69,10 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   const context = structuredClone(request.context);
   const configured = capableModel(model);
   if (!configured) throw new CodexCompactionProtocolError("Model is not configured for remote compaction");
-  const configuredMetadata = compactionModelMetadata(model);
   const retries = compactionRetryLimit(request.maxRetries);
   let preparedPayload: JsonObject | undefined;
   let sentInput: JsonObject[] | undefined;
   let identity: ProviderIdentity | undefined;
-  let modelMetadata: CompactionModelMetadata | undefined;
   let images: ImageEstimates | undefined;
   let contextual: boolean[] | undefined;
   const baseFetch = request.fetch ?? globalThis.fetch;
@@ -107,12 +103,10 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       try {
         // Endpoint overrides are same-origin HTTP routes; authentication remains assembled by Pi.
         const actual = normalizeUrl(input instanceof Request ? input.url : String(input));
-        // Redirects must not move opaque history beyond the endpoint that was validated above.
-        const transportInit = { ...init, redirect: "error" as const };
-        const response = actual === identity!.endpoint ? await baseFetch(input, transportInit)
+        const response = actual === identity!.endpoint ? await baseFetch(input, init)
           : input instanceof Request
-            ? await baseFetch(new Request(identity!.endpoint, new Request(input, transportInit)))
-            : await baseFetch(identity!.endpoint, transportInit);
+            ? await baseFetch(new Request(identity!.endpoint, new Request(input, init)))
+            : await baseFetch(identity!.endpoint, init);
         return attempt.observeResponse(response, request.signal);
       } catch (error) {
         attempt.fetchFailed(error);
@@ -139,19 +133,6 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
             if (!sameModel(configured.identity, preparedModel)) {
               throw new CodexCompactionProtocolError("Provider resolved an unexpected compaction model");
             }
-            const actualMetadata = compactionModelMetadata(preparedModel);
-            const priorMetadata = normalizeCompactionModelMetadata(request.priorCheckpoint?.identity);
-            for (const expected of [configuredMetadata, priorMetadata]) {
-              if (expected.compactionModelHash && actualMetadata.compactionModelHash &&
-                  expected.compactionModelHash !== actualMetadata.compactionModelHash) {
-                throw new CodexCompactionProtocolError("Prepared compaction model has an incompatible compaction hash");
-              }
-            }
-            if (modelMetadata && (modelMetadata.compactionModelHash !== actualMetadata.compactionModelHash ||
-                modelMetadata.modelContextWindow !== actualMetadata.modelContextWindow)) {
-              throw new CodexCompactionProtocolError("Prepared compaction model metadata changed during remote compaction retries");
-            }
-            modelMetadata ??= actualMetadata;
             const resolved = capableModel(model, preparedModel.baseUrl);
             if (!resolved) throw new CodexCompactionProtocolError("Resolved provider endpoint is incompatible with remote compaction");
             if (identity && !sameBackend(identity, resolved.identity)) {
@@ -225,7 +206,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       if (attempt.fatal) throw attempt.fatal.error;
       if (!sentInput || !identity || !images || !contextual) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
       if (!usage) throw new CodexCompactionProtocolError("Provider stream ended without a completed message");
-      return { item: collector.finish(), promptInput: sentInput, identity, modelMetadata, usage, images, contextual };
+      return { item: collector.finish(), promptInput: sentInput, identity, usage, images, contextual };
     } catch (error) {
       request.signal.throwIfAborted();
       if (attempt.fatal) throw attempt.fatal.error;
