@@ -30,7 +30,7 @@ import {
   projectCheckpointContext,
   projectCheckpointRequest,
 } from "./checkpoint.js";
-import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker } from "./protocol.js";
+import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker, withoutInputImages } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
 import { requestFallbackCompaction } from "./fallback.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH, loadCompactionSettings, type CompactionConfiguration } from "./fallback-settings.js";
@@ -103,7 +103,7 @@ function projectedCurrentMessages(
   return { messages: projected, prior };
 }
 
-async function replayCheckpoint(payload: unknown, ctx: ExtensionContext): Promise<JsonObject | undefined> {
+async function replayCheckpoint(payload: unknown, ctx: ExtensionContext, blockImages: boolean): Promise<JsonObject | undefined> {
   const checkpoint = activeCheckpoint(ctx);
   if (!checkpoint) return undefined;
   const marker = checkpointMarker(checkpoint.details.checkpointId);
@@ -111,7 +111,8 @@ async function replayCheckpoint(payload: unknown, ctx: ExtensionContext): Promis
   if (!await compatibleIdentity(checkpoint.details, ctx)) {
     throw new Error("The active opaque checkpoint no longer matches the resolved provider endpoint");
   }
-  return rewriteCheckpointMarker(payload, marker, checkpoint.details.replacementHistory);
+  const history = checkpoint.details.replacementHistory;
+  return rewriteCheckpointMarker(payload, marker, blockImages ? withoutInputImages(history) : history);
 }
 
 function errorMessage(error: unknown): string {
@@ -138,6 +139,17 @@ async function compactFallback(
   let announced = false;
   try {
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+    // Pi's text preparation contains only the checkpoint's recovery notice, not its opaque history.
+    // A native result would supersede the checkpoint and make that history unavailable to later turns.
+    if (latestCheckpoint(event.branchEntries)) {
+      if (ctx.hasUI) ctx.ui.notify(
+        "Compaction stopped: Pi text compaction cannot preserve the active Codex checkpoint's older history. " +
+        "Keep Remote Compaction V2 enabled and retry with the original provider backend." +
+        (remoteError === undefined ? "" : ` ${errorMessage(remoteError)}`),
+        "warning",
+      );
+      return { cancel: true };
+    }
     const result = await requestFallbackCompaction({
       configuration: configuration.fallback,
       modelRegistry: ctx.modelRegistry,
@@ -220,6 +232,7 @@ async function compactRemotely(
       reasoning,
       sessionId,
       thinkingBudgets: settings.thinkingBudgets,
+      blockImages: settings.images?.blockImages ?? false,
       maxRetries: settings.retry?.provider?.maxRetries,
       maxRetryDelayMs: settings.retry?.provider?.maxRetryDelayMs,
       signal: event.signal,
@@ -344,7 +357,7 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("before_provider_request", async (event, ctx) => {
-      const payload = await replayCheckpoint(event.payload, ctx);
+      const payload = await replayCheckpoint(event.payload, ctx, pi.getSettings().images?.blockImages ?? false);
       snapshots.recordProviderRequest(
         ctx.sessionManager.getSessionId(),
         capableModel(ctx.model),

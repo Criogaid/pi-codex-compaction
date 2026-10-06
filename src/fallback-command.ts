@@ -7,7 +7,7 @@ import { loadCompactionSettings, type FallbackConfiguration } from "./fallback-s
 const COMMAND_NAME = "codex-compaction";
 const SUMMARY_SWITCH_LABEL = "Use separate summary model";
 const SUMMARY_MODEL_LABEL = "Summary model and thinking level";
-const TEXT_SUMMARY_DESCRIPTION = "Text summaries are used when V2 is off, unsupported, or fails.";
+const TEXT_SUMMARY_DESCRIPTION = "Text summaries are used when V2 is off, unsupported, or fails, provided no opaque V2 checkpoint is active.";
 const MAX_VISIBLE_MODELS = 10;
 type SettingsAction = "model" | "toggle" | "remote";
 
@@ -58,7 +58,7 @@ async function chooseAction(
   }
   return ctx.ui.custom<SettingsAction | undefined>((tui, _theme, _keys, done) => {
     const list = new SettingsList([
-      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When On, try V2 with the chat model. When Off, unsupported, or failed, use text summaries. The settings below choose their model. Turning V2 off does not affect previously compressed chat history." },
+      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When On, try V2 with the chat model. Text summaries can replace it only without an active V2 checkpoint. Turning V2 off preserves checkpoint replay; further compaction stops until V2 can preserve that history." },
       { id: "toggle", label: SUMMARY_SWITCH_LABEL, currentValue: switchValue, values: invalid ? ["Invalid"] : ["Off", "On"], description },
       { id: "model", label: SUMMARY_MODEL_LABEL, currentValue: invalid ? "Invalid" : fallbackModelLabel(current) ?? "Not configured", values: ["Choose"], description: invalid ? "Choose a model to replace the invalid fallback settings." : `Choose the model and thinking level used when "${SUMMARY_SWITCH_LABEL}" is On. Choosing a model does not enable the switch or change the chat model. ${TEXT_SUMMARY_DESCRIPTION}` },
     ], 3, getSettingsListTheme(), (id) => done(id === "toggle" ? "toggle" : id === "remote" ? "remote" : "model"), () => done(undefined));

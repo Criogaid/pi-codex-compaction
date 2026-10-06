@@ -44,6 +44,7 @@ export interface SessionRequest {
 export async function sessionFixture(options: {
   readonly api?: "openai-responses" | "openai-codex-responses";
   readonly extensions: readonly ExtensionFactory[];
+  readonly respond?: (request: SessionRequest) => Response | undefined | Promise<Response | undefined>;
 }) {
   const directory = await mkdtemp(join(tmpdir(), "pi-compaction-session-"));
   const requests: SessionRequest[] = [];
@@ -61,7 +62,10 @@ export async function sessionFixture(options: {
     const body = request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
     const payload: unknown = JSON.parse(body.toString("utf8"));
     assert.ok(isObject(payload));
-    requests.push({ payload, headers: request.headers, url: request.url });
+    const recorded = { payload, headers: request.headers, url: request.url };
+    requests.push(recorded);
+    const response = await options.respond?.(recorded);
+    if (response) return response;
     assert.ok(Array.isArray(payload.input));
     const compacting = payload.input.some((item) => isObject(item) && item.type === "compaction_trigger");
     const item = compacting

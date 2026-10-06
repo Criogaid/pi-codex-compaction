@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Model, Tool, UserMessage, SystemMessage } from "@earendil-works/pi-ai";
+import { createGrammarToolInputProperties } from "@earendil-works/pi-ai/api/constrained-sampling";
+import { convertResponsesMessages, convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
+import { getDeclaredTools, normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { CapableModel } from "../src/capability.js";
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, fingerprintMessage } from "../src/checkpoint.js";
 import { applyProviderRequest, compactionRequest, providerRequestFor, RequestSnapshotTracker, type ProviderRequestInputs, type RequestDeclarations } from "../src/request-snapshot.js";
+import { isObject, withoutToolDeclarations } from "../src/protocol.js";
 
 const sessionId = "snapshot-session";
 const model: Model<"openai-responses"> = {
@@ -249,11 +253,12 @@ const wirePayload = () => ({
   reasoning: { effort: "medium" }, prompt_cache_key: "wire-cache-key", prompt_cache_retention: "24h", service_tier: "priority",
   text: { verbosity: "low", format: { type: "json_object" } },
   input: [{ type: "message", role: "developer", content: [{ type: "input_text", text: "wire-prefix" }] },
-    { type: "additional_tools", tools: [] }, { type: "message", role: "user", content: [{ type: "input_text", text: "source" }] }],
+    { type: "additional_tools", tools: [{ type: "function", name: "internal_read", parameters: { type: "object" } }] },
+    { type: "message", role: "user", content: [{ type: "input_text", text: "source" }] }],
   previous_response_id: "old-response", max_output_tokens: 123, store: true, stream: false, metadata: { private: "not-copied" },
 });
 
-test("observed fields and declaration prefix survive newer conversation messages without copying transient state", () => {
+test("observed prompt and cache fields survive newer messages without copying tool schemas or transient state", () => {
   const canonical = [system(), user()];
   const observed = wirePayload();
   const tracker = observedRequest(canonical, observed);
@@ -266,13 +271,15 @@ test("observed fields and declaration prefix survive newer conversation messages
     tools: [], text: { verbosity: "high" }, max_output_tokens: 4_096, store: false, stream: true };
   const result = applyProviderRequest(fresh, target, snapshot);
   const original = wirePayload();
-  assert.deepEqual(result.tools, original.tools);
+  assert.equal("tools" in snapshot.fields, false);
+  assert.deepEqual(result.tools, fresh.tools, "the observation never restores old tool schemas");
   assert.deepEqual(result.reasoning, original.reasoning);
   assert.equal(result.prompt_cache_key, original.prompt_cache_key);
   assert.equal(result.prompt_cache_retention, original.prompt_cache_retention);
   assert.equal(result.service_tier, original.service_tier);
   assert.deepEqual(result.text, { verbosity: original.text.verbosity });
-  assert.deepEqual(result.input, [...original.input.slice(0, 2), fresh.input[1]]);
+  assert.deepEqual(result.input, [original.input[0], fresh.input[1]]);
+  assert.doesNotMatch(JSON.stringify(snapshot.prefix), /internal_read/);
   assert.equal(result.previous_response_id, undefined);
   assert.equal(result.metadata, undefined);
   assert.equal(result.max_output_tokens, fresh.max_output_tokens);
@@ -309,7 +316,6 @@ test("missing wire fields remove obsolete defaults and malformed observations di
   const snapshot = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
   assert.ok(snapshot);
   const actual = applyProviderRequest(wirePayload(), target, snapshot);
-  assert.equal(actual.tools, undefined);
   assert.equal(actual.instructions, undefined);
   assert.equal(actual.prompt_cache_key, undefined);
   assert.deepEqual(actual.text, { format: { type: "json_object" } });
@@ -334,3 +340,38 @@ test("retry observations replace wire fields and reset detaches a captured compa
   assert.equal(tracker.current().providerRequest, undefined);
   assert.equal(view.providerRequest?.fields.prompt_cache_key, "retried-cache-key");
 });
+
+for (const api of ["openai-responses", "openai-codex-responses"] as const) {
+  test(`${api} keeps historical grammar calls intact before removing wire declarations`, () => {
+    const grammar: Tool = { name: "grammar_tool", description: "Grammar fixture",
+      parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
+      constrainedSampling: { type: "grammar", variants: { openai_regex: "ping" } } };
+    const grammarModel = { ...model, api, compat: { supportsOpenAIGrammarTools: true } };
+    const grammarTarget: CapableModel = { model: grammarModel, identity: { ...target.identity, api } };
+    const callId = "grammar-call|ctc_history";
+    const assistant: AgentMessage = { role: "assistant", content: [{ type: "toolCall", id: callId, name: grammar.name, arguments: { input: "ping" } }],
+      api, provider: model.provider, model: model.id, stopReason: "toolUse", timestamp: 2,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const resultMessage: AgentMessage = { role: "toolResult", toolCallId: callId, toolName: grammar.name,
+      content: [{ type: "text", text: "pong" }], isError: false, timestamp: 3 };
+    const canonical: AgentMessage[] = [{ ...system(), toolsAdded: [grammar] }, user(), assistant, resultMessage];
+    const saved = structuredClone(canonical);
+    const request = compactionRequest({}, sessionId, grammarTarget, canonical, declarationsInTranscript);
+    const context = normalizeContext(request.context);
+    const converted = convertResponsesMessages(grammarModel, context, new Set([model.provider]), {
+      supportsMidConvoSystemMessages: true,
+      grammarToolInputProperties: createGrammarToolInputProperties(getDeclaredTools(context.messages), true),
+    });
+    const wire = withoutToolDeclarations({ model: model.id, input: converted,
+      tools: convertResponsesTools([grammar], { supportsOpenAIGrammarTools: true }) });
+    assert.equal(wire.tools, undefined);
+    assert.ok(Array.isArray(wire.input));
+    const calls = wire.input.filter(isObject).filter((item) => item.type === "custom_tool_call" || item.type === "custom_tool_call_output");
+    assert.deepEqual(calls.map((item) => item.type), ["custom_tool_call", "custom_tool_call_output"]);
+    assert.equal(calls[0].input, "ping");
+    assert.equal(calls[1].output, "pong");
+    assert.equal(calls[0].call_id, calls[1].call_id);
+    assert.deepEqual(request.messages, canonical);
+    assert.deepEqual(canonical, saved);
+  });
+}

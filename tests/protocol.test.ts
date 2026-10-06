@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CodexCompactionProtocolError, appendCompactionTrigger, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker } from "../src/protocol.js";
+import { CodexCompactionProtocolError, appendCompactionTrigger, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker, withoutInputImages, withoutToolDeclarations } from "../src/protocol.js";
 
 const item = { type: "compaction", encrypted_content: "opaque" };
 const done = { type: "response.output_item.done", item };
@@ -11,6 +11,81 @@ test("counts one completed output item without counting response.output twice", 
   collector.observe(done);
   collector.observe(completed);
   assert.deepEqual(collector.finish(), item);
+});
+
+test("accepts the raw successful Codex response.done alias", () => {
+  const collector = createCompactionCollector();
+  collector.observe(done);
+  collector.observe({ type: "response.done", response: { status: "completed", output: [item] } });
+  assert.deepEqual(collector.finish(), item);
+});
+
+for (const type of ["response.done", "response.completed"] as const) {
+  for (const status of ["incomplete", "failed", "cancelled", "in_progress"]) {
+    test(`rejects ${type} with unsuccessful status ${status}`, () => {
+      const collector = createCompactionCollector();
+      collector.observe(done);
+      assert.throws(() => collector.observe({ type, response: { status } }), CodexCompactionProtocolError);
+    });
+  }
+}
+
+test("does not infer success from a bare response.done or incomplete terminal event", () => {
+  for (const type of ["response.done", "response.failed", "response.incomplete"]) {
+    const collector = createCompactionCollector();
+    collector.observe(done);
+    assert.throws(() => collector.observe({ type }), CodexCompactionProtocolError);
+  }
+});
+
+test("blocks replayed user and tool-output images without changing saved history or opaque items", () => {
+  const image = { type: "input_image", image_url: "data:image/png;base64,private-image" };
+  const text = { type: "input_text", text: "Keep this constraint" };
+  const parts = [image, image, text, image];
+  const history = [
+    { role: "user", content: parts, id: "user" },
+    { type: "function_call_output", call_id: "call", output: parts },
+    { type: "custom_tool_call_output", call_id: "custom", output: parts },
+    { type: "function_call", arguments: JSON.stringify({ image_url: "unrelated argument" }) },
+    item,
+  ];
+  const saved = structuredClone(history);
+  const filtered = withoutInputImages(history);
+  const placeholder = { type: "input_text", text: "Image reading is disabled." };
+  assert.deepEqual(filtered[0].content, [placeholder, text, placeholder]);
+  assert.deepEqual(filtered[1].output, [placeholder, text, placeholder]);
+  assert.deepEqual(filtered[2].output, [placeholder, text, placeholder]);
+  assert.deepEqual(filtered.slice(3), history.slice(3));
+  assert.doesNotMatch(JSON.stringify(filtered), /private-image/);
+  assert.deepEqual(history, saved);
+});
+
+test("omits tool schemas and synthetic loads while preserving real tool history and request options", () => {
+  const schema = { type: "function", name: "internal_read", description: "private-schema", parameters: { type: "object" } };
+  const history = [
+    { role: "developer", content: "Keep the task constraints" },
+    { type: "additional_tools", role: "developer", tools: [schema] },
+    { type: "tool_search_call", execution: "client", call_id: "pi_tool_load_fixture", arguments: { query: "internal_read" } },
+    { type: "tool_search_output", execution: "client", call_id: "pi_tool_load_fixture", tools: [schema] },
+    { type: "tool_search_call", execution: "client", call_id: "real_search", arguments: { query: "files" } },
+    { type: "tool_search_output", execution: "client", call_id: "real_search", tools: [schema], status: "completed" },
+    { type: "function_call", name: "internal_read", call_id: "read", arguments: "{}" },
+    { type: "function_call_output", call_id: "read", output: "important result" },
+    { type: "custom_tool_call", name: "custom", call_id: "custom", input: "important input" },
+    { type: "custom_tool_call_output", call_id: "custom", output: "custom result" },
+    item,
+  ];
+  const payload = { model: "gpt", input: history, tools: [schema], tool_choice: { type: "function", name: "internal_read" },
+    reasoning: { effort: "high" }, prompt_cache_key: "same-session" };
+  const saved = structuredClone(payload);
+  const filtered = withoutToolDeclarations(payload);
+  assert.equal(filtered.tools, undefined);
+  assert.equal(filtered.tool_choice, undefined);
+  assert.deepEqual(filtered.input, [history[0], history[4], { ...history[5], tools: [] }, ...history.slice(6)]);
+  assert.deepEqual(filtered.reasoning, payload.reasoning);
+  assert.equal(filtered.prompt_cache_key, payload.prompt_cache_key);
+  assert.doesNotMatch(JSON.stringify(filtered), /private-schema|pi_tool_load_fixture/);
+  assert.deepEqual(payload, saved);
 });
 
 test("rejects identical duplicate output events as Codex does", () => {

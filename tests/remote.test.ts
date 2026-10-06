@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
+import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { mergeRemoteCompactionHeader, requestRemoteCompaction } from "../src/remote.js";
 import { assertTrimmedOutput, testRegistry } from "./helpers.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
@@ -35,6 +36,33 @@ test("merges the V2 beta feature without dropping existing features", () => {
   assert.deepEqual(mergeRemoteCompactionHeader({ "X-Codex-Beta-Features": "feature_a,remote_compaction_v2" }),
     { "x-codex-beta-features": "feature_a,remote_compaction_v2" });
 });
+
+for (const status of ["completed", "incomplete"] as const) {
+  test(`handles the raw Codex response.done alias with status ${status} through the real adapter`, async () => {
+    const codex = openaiCodexProvider();
+    const catalogModel = codex.getModels().find((candidate) => candidate.id === "gpt-6.1-sol");
+    assert.ok(catalogModel);
+    const apiKey = `fixture.${Buffer.from(JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
+    })).toString("base64url")}.signature`;
+    const registry = await testRegistry(codex, async () => ({ auth: { apiKey } }));
+    const result = requestRemoteCompaction({ ...request(registry), model: catalogModel,
+      fetch: async () => {
+        const item = { type: "compaction", encrypted_content: "valid-opaque-history" };
+        const events = [
+          { type: "response.created", response: { id: "resp-alias" } },
+          { type: "response.output_item.done", output_index: 0, item },
+          { type: "response.done", response: { id: "resp-alias", status, output: [item],
+            usage: { input_tokens: 20, output_tokens: 1 } } },
+        ];
+        return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+          { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    if (status === "completed") assert.equal((await result).item.encrypted_content, "valid-opaque-history");
+    else await assert.rejects(result, /did not complete successfully/);
+  });
+}
 
 test("Pi resolves model headers, auth headers, scoped env, and the actual endpoint", async () => {
   const registry = await testRegistry(provider, async () => ({
@@ -209,6 +237,46 @@ function providerInput(input: readonly JsonObject[]): Provider<"openai-responses
     } });
   } };
 }
+
+test("the final V2 payload omits declarations after provider adaptation, snapshot reuse, and checkpoint replay", async () => {
+  const schema = { type: "function", name: "internal_read", description: "private-schema", parameters: { type: "object" } };
+  const marker = "checkpoint marker";
+  const markerItem = { role: "user", content: [{ type: "input_text", text: marker }] };
+  const call = { type: "function_call", name: "internal_read", call_id: "read", arguments: "{}" };
+  const output = { type: "function_call_output", call_id: "read", output: "Keep the completed tool result" };
+  const input = [markerItem,
+    { type: "additional_tools", role: "developer", tools: [schema] }, call, output,
+  ];
+  const prior = [{ type: "additional_tools", role: "developer", tools: [schema] },
+    { role: "user", content: [{ type: "input_text", text: "Keep the older constraint" }] },
+    { type: "compaction", encrypted_content: "prior" },
+  ];
+  const savedPrior = structuredClone(prior);
+  const identity = { provider: model.provider, api: model.api, modelId: model.id,
+    baseUrl: model.baseUrl, endpoint: `${model.baseUrl}/responses` };
+  const registry = await testRegistry(providerInput(input));
+  let sent: unknown;
+  const result = await requestRemoteCompaction({ ...request(registry),
+    context: { messages: [{ role: "user", content: marker, timestamp: 1 }],
+      tools: [{ name: "internal_read", description: "private-schema", parameters: { type: "object", properties: {} } }],
+    },
+    providerRequest: { sessionId: "session", identity, sourceFingerprints: [], inputsKey: "fixture",
+      fields: { instructions: "Keep the effective prompt", prompt_cache_key: "same-session" },
+      prefix: [{ type: "additional_tools", role: "developer", tools: [schema] }],
+    },
+    priorCheckpoint: { identity, marker, replacementHistory: prior },
+    fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
+  });
+  assert.ok(isObject(sent));
+  assert.equal(sent.tools, undefined);
+  assert.equal(sent.tool_choice, undefined);
+  assert.equal(sent.instructions, "Keep the effective prompt");
+  assert.equal(sent.prompt_cache_key, "same-session");
+  assert.deepEqual(result.promptInput, [...prior.slice(1), call, output]);
+  assert.deepEqual(sent.input, [...result.promptInput, { type: "compaction_trigger" }]);
+  assert.doesNotMatch(JSON.stringify(sent), /private-schema|additional_tools/);
+  assert.deepEqual(prior, savedPrior);
+});
 
 test("returns trimmed promptInput and contextual flags matching the actual provider payload", async () => {
   const hidden = { role: "user", content: [{ type: "input_text", text: "hidden" }] };

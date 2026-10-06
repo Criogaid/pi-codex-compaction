@@ -18,6 +18,42 @@ export function isInputImage(value: unknown): value is JsonObject {
   return isObject(value) && value.type === "input_image";
 }
 
+/** Apply Pi's current image policy to replayed Responses items without changing saved history. */
+export function withoutInputImages(items: readonly JsonObject[]): JsonObject[] {
+  const blockedText = "Image reading is disabled.";
+  return items.map((item) => {
+    const field = item.role === "user" ? "content"
+      : item.type === "function_call_output" || item.type === "custom_tool_call_output" ? "output" : undefined;
+    const parts = field && item[field];
+    if (!field || !Array.isArray(parts) || !parts.some(isInputImage)) return item;
+    const blocked = parts.map((part: unknown) => isInputImage(part)
+      ? { type: "input_text", text: blockedText } : part);
+    const isPlaceholder = (part: unknown) => isObject(part) && part.type === "input_text" && part.text === blockedText;
+    return { ...item, [field]: blocked.filter((part, index) =>
+      !(index > 0 && isPlaceholder(part) && isPlaceholder(blocked[index - 1]))) };
+  });
+}
+
+/** Pi exposes no current hidden-declaration projection; V2 must not reuse stale tool schemas. */
+export function withoutToolDeclarations(payload: JsonObject): JsonObject {
+  if (!Array.isArray(payload.input)) {
+    throw new CodexCompactionProtocolError("Codex payload is missing an input array");
+  }
+  const { tools: _tools, tool_choice: _choice, ...rest } = payload;
+  // Pi synthesizes these pairs solely to carry system tool additions. Real search history stays.
+  const loadCalls = new Set(payload.input.flatMap((item: unknown) =>
+    isObject(item) && item.type === "tool_search_call" && item.execution === "client" &&
+    typeof item.call_id === "string" && item.call_id.startsWith("pi_tool_load_") ? [item.call_id] : []));
+  return { ...rest, input: payload.input.flatMap((item: unknown) => {
+    if (!isObject(item)) return [item];
+    if (item.type === "additional_tools") return [];
+    if ((item.type === "tool_search_call" || item.type === "tool_search_output") &&
+        typeof item.call_id === "string" && loadCalls.has(item.call_id)) return [];
+    if (item.type === "tool_search_output") return [{ ...item, tools: [] }];
+    return [item];
+  }) };
+}
+
 function isCompactionType(type: unknown): boolean {
   return type === "compaction" || type === "compaction_summary";
 }
@@ -62,7 +98,17 @@ export function createCompactionCollector(): CompactionCollector {
         count += 1;
         item = validateCompactionItem(event.item);
       }
-      if (event.type === "response.completed") completed = true;
+      // Pi exposes raw Codex events before normalizing the successful response.done alias.
+      if (event.type === "response.completed" || event.type === "response.done") {
+        const status = isObject(event.response) ? event.response.status : undefined;
+        if (status !== "completed" && (event.type === "response.done" || status !== undefined)) {
+          throw new CodexCompactionProtocolError("Remote compaction did not complete successfully");
+        }
+        completed = true;
+      }
+      if (event.type === "response.failed" || event.type === "response.incomplete") {
+        throw new CodexCompactionProtocolError("Remote compaction did not complete successfully");
+      }
     },
     finish() {
       if (!completed) {

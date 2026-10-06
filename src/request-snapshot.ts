@@ -125,7 +125,6 @@ export interface ProviderRequestInputs {
 
 interface ProviderRequestFields {
   readonly instructions?: string;
-  readonly tools?: readonly JsonObject[];
   readonly reasoning?: JsonObject;
   readonly prompt_cache_key?: string;
   readonly prompt_cache_retention?: string;
@@ -167,12 +166,12 @@ function captureProviderRequest(
   return {
     sessionId: context.sessionId, identity: context.identity, sourceFingerprints: context.sourceFingerprints,
     inputsKey: requestInputsKey(target, inputs),
-    fields: structuredClone({ instructions, tools, reasoning, prompt_cache_key, prompt_cache_retention, service_tier }),
-    verbosity, prefix: structuredClone(declarationPrefix(payload.input)),
+    fields: structuredClone({ instructions, reasoning, prompt_cache_key, prompt_cache_retention, service_tier }),
+    verbosity, prefix: structuredClone(declarationPrefix(payload.input).filter((item) => item.type !== "additional_tools")),
   };
 }
 
-/** Reuse wire declarations only with an unchanged source prefix and request configuration. */
+/** Reuse the wire prompt and request parameters only with an unchanged source prefix and configuration. */
 export function providerRequestFor(
   snapshots: RequestSnapshots, sessionId: string, target: CapableModel, current: readonly AgentMessage[], inputs: ProviderRequestInputs,
 ): ProviderRequestSnapshot | undefined {
@@ -181,7 +180,7 @@ export function providerRequestFor(
     snapshot.inputsKey === requestInputsKey(target, inputs) ? snapshot : undefined;
 }
 
-/** Replace only declarations and cache-related fields; Pi still owns the current input, transport, and output limits. */
+/** Copy the observed prompt and cache-related fields, never tool schemas or transient response state. */
 export function applyProviderRequest(
   payload: JsonObject, target: CapableModel, snapshot: ProviderRequestSnapshot | undefined,
 ): JsonObject {
@@ -276,7 +275,7 @@ export class RequestSnapshotTracker {
   }
 }
 
-/** What Pi would declare for an ordinary request whose transcript carries no system messages. */
+/** Pi's internal declarations let the provider serialize historical grammar tool calls correctly. */
 export interface RequestDeclarations {
   readonly blockImages: boolean;
   readonly systemPrompt: () => string;
@@ -298,8 +297,8 @@ function withoutImages(messages: Message[]): Message[] {
 
 /**
  * Build compaction's provider context from the current transcript and the snapshots bound to this
- * session, model, and backend. Pi 0.99 transcripts declare the prompt and tools through system
- * messages, as ordinary requests do; `messages` is the transcript actually sent.
+ * session, model, and backend. Keep internal tool declarations for Pi's serialization;
+ * the remote request boundary removes their wire schemas after historical calls are converted.
  */
 export function compactionRequest(
   snapshots: RequestSnapshots,

@@ -747,7 +747,7 @@ test("an image-bearing projected prefix survives a failed HTTP compaction attemp
     assert.ok(Array.isArray(request.input));
     assert.equal(JSON.stringify(request.input.slice(0, ordinary.input.length)), JSON.stringify(ordinary.input));
     assert.deepEqual(request.instructions, ordinary.instructions);
-    assert.deepEqual(request.tools, ordinary.tools);
+    assert.equal(request.tools, undefined, "compaction omits schemas while preserving the observed conversation prefix");
     assert.match(JSON.stringify(request.input.at(-2)), /Image inspected/);
     assert.deepEqual(request.input.at(-1), { type: "compaction_trigger" });
     assert.equal(request.input.length, ordinary.input.length + 2);
@@ -828,7 +828,7 @@ for (const change of ["system", "session-start", "session-shutdown", "session-id
 }
 
 for (const withSystem of [true, false]) {
-  test(`sends one system prompt to the provider with transcript system messages ${withSystem}`, async () => {
+  test(`sends one system prompt without tool schemas with transcript system messages ${withSystem}`, async () => {
     const tool: Tool = { name: "transcript_tool", description: "Transcript tool", parameters: { type: "object", properties: {} } };
     const inactive = { ...tool, name: "inactive_tool" };
     const messages: SessionMessage[] = [
@@ -841,19 +841,19 @@ for (const withSystem of [true, false]) {
       assert.deepEqual(Object.keys(result.contexts[0]), ["messages"]);
     } else {
       assert.equal(result.contexts[0].systemPrompt, "system");
-      assert.deepEqual(result.contexts[0].tools, [tool]);
+      assert.deepEqual(result.contexts[0].tools, [tool], "Pi may use internal declarations to serialize historical tool calls");
     }
     assert.ok(Array.isArray(result.payload.input));
     const instructions = result.payload.input.filter(isObject).filter((item) => item.role === "system" || item.role === "developer");
     assert.deepEqual(instructions, [{ role: "developer", content: "system" }]);
-    assert.ok(Array.isArray(result.payload.tools));
-    assert.deepEqual(result.payload.tools.filter(isObject).map((item) => item.name), [tool.name]);
+    assert.equal(result.payload.tools, undefined);
+    assert.doesNotMatch(JSON.stringify(result.payload), /transcript_tool|inactive_tool/);
     assert.equal(result.payload.instructions, undefined);
     assert.deepEqual(result.notifications.filter((notice) => notice.level === "warning"), []);
   });
 }
 
-test("uses transcript tools and system updates instead of the current fallback context", async () => {
+test("uses transcript system updates without tool schemas", async () => {
   const tool: Tool = { name: "transcript_tool", description: "Transcript tool", parameters: { type: "object", properties: {} } };
   const result = await providerCompaction([
     { role: "system", content: "initial instructions", toolsAdded: [tool], timestamp: 0 },

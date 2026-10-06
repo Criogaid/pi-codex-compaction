@@ -6,7 +6,7 @@ import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, typ
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
-import { CodexCompactionProtocolError, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload } from "./protocol.js";
+import { CodexCompactionProtocolError, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload, withoutInputImages, withoutToolDeclarations } from "./protocol.js";
 import { applyProviderRequest, type ProviderRequestSnapshot } from "./request-snapshot.js";
 
 const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
@@ -21,6 +21,8 @@ export interface RemoteCompactionRequest {
   reasoning: ThinkingLevel;
   sessionId: string;
   thinkingBudgets?: ThinkingBudgets;
+  /** Apply the current Pi image policy to both fresh input and replayed opaque checkpoint history. */
+  blockImages?: boolean;
   /** Pi's provider retry setting; Codex caps compaction retries below it. */
   maxRetries?: number;
   maxRetryDelayMs?: number;
@@ -111,13 +113,22 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
         throw new CodexCompactionProtocolError("The active opaque checkpoint belongs to a different resolved provider backend");
       }
       if (isObject(payload)) payload = applyProviderRequest(payload, resolved, request.providerRequest);
+      if (request.blockImages && isObject(payload)) {
+        payload = { ...payload, input: withoutInputImages(objectItems(payload.input)) };
+      }
+      const checkpoint = request.priorCheckpoint && request.blockImages
+        ? { ...request.priorCheckpoint, replacementHistory: withoutInputImages(request.priorCheckpoint.replacementHistory) }
+        : request.priorCheckpoint;
       const contextItems = contextUserItems(isObject(payload) ? payload.input : undefined, request.userItemOrigins);
       const payloadItems = isObject(payload) && Array.isArray(payload.input) ? payload.input.filter(isObject) : [];
-      const estimates = await estimateImages([...payloadItems, ...request.priorCheckpoint?.replacementHistory ?? []], request.signal);
-      const prepared = prepareRemoteCompactionPayload(payload, request.priorCheckpoint, (history) => ({
-        ...history,
-        input: trimToolOutputsToContextWindow(objectItems(history.input), history.instructions, request.model.contextWindow, estimates),
-      }));
+      const estimates = await estimateImages([...payloadItems, ...checkpoint?.replacementHistory ?? []], request.signal);
+      const prepared = prepareRemoteCompactionPayload(payload, checkpoint, (history) => {
+        // Enforce after snapshot reuse and checkpoint replay so neither can restore stale schemas.
+        const declared = withoutToolDeclarations(history);
+        return { ...declared,
+          input: trimToolOutputsToContextWindow(objectItems(declared.input), declared.instructions, request.model.contextWindow, estimates),
+        };
+      });
       if (prepared.model !== request.model.id) throw new CodexCompactionProtocolError("Provider payload used an unexpected model");
       const sent = objectItems(prepared.input).slice(0, -1);
       contextual = sent.map((item) => contextItems.has(item));
