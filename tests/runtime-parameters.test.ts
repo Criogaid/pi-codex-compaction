@@ -75,10 +75,9 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         },
       });
       assert.ok(ordinaryPayload && typeof ordinaryPayload === "object");
-      const expected = ordinaryPayload as { input: unknown[]; tools?: unknown; tool_choice?: unknown };
-      const { tools: _tools, tool_choice: _choice, ...ordinaryParameters } = expected;
+      const expected = ordinaryPayload as { input: unknown[] };
       assert.deepEqual(compactPayload, {
-        ...ordinaryParameters, input: [...expected.input, { type: "compaction_trigger" }],
+        ...expected, input: [...expected.input, { type: "compaction_trigger" }],
       });
       for (const header of ["session-id", "x-client-request-id", "chatgpt-account-id"]) {
         assert.equal(compactHeaders?.get(header), ordinaryHeaders?.get(header), header);

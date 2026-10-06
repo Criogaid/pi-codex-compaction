@@ -238,7 +238,7 @@ function providerInput(input: readonly JsonObject[]): Provider<"openai-responses
   } };
 }
 
-test("the final V2 payload omits declarations after provider adaptation, snapshot reuse, and checkpoint replay", async () => {
+test("the final V2 payload preserves declarations through snapshot reuse and checkpoint replay", async () => {
   const schema = { type: "function", name: "internal_read", description: "private-schema", parameters: { type: "object" } };
   const marker = "checkpoint marker";
   const markerItem = { role: "user", content: [{ type: "input_text", text: marker }] };
@@ -261,20 +261,19 @@ test("the final V2 payload omits declarations after provider adaptation, snapsho
       tools: [{ name: "internal_read", description: "private-schema", parameters: { type: "object", properties: {} } }],
     },
     providerRequest: { sessionId: "session", identity, sourceFingerprints: [], inputsKey: "fixture",
-      fields: { instructions: "Keep the effective prompt", prompt_cache_key: "same-session" },
+      fields: { instructions: "Keep the effective prompt", tools: [schema], prompt_cache_key: "same-session" },
       prefix: [{ type: "additional_tools", role: "developer", tools: [schema] }],
     },
     priorCheckpoint: { identity, marker, replacementHistory: prior },
     fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
   });
   assert.ok(isObject(sent));
-  assert.equal(sent.tools, undefined);
+  assert.deepEqual(sent.tools, [schema]);
   assert.equal(sent.tool_choice, undefined);
   assert.equal(sent.instructions, "Keep the effective prompt");
   assert.equal(sent.prompt_cache_key, "same-session");
-  assert.deepEqual(result.promptInput, [...prior.slice(1), call, output]);
+  assert.deepEqual(result.promptInput, [{ type: "additional_tools", role: "developer", tools: [schema] }, ...prior, ...input.slice(1)]);
   assert.deepEqual(sent.input, [...result.promptInput, { type: "compaction_trigger" }]);
-  assert.doesNotMatch(JSON.stringify(sent), /private-schema|additional_tools/);
   assert.deepEqual(prior, savedPrior);
 });
 

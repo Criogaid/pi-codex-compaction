@@ -64,14 +64,14 @@ const prompt = (turn: number) => `Task ${turn}. ${"Preserve the current implemen
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   for (const change of ["thinking", "additions", "removal", "tool search"] as const) {
-    test(`${api} compaction omits schemas after ${change} while ordinary requests keep their visible declarations`, { timeout: 20_000 }, async () => {
+    test(`${api} compaction preserves tool declarations and history after ${change}`, { timeout: 20_000 }, async () => {
       let controls: ExtensionAPI | undefined;
       const additive = change === "additions" || change === "tool search";
       const initial = additive ? ["router"]
         : change === "removal" ? ["router", "internal_read", "retired_read"] : ["router", "internal_read", "grammar_read"];
       let calledTools = false;
       const fixture = await sessionFixture({ api, extensions: [
-        hiddenLoadout(initial, (pi) => { controls = pi; }), createCodexCompactionExtension(),
+        hiddenLoadout(initial, (pi) => { controls = pi; }, () => !additive), createCodexCompactionExtension(),
       ], respond: () => {
         if (change !== "thinking" || calledTools) return undefined;
         calledTools = true;
@@ -87,7 +87,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         await fixture.session.prompt(prompt(3));
         const ordinaryPayload = fixture.requests.at(-1)!.payload;
         const ordinary = declarations(ordinaryPayload);
-        assert.doesNotMatch(JSON.stringify(ordinary), /internal_read/);
+        if (!additive) assert.doesNotMatch(JSON.stringify(ordinary), /internal_read/);
         if (change !== "thinking") assert.match(JSON.stringify(ordinary), /visible_read/);
         if (additive) {
           assert.equal(ordinary.additions.length, 1, "ordinary tool additions stay anchored in history");
@@ -105,10 +105,16 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         await fixture.session.compact();
         const compacting = fixture.requests.at(-1)!.payload;
         assert.ok(Array.isArray(compacting.input) && compacting.input.some((item) => isObject(item) && item.type === "compaction_trigger"));
-        assert.deepEqual(declarations(compacting), { tools: [], additions: [] });
+        if (change === "thinking") {
+          assert.match(JSON.stringify(declarations(compacting)), /grammar_read/);
+        } else {
+          assert.deepEqual(declarations(compacting), ordinary);
+          assert.ok(Array.isArray(ordinaryPayload.input));
+          assert.deepEqual(compacting.input.slice(0, ordinaryPayload.input.length), ordinaryPayload.input);
+        }
         assert.deepEqual(toolHistory(compacting), toolHistory(ordinaryPayload), "compaction retains actual tool calls and results");
         if (change === "thinking") assert.deepEqual(compacting.reasoning, { effort: "high", summary: "auto" });
-        if (change === "tool search") assert.ok(!compacting.input.some((item) => isObject(item) && item.type === "tool_search_call"), "removing synthetic tool-search declarations leaves no orphaned call");
+        if (change === "tool search") assert.ok(compacting.input.some((item) => isObject(item) && item.type === "tool_search_call"), "synthetic tool loading stays paired with its declared schemas");
         assert.deepEqual(fixture.errors, []);
       } finally {
         await fixture.close();
@@ -117,7 +123,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   }
 
   for (const change of ["reload", "unobserved loadout"] as const) {
-    test(`${api} compacts without schemas after ${change}`, { timeout: 20_000 }, async () => {
+    test(`${api} compaction uses serialized declarations after ${change} invalidates the snapshot`, { timeout: 20_000 }, async () => {
       let controls: ExtensionAPI | undefined;
       const fixture = await sessionFixture({ api, extensions: [
         hiddenLoadout(["router", "internal_read"], (pi) => { controls = pi; }), createCodexCompactionExtension(),
@@ -135,7 +141,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         await fixture.session.compact();
         const compacting = fixture.requests.at(-1)!.payload;
         assert.ok(Array.isArray(compacting.input) && compacting.input.some((item) => isObject(item) && item.type === "compaction_trigger"));
-        assert.deepEqual(declarations(compacting), { tools: [], additions: [] });
+        assert.match(JSON.stringify(declarations(compacting)), /router/);
+        assert.match(JSON.stringify(declarations(compacting)), /internal_read/, "without a valid snapshot, Pi serializes transcript declarations");
         assert.ok(fixture.session.sessionManager.getBranch().some((entry) => entry.type === "compaction" && isObject(entry.details) && entry.details.kind === "pi-codex-compaction"));
         assert.deepEqual(fixture.errors, []);
       } finally {
@@ -144,7 +151,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     });
   }
 
-  test(`${api} immediate compaction omits schemas after a hide-only command leaves public state unchanged`, { timeout: 20_000 }, async () => {
+  test(`${api} compaction reuses observed declarations when a hide-only command leaves public state unchanged`, { timeout: 20_000 }, async () => {
     let controls: ExtensionAPI | undefined;
     let context: ExtensionContext | undefined;
     let hidden = false;
@@ -165,6 +172,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       const pi = controls;
       const ctx = context;
       assert.match(JSON.stringify(declarations(fixture.requests.at(-1)!.payload)), /internal_read/);
+      const observed = declarations(fixture.requests.at(-1)!.payload);
       const publicState = () => JSON.stringify({
         model: ctx.model, activeTools: pi.getActiveTools(), tools: pi.getAllTools(), settings: pi.getSettings(),
         thinkingLevel: pi.getThinkingLevel(), systemPrompt: ctx.getSystemPrompt(), branchEntries: ctx.sessionManager.getBranch(),
@@ -178,7 +186,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       await fixture.session.compact();
       const compacting = fixture.requests.at(-1)!.payload;
       assert.ok(Array.isArray(compacting.input) && compacting.input.some((item) => isObject(item) && item.type === "compaction_trigger"));
-      assert.deepEqual(declarations(compacting), { tools: [], additions: [] });
+      assert.deepEqual(declarations(compacting), observed);
       await fixture.session.prompt("Continue with the current visible tool loadout.");
       const ordinary = declarations(fixture.requests.at(-1)!.payload);
       assert.match(JSON.stringify(ordinary), /router/);

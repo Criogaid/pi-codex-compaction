@@ -125,6 +125,7 @@ export interface ProviderRequestInputs {
 
 interface ProviderRequestFields {
   readonly instructions?: string;
+  readonly tools?: readonly JsonObject[];
   readonly reasoning?: JsonObject;
   readonly prompt_cache_key?: string;
   readonly prompt_cache_retention?: string;
@@ -166,8 +167,8 @@ function captureProviderRequest(
   return {
     sessionId: context.sessionId, identity: context.identity, sourceFingerprints: context.sourceFingerprints,
     inputsKey: requestInputsKey(target, inputs),
-    fields: structuredClone({ instructions, reasoning, prompt_cache_key, prompt_cache_retention, service_tier }),
-    verbosity, prefix: structuredClone(declarationPrefix(payload.input).filter((item) => item.type !== "additional_tools")),
+    fields: structuredClone({ instructions, tools, reasoning, prompt_cache_key, prompt_cache_retention, service_tier }),
+    verbosity, prefix: structuredClone(declarationPrefix(payload.input)),
   };
 }
 
@@ -180,7 +181,7 @@ export function providerRequestFor(
     snapshot.inputsKey === requestInputsKey(target, inputs) ? snapshot : undefined;
 }
 
-/** Copy the observed prompt and cache-related fields, never tool schemas or transient response state. */
+/** Replace only declarations and cache-related fields; Pi owns transport, output limits, and response state. */
 export function applyProviderRequest(
   payload: JsonObject, target: CapableModel, snapshot: ProviderRequestSnapshot | undefined,
 ): JsonObject {
@@ -297,8 +298,7 @@ function withoutImages(messages: Message[]): Message[] {
 
 /**
  * Build compaction's provider context from the current transcript and the snapshots bound to this
- * session, model, and backend. Keep internal tool declarations for Pi's serialization;
- * the remote request boundary removes their wire schemas after historical calls are converted.
+ * session, model, and backend. Preserve tool declarations for the request prefix and historical-call serialization.
  */
 export function compactionRequest(
   snapshots: RequestSnapshots,

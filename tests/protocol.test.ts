@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CodexCompactionProtocolError, appendCompactionTrigger, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker, withoutInputImages, withoutToolDeclarations } from "../src/protocol.js";
+import { CodexCompactionProtocolError, appendCompactionTrigger, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker, withoutInputImages } from "../src/protocol.js";
 
 const item = { type: "compaction", encrypted_content: "opaque" };
 const done = { type: "response.output_item.done", item };
@@ -60,7 +60,7 @@ test("blocks replayed user and tool-output images without changing saved history
   assert.deepEqual(history, saved);
 });
 
-test("omits tool schemas and synthetic loads while preserving real tool history and request options", () => {
+test("preparing V2 preserves tool declarations and loading history before the trigger", () => {
   const schema = { type: "function", name: "internal_read", description: "private-schema", parameters: { type: "object" } };
   const history = [
     { role: "developer", content: "Keep the task constraints" },
@@ -78,13 +78,8 @@ test("omits tool schemas and synthetic loads while preserving real tool history 
   const payload = { model: "gpt", input: history, tools: [schema], tool_choice: { type: "function", name: "internal_read" },
     reasoning: { effort: "high" }, prompt_cache_key: "same-session" };
   const saved = structuredClone(payload);
-  const filtered = withoutToolDeclarations(payload);
-  assert.equal(filtered.tools, undefined);
-  assert.equal(filtered.tool_choice, undefined);
-  assert.deepEqual(filtered.input, [history[0], history[4], { ...history[5], tools: [] }, ...history.slice(6)]);
-  assert.deepEqual(filtered.reasoning, payload.reasoning);
-  assert.equal(filtered.prompt_cache_key, payload.prompt_cache_key);
-  assert.doesNotMatch(JSON.stringify(filtered), /private-schema|pi_tool_load_fixture/);
+  const prepared = prepareRemoteCompactionPayload(payload);
+  assert.deepEqual(prepared, { ...payload, input: [...history, { type: "compaction_trigger" }] });
   assert.deepEqual(payload, saved);
 });
 

@@ -34,26 +34,6 @@ export function withoutInputImages(items: readonly JsonObject[]): JsonObject[] {
   });
 }
 
-/** Pi exposes no current hidden-declaration projection; V2 must not reuse stale tool schemas. */
-export function withoutToolDeclarations(payload: JsonObject): JsonObject {
-  if (!Array.isArray(payload.input)) {
-    throw new CodexCompactionProtocolError("Codex payload is missing an input array");
-  }
-  const { tools: _tools, tool_choice: _choice, ...rest } = payload;
-  // Pi synthesizes these pairs solely to carry system tool additions. Real search history stays.
-  const loadCalls = new Set(payload.input.flatMap((item: unknown) =>
-    isObject(item) && item.type === "tool_search_call" && item.execution === "client" &&
-    typeof item.call_id === "string" && item.call_id.startsWith("pi_tool_load_") ? [item.call_id] : []));
-  return { ...rest, input: payload.input.flatMap((item: unknown) => {
-    if (!isObject(item)) return [item];
-    if (item.type === "additional_tools") return [];
-    if ((item.type === "tool_search_call" || item.type === "tool_search_output") &&
-        typeof item.call_id === "string" && loadCalls.has(item.call_id)) return [];
-    if (item.type === "tool_search_output") return [{ ...item, tools: [] }];
-    return [item];
-  }) };
-}
-
 function isCompactionType(type: unknown): boolean {
   return type === "compaction" || type === "compaction_summary";
 }

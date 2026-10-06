@@ -6,7 +6,7 @@ import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, typ
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
-import { CodexCompactionProtocolError, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload, withoutInputImages, withoutToolDeclarations } from "./protocol.js";
+import { CodexCompactionProtocolError, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
 import { applyProviderRequest, type ProviderRequestSnapshot } from "./request-snapshot.js";
 import { CompactionAttempt, compactionRetryLimit, waitForCompactionRetry } from "./remote-retry.js";
 
@@ -161,13 +161,10 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
             const contextItems = contextUserItems(isObject(payload) ? payload.input : undefined, request.userItemOrigins);
             const payloadItems = isObject(payload) && Array.isArray(payload.input) ? payload.input.filter(isObject) : [];
             const estimates = await estimateImages([...payloadItems, ...checkpoint?.replacementHistory ?? []], request.signal);
-            const prepared = prepareRemoteCompactionPayload(payload, checkpoint, (history) => {
-              // Enforce after snapshot reuse and checkpoint replay so neither can restore stale schemas.
-              const declared = withoutToolDeclarations(history);
-              return { ...declared,
-                input: trimToolOutputsToContextWindow(objectItems(declared.input), declared.instructions, preparedModel.contextWindow, estimates),
-              };
-            });
+            const prepared = prepareRemoteCompactionPayload(payload, checkpoint, (history) => ({
+              ...history,
+              input: trimToolOutputsToContextWindow(objectItems(history.input), history.instructions, preparedModel.contextWindow, estimates),
+            }));
             if (prepared.model !== model.id) throw new CodexCompactionProtocolError("Provider payload used an unexpected model");
             const sent = objectItems(prepared.input).slice(0, -1);
             contextual = sent.map((item) => contextItems.has(item));

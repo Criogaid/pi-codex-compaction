@@ -85,7 +85,7 @@ function requestTransform(onReady?: (pi: ExtensionAPI) => void): ExtensionFactor
 }
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
-  test(`real ${api} compaction reuses observed instructions and cache fields without schemas or old response state`, { timeout: 20_000 }, async () => {
+  test(`real ${api} compaction reuses observed declarations and cache fields without old response state`, { timeout: 20_000 }, async () => {
     const fixture = await sessionFixture({ api, extensions: [requestTransform(), createCodexCompactionExtension()] });
     try {
       for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Preserve the implementation constraints. ".repeat(60)}`);
@@ -99,7 +99,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         assert.deepEqual(compacting[field], ordinary[field], `Compaction must preserve the observed ${field}`);
       }
       assert.ok(Array.isArray(ordinary.tools) && ordinary.tools.length > 0);
-      assert.equal(compacting.tools, undefined, "V2 cannot verify the current Pi tool visibility");
+      assert.deepEqual(compacting.tools, ordinary.tools, "V2 preserves the ordinary request's tool prefix");
       assert.ok(Array.isArray(ordinary.input));
       assert.deepEqual(compacting.input.slice(0, ordinary.input.length), ordinary.input);
       assert.equal(compacting.previous_response_id, undefined);

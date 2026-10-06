@@ -8,7 +8,7 @@ import { getDeclaredTools, normalizeContext } from "@earendil-works/pi-ai/utils/
 import type { CapableModel } from "../src/capability.js";
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, fingerprintMessage } from "../src/checkpoint.js";
 import { applyProviderRequest, compactionRequest, providerRequestFor, RequestSnapshotTracker, type ProviderRequestInputs, type RequestDeclarations } from "../src/request-snapshot.js";
-import { isObject, withoutToolDeclarations } from "../src/protocol.js";
+import { isObject } from "../src/protocol.js";
 
 const sessionId = "snapshot-session";
 const model: Model<"openai-responses"> = {
@@ -258,7 +258,7 @@ const wirePayload = () => ({
   previous_response_id: "old-response", max_output_tokens: 123, store: true, stream: false, metadata: { private: "not-copied" },
 });
 
-test("observed prompt and cache fields survive newer messages without copying tool schemas or transient state", () => {
+test("observed declarations and cache fields survive newer messages without copying transient state", () => {
   const canonical = [system(), user()];
   const observed = wirePayload();
   const tracker = observedRequest(canonical, observed);
@@ -271,15 +271,13 @@ test("observed prompt and cache fields survive newer messages without copying to
     tools: [], text: { verbosity: "high" }, max_output_tokens: 4_096, store: false, stream: true };
   const result = applyProviderRequest(fresh, target, snapshot);
   const original = wirePayload();
-  assert.equal("tools" in snapshot.fields, false);
-  assert.deepEqual(result.tools, fresh.tools, "the observation never restores old tool schemas");
+  assert.deepEqual(result.tools, original.tools);
   assert.deepEqual(result.reasoning, original.reasoning);
   assert.equal(result.prompt_cache_key, original.prompt_cache_key);
   assert.equal(result.prompt_cache_retention, original.prompt_cache_retention);
   assert.equal(result.service_tier, original.service_tier);
   assert.deepEqual(result.text, { verbosity: original.text.verbosity });
-  assert.deepEqual(result.input, [original.input[0], fresh.input[1]]);
-  assert.doesNotMatch(JSON.stringify(snapshot.prefix), /internal_read/);
+  assert.deepEqual(result.input, [...original.input.slice(0, 2), fresh.input[1]]);
   assert.equal(result.previous_response_id, undefined);
   assert.equal(result.metadata, undefined);
   assert.equal(result.max_output_tokens, fresh.max_output_tokens);
@@ -317,6 +315,7 @@ test("missing wire fields remove obsolete defaults and malformed observations di
   assert.ok(snapshot);
   const actual = applyProviderRequest(wirePayload(), target, snapshot);
   assert.equal(actual.instructions, undefined);
+  assert.equal(actual.tools, undefined);
   assert.equal(actual.prompt_cache_key, undefined);
   assert.deepEqual(actual.text, { format: { type: "json_object" } });
   for (const invalid of [null, {}, { ...payload, tools: "invalid" }, { ...payload, input: [null] },
@@ -342,7 +341,7 @@ test("retry observations replace wire fields and reset detaches a captured compa
 });
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
-  test(`${api} keeps historical grammar calls intact before removing wire declarations`, () => {
+  test(`${api} preserves grammar declarations and historical custom-tool calls`, () => {
     const grammar: Tool = { name: "grammar_tool", description: "Grammar fixture",
       parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
       constrainedSampling: { type: "grammar", variants: { openai_regex: "ping" } } };
@@ -362,12 +361,13 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       supportsMidConvoSystemMessages: true,
       grammarToolInputProperties: createGrammarToolInputProperties(getDeclaredTools(context.messages), true),
     });
-    const wire = withoutToolDeclarations({ model: model.id, input: converted,
-      tools: convertResponsesTools([grammar], { supportsOpenAIGrammarTools: true }) });
-    assert.equal(wire.tools, undefined);
+    const wire = { model: model.id, input: converted,
+      tools: convertResponsesTools([grammar], { supportsOpenAIGrammarTools: true }) };
+    assert.equal(wire.tools[0].type, "custom");
     assert.ok(Array.isArray(wire.input));
     const calls = wire.input.filter(isObject).filter((item) => item.type === "custom_tool_call" || item.type === "custom_tool_call_output");
-    assert.deepEqual(calls.map((item) => item.type), ["custom_tool_call", "custom_tool_call_output"]);
+    assert.equal(calls.length, 2);
+    assert.ok(calls[0].type === "custom_tool_call" && calls[1].type === "custom_tool_call_output");
     assert.equal(calls[0].input, "ping");
     assert.equal(calls[1].output, "pong");
     assert.equal(calls[0].call_id, calls[1].call_id);
