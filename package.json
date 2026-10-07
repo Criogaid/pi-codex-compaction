@@ -45,10 +45,10 @@
     "saxes": "6.0.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.99.1",
-    "@earendil-works/pi-ai": "0.99.1",
-    "@earendil-works/pi-coding-agent": "0.99.1",
-    "@earendil-works/pi-tui": "0.99.1",
+    "@earendil-works/pi-agent-core": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-tui": "1.0.4",
     "@types/node": "26.1.1",
     "@types/proper-lockfile": "4.1.4",
     "typescript": "7.0.2"

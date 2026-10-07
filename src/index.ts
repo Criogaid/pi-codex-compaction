@@ -367,6 +367,10 @@ export function createCodexCompactionExtension(
       return payload;
     });
 
+    pi.on("agent_settled", (_event, ctx) => {
+      snapshots.recordSettledRun(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => providerRequestInputs(pi, ctx));
+    });
+
     pi.on("model_select", async (event, ctx) => {
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || await compatibleIdentity(checkpoint.details, ctx, event.model)) return;

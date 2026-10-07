@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { getCurrentSystemMessage, getSystemMessageText } from "@earendil-works/pi-ai";
+import { buildSessionContext, convertToLlm, type ExtensionAPI, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { readFile, writeFile } from "node:fs/promises";
 import { createCodexCompactionExtension } from "../src/index.js";
 import { parseCheckpointDetails } from "../src/checkpoint.js";
@@ -209,6 +210,57 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         assert.ok(!JSON.stringify(saved.details).includes("Private context"), "Hidden extension messages stay out of plaintext retention");
         if (cycle === 0) await fixture.reopen();
       }
+      assert.deepEqual(fixture.errors, []);
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+for (const api of ["openai-responses", "openai-codex-responses"] as const) {
+  test(`real ${api} compaction reuses the wire prefix after non-forced systemPromptOptions settle`, { timeout: 20_000 }, async () => {
+    const runPrompts: string[] = [];
+    const settledPrompts: string[] = [];
+    let runs = 0;
+    const perRunPrompt: ExtensionFactory = (pi) => {
+      pi.on("before_agent_start", (event) => {
+        assert.equal(event.systemPromptOptions.forceSystemPrompt, undefined);
+        event.systemPromptOptions.sections.fixture_run = `Keep the instructions for run ${++runs}.`;
+      });
+      pi.on("before_provider_request", (event, ctx) => {
+        const branch = ctx.sessionManager.getBranch();
+        const head = getCurrentSystemMessage(convertToLlm(buildSessionContext(branch, branch.at(-1)?.id ?? null).messages));
+        assert.ok(head);
+        const prompt = ctx.getSystemPrompt();
+        assert.equal(getSystemMessageText(head), prompt, "Structured run options are persisted without a forced override");
+        assert.match(prompt, /Keep the instructions for run/);
+        runPrompts.push(prompt);
+        assert.ok(isObject(event.payload));
+        return { ...event.payload, previous_response_id: undefined, prompt_cache_options: { mode: "explicit", ttl: "30m" } };
+      });
+      pi.on("agent_settled", (_event, ctx) => { settledPrompts.push(ctx.getSystemPrompt()); });
+    };
+    const fixture = await sessionFixture({ api, extensions: (fetch) => [
+      requestTransform(), perRunPrompt, createCodexCompactionExtension({ fetch }),
+    ] });
+    try {
+      for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Preserve the run's decisions. ".repeat(60)}`);
+      assert.equal(runPrompts.length, runs);
+      assert.equal(settledPrompts.length, runs);
+      assert.equal(new Set(runPrompts).size, runs, "Each ordinary request observes its own structured prompt update");
+      for (let index = 0; index < runs; index++) assert.notEqual(runPrompts[index], settledPrompts[index]);
+      assert.equal(fixture.session.systemPrompt, settledPrompts.at(-1));
+      const ordinary = fixture.requests.at(-1)?.payload;
+      assert.ok(ordinary && Array.isArray(ordinary.input));
+      await fixture.session.compact();
+      const compact = fixture.requests.at(-1)?.payload;
+      assert.ok(compact && Array.isArray(compact.input));
+      for (const field of ["instructions", "tools", "reasoning", "text", "prompt_cache_key", "prompt_cache_retention", "prompt_cache_options", "service_tier"]) {
+        assert.deepEqual(compact[field], ordinary[field], `Compaction preserves ${field} after structured run options settle`);
+      }
+      assert.deepEqual(compact.input.slice(0, ordinary.input.length), ordinary.input);
+      assert.deepEqual(compact.input.at(-1), { type: "compaction_trigger" });
+      assert.ok(JSON.stringify(compact.input.slice(ordinary.input.length)).includes(`Fixture reply ${runs}.`));
       assert.deepEqual(fixture.errors, []);
     } finally {
       await fixture.close();

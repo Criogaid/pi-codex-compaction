@@ -18,17 +18,19 @@ export function isInputImage(value: unknown): value is JsonObject {
   return isObject(value) && value.type === "input_image";
 }
 
+/** Pi's placeholder for a blocked image; replayed and fresh history must match it byte for byte. */
+export const BLOCKED_IMAGE_TEXT = "Image reading is disabled.";
+
 /** Apply Pi's current image policy to replayed Responses items without changing saved history. */
 export function withoutInputImages(items: readonly JsonObject[]): JsonObject[] {
-  const blockedText = "Image reading is disabled.";
   return items.map((item) => {
     const field = item.role === "user" ? "content"
       : item.type === "function_call_output" || item.type === "custom_tool_call_output" ? "output" : undefined;
     const parts = field && item[field];
     if (!field || !Array.isArray(parts) || !parts.some(isInputImage)) return item;
     const blocked = parts.map((part: unknown) => isInputImage(part)
-      ? { type: "input_text", text: blockedText } : part);
-    const isPlaceholder = (part: unknown) => isObject(part) && part.type === "input_text" && part.text === blockedText;
+      ? { type: "input_text", text: BLOCKED_IMAGE_TEXT } : part);
+    const isPlaceholder = (part: unknown) => isObject(part) && part.type === "input_text" && part.text === BLOCKED_IMAGE_TEXT;
     return { ...item, [field]: blocked.filter((part, index) =>
       !(index > 0 && isPlaceholder(part) && isPlaceholder(blocked[index - 1]))) };
   });

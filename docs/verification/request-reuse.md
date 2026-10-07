@@ -4,11 +4,11 @@
 
 ## 当前边界
 
-V2 保留结构化工具声明和历史工具加载记录；符合会话、模型、后端、历史前缀及当前设置约束时，复用普通请求的完整 wire 前缀，以及系统指令、思考、并行工具调用、输出格式、verbosity、缓存模式/TTL、缓存键和服务等级。临时提示词结束后仅恢复到同一源提示词不会使快照失效；切换界面主题不使快照失效，真正的提示词或其他设置变化仍会失效。没有可用快照时由 Pi 序列化会话声明。Pi 未公开隐藏工具投影的修订号，因此只改变隐藏状态而公开输入不变时，旧快照仍可能被复用。
+V2 保留结构化工具声明和历史工具加载记录；符合会话、模型、后端、历史前缀及当前设置约束时，复用普通请求的完整 wire 前缀，以及系统指令、思考、并行工具调用、输出格式、verbosity、缓存模式/TTL、缓存键和服务等级。临时提示词结束后仅恢复到同一源提示词不会使快照失效；本轮结束时 Pi 改报基础提示词，若该轮最后一次请求的其他输入均未变化，也继续接受快照。主题、思考块显示、终端、编辑器和全屏显示等 Pi 0.99.1 与 1.0.4 中只影响显示或交互的设置不参与匹配，真正的提示词或其他设置变化仍会失效。没有可用快照时由 Pi 序列化会话声明。Pi 未公开隐藏工具投影的修订号，因此只改变隐藏状态而公开输入不变时，旧快照仍可能被复用。
 
 快照记录 checkpoint 重放前的 input 和逐项上下文来源。压缩时由 Pi 序列化新增尾部，通过仅用于本地定位的边界项拼接完整旧前缀；该项在发送前移除。检查点在普通请求和 V2 中各重放一次，隐藏扩展消息仍不进入明文保留区。预热操作和诊断响应 ID 不随缓存策略复用。普通请求依赖 `previous_response_id`、`conversation` 或 `item_reference` 时，仅复用独立参数，历史由 Pi 从本地完整上下文重建。
 
-两种 Responses API 的回归测试覆盖本轮临时提示词结束后的字段复用、历史文本投影和显式缓存断点、中途隐藏的 additional_tools/工具搜索声明、重开会话后的再次压缩，以及整次重试的请求体一致性。完整前缀修复前，定向测试 22 项中 6 项失败。主题切换的两项回归在修复前均失败，修复后仅改主题再直接压缩，工具声明和已有 input 前缀仍与普通请求一致。当前完整测试 478 项中 477 项通过，1 项因 Windows 符号链接权限跳过。离线测试验证请求内容，不保证服务端缓存命中。
+两种 Responses API 的回归测试覆盖本轮临时提示词结束后的字段复用、历史文本投影和显式缓存断点、中途隐藏的 additional_tools/工具搜索声明、重开会话后的再次压缩，以及整次重试的请求体一致性。完整前缀修复前，定向测试 22 项中 6 项失败。主题切换的两项回归在修复前均失败，修复后仅改主题再直接压缩，工具声明和已有 input 前缀仍与普通请求一致。当前在 Pi 1.0.4 上运行完整测试 514 项，513 项通过，1 项因 Windows 符号链接权限跳过。离线测试验证请求内容，不保证服务端缓存命中。
 
 V2 对完整 SSE 请求与收集过程重试：额外次数不超过 Pi provider 设置与 2 的较小值，内层 HTTP 重试为 0。首次准备完成后固定请求体与后端，后续尝试重新认证并校验归属；只有明确暂时故障才重试，无效/重复压缩输出、永久错误和取消不会重试。重定向沿用 provider 和 fetch，传输固定为 SSE，未实现 Codex 的 WebSocket 到 HTTP 切换。
 
@@ -17,6 +17,34 @@ V2 对完整 SSE 请求与收集过程重试：额外次数不超过 Pi provider
 已有 V2 检查点也允许原生文字摘要回退。文字摘要无法解读加密历史，成功后它成为活动上下文；原持久化检查点保持不变。配置保存使用跨进程锁，检查点图片重放遵守当前图片读取设置。
 
 这些检查仍受本扩展的钩子位置限制：之后执行的扩展可以继续改写请求，Pi 的隐藏状态和服务端缓存状态也不由快照证明。离线 fixture 不用于推断摘要质量、线上模型兼容性或费用。当前回归范围与运行命令见[对照记录](codex-v2-parity.md#9-本轮验证与复现边界)；下方 Windows/TS7 耗时记录保留原样。
+
+## Pi 1.0.4 运行结束后的快照验证
+
+Pi 的 `AgentSession._runAgentPrompt()` 在 `finally` 中先清除 `_runSystemPromptOptions`，再发出 `agent_settled`；此时 `ctx.getSystemPrompt()` 返回基础提示词。扩展在 `before_agent_start` 修改 `systemPromptOptions.sections` 时，本轮提示词已写入会话系统消息，并不产生 forced-prompt override。仅匹配观察时提示词会在运行结束后丢弃仍可复用的请求快照。
+
+新增 36 项测试。单元测试验证基础提示词在 settle 前不匹配、settle 后复用前缀与字段；别名每份快照只记录一次，新 provider 请求清除旧别名。思考等级、启用工具、工具定义、transport、图片读取、thinkingBudgets 或未知设置变化，在 settle 和复用两个阶段均拒绝匹配；其他会话、模型或后端的 settle 不能建立别名。21 个界面设置分别验证添加、移除及 settle 后的匹配。
+
+两项真实 Pi 会话测试分别使用 `openai-responses` 和 `openai-codex-responses`。扩展连续三轮修改结构化提示词，确认持久化提示词等于请求时有效提示词、结束后恢复基础提示词，然后手动压缩，检查完整 input 前缀、instructions、tools、reasoning、text、prompt_cache_* 和 service_tier 一致。网络边界仍使用模拟 SSE。原有 forced-prompt 和 theme 场景继续通过。
+
+在独立工作树中编译修复前的 `6eb2ccd`，使用同一套 Pi 1.0.4 依赖和新增会话测试，两项均失败：Responses 的 instructions 为 undefined，Codex Responses 使用会话提示词，都没有复用普通请求的 `fixture-wire-instructions`。修复后两项均通过。旧版断言停在 instructions，因此该对照不单独证明旧版每个字段或前缀都发生了变化。
+
+`npm ci --ignore-scripts`、`npm run typecheck`、`npm test` 和 `npm run pack:check` 均通过。安装后的四个 Pi 开发依赖均为 1.0.4，peer 范围保持 `>=0.99.1`。原有 478 项测试在补齐 remote fixture 的必填 `systemPrompt` 后全部符合预期，无需放宽行为断言。历史耗时与测试数保留在下文。
+
+### 界面设置排除依据
+
+核对 Pi 0.99.1 与 1.0.4 发布包的 `dist/core/settings-manager.js` getter 和调用位置；以下字段用于显示、交互或导出样式，不构造 provider 输入。1.0.4 的主要读取位置如下，路径均相对 Pi 包。
+
+| 设置 | 读取位置及用途 |
+| --- | --- |
+| `autocompleteMaxVisible`、`editorPaddingX`、`externalEditor`、`doubleEscapeAction` | `dist/modes/interactive/interactive-mode.js`：编辑器、外部编辑命令和按键动作 |
+| `collapseChangelog`、`lastChangelogVersion`、`quietStartup` | 同文件：启动输出与更新日志显示 |
+| `fullscreenCopyOnSelect`、`fullscreenExitOutput`、`fullscreenScrollbar`、`fullscreenWheelScrollLines`、`tuiMode` | 同文件：渲染器初始化、滚动与退出画面 |
+| `hideThinkingBlock`、`outputPad`、`showCacheMissNotices`、`showHardwareCursor`、`treeFilterMode` | 同文件：消息显示、间距、缓存通知、光标和会话树筛选 |
+| `markdown`、`warnings` | 同文件：代码块缩进、Mermaid 渲染和 Anthropic 额外用量确认 |
+| `terminal` | 同文件及 `dist/cli/startup-ui.js`、`dist/main.js`：终端图片、颜色、链接、进度与清屏；`dist/core/resource-loader.js` 只用终端颜色能力构造主题 |
+| `theme` | 交互界面与 `dist/core/agent-session.js` 的 HTML 导出样式 |
+
+`terminal.showImages` 控制终端显示；`images.blockImages` 控制发往模型的图片，两者分别测试。排除表以外的设置，包括未知键，仍参与匹配。这里描述 Pi 自身读取方式；其他扩展若根据界面设置改写请求，仍受前述钩子可见范围限制。
 
 ## 2026-10-02 历史记录
 

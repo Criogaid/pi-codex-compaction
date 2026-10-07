@@ -6,10 +6,19 @@ import { getCurrentSystemMessage, getSystemMessageText, type Context, type Messa
 import { convertToLlm, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
 import { type CodexCheckpointDetails, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
-import { CodexCompactionProtocolError, isObject, type JsonObject } from "./protocol.js";
+import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, isObject, type JsonObject } from "./protocol.js";
 import { contextUserItems, userItemOrigins } from "./retention-input.js";
 
-const BLOCKED_IMAGE_TEXT = "Image reading is disabled.";
+/**
+ * In Pi 0.99.1 and 1.0.4 these settings affect presentation, not provider inputs. Every other setting,
+ * including unknown future ones, stays in the reuse key, so changing it drops the wire snapshot.
+ */
+const INTERFACE_ONLY_SETTINGS: ReadonlySet<string> = new Set([
+  "autocompleteMaxVisible", "collapseChangelog", "doubleEscapeAction", "editorPaddingX", "externalEditor",
+  "fullscreenCopyOnSelect", "fullscreenExitOutput", "fullscreenScrollbar", "fullscreenWheelScrollLines",
+  "hideThinkingBlock", "lastChangelogVersion", "markdown", "outputPad", "quietStartup", "showCacheMissNotices",
+  "showHardwareCursor", "terminal", "theme", "treeFilterMode", "tuiMode", "warnings",
+]);
 
 interface SnapshotScope {
   readonly sessionId: string;
@@ -141,7 +150,11 @@ interface ProviderRequestFields {
 
 export interface ProviderRequestSnapshot extends SnapshotScope {
   readonly sourceFingerprints: readonly string[];
+  /** The effective prompt `ctx.getSystemPrompt()` reported for the observed request. */
+  readonly systemPrompt: string;
   readonly inputsKey: string;
+  /** The same inputs after the observed run settled and Pi fell back to its base prompt options. */
+  readonly settledInputsKey?: string;
   readonly fields: ProviderRequestFields;
   /** Absent when the observed input depends on server-side conversation state. */
   readonly prefix?: {
@@ -153,8 +166,7 @@ export interface ProviderRequestSnapshot extends SnapshotScope {
 }
 
 function requestInputsKey(target: CapableModel, inputs: ProviderRequestInputs): string {
-  // Theme selection changes presentation, not the provider request. Keep other settings conservative.
-  const { theme: _theme, ...settings } = inputs.settings;
+  const settings = Object.fromEntries(Object.entries(inputs.settings).filter(([key]) => !INTERFACE_ONLY_SETTINGS.has(key)));
   return JSON.stringify({ model: target.model, ...inputs, settings });
 }
 
@@ -186,7 +198,7 @@ function captureProviderRequest(
     payload.input.some((item) => item.type === "item_reference");
   return {
     sessionId: context.sessionId, identity: context.identity, sourceFingerprints: context.sourceFingerprints,
-    inputsKey: requestInputsKey(target, inputs),
+    systemPrompt: inputs.systemPrompt, inputsKey: requestInputsKey(target, inputs),
     fields: structuredClone({ instructions, tools, reasoning, parallel_tool_calls, text, prompt_cache_key,
       prompt_cache_retention, prompt_cache_options: cachePolicy, service_tier }),
     prefix: serverHistory ? undefined : {
@@ -203,8 +215,9 @@ export function providerRequestFor(
   const snapshot = snapshotFor(snapshots.providerRequest, sessionId, target);
   const override = promptOverrideFor(snapshots.promptOverride, sessionId, target, current, inputs.systemPrompt);
   const effectiveInputs = override ? { ...inputs, systemPrompt: override.text } : inputs;
+  const key = requestInputsKey(target, effectiveInputs);
   return snapshot && matchingSource(current, snapshot) &&
-    snapshot.inputsKey === requestInputsKey(target, effectiveInputs) ? snapshot : undefined;
+    (snapshot.inputsKey === key || snapshot.settledInputsKey === key) ? snapshot : undefined;
 }
 
 /** Replace the serialized prefix up to the private boundary; never let that boundary reach the provider. */
@@ -252,7 +265,8 @@ interface TrackedSnapshots {
 
 /**
  * Follow one ordinary request through Pi's hooks: `context`, then `context_with_system`, then
- * `before_provider_request` for each provider attempt. State lives only as long as the Pi process.
+ * `before_provider_request` for each provider attempt, then `agent_settled` when its run ends.
+ * State lives only as long as the Pi process.
  */
 export class RequestSnapshotTracker {
   private state: TrackedSnapshots = {};
@@ -310,6 +324,20 @@ export class RequestSnapshotTracker {
       const { payload, inputs } = observation();
       this.state.providerRequest = captureProviderRequest(context, target, payload, inputs);
     }
+  }
+
+  /**
+   * `agent_settled`: Pi drops the run's prompt options, so `ctx.getSystemPrompt()` reports the base prompt
+   * until the next run. Accept that prompt for the run's last request only while every other input is unchanged;
+   * the request prefix still comes from the transcript the snapshot's source fingerprints bind.
+   */
+  recordSettledRun(sessionId: string, target: CapableModel | undefined, inputs: () => ProviderRequestInputs): void {
+    if (!target) return;
+    const snapshot = snapshotFor(this.state.providerRequest, sessionId, target);
+    if (!snapshot || snapshot.settledInputsKey !== undefined) return;
+    const settled = inputs();
+    if (requestInputsKey(target, { ...settled, systemPrompt: snapshot.systemPrompt }) !== snapshot.inputsKey) return;
+    this.state.providerRequest = { ...snapshot, settledInputsKey: requestInputsKey(target, settled) };
   }
 }
 

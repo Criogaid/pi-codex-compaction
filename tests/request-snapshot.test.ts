@@ -417,3 +417,132 @@ for (const reference of [
     assert.equal(payload.prompt_cache_key, wirePayload().prompt_cache_key);
   });
 }
+
+test("a non-forced run prompt reuses its wire prefix only after the matching run settles", () => {
+  const canonical = [system(), user()];
+  const observed = { ...wirePayload(), prompt_cache_options: { mode: "explicit", ttl: "30m" } };
+  const tracker = observedRequest(canonical, observed);
+  const baseInputs = { ...inputs, systemPrompt: "base prompt" };
+  assert.equal(tracker.current().promptOverride, undefined, "The persisted head already contains the run prompt");
+  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs), undefined);
+  tracker.recordSettledRun(sessionId, target, () => baseInputs);
+  const current = [...canonical, user("new suffix", 2)];
+  const snapshot = providerRequestFor(tracker.current(), sessionId, target, current, baseInputs);
+  assert.ok(snapshot?.prefix);
+  const request = compactionRequest(tracker.current(), sessionId, target, current,
+    { ...declarationsInTranscript, systemPrompt: () => baseInputs.systemPrompt }, snapshot);
+  const fresh = { model: model.id, input: convertResponsesMessages(model, normalizeContext(request.context), new Set([model.provider])) };
+  const { payload } = applyProviderRequest(fresh, target, snapshot);
+  assert.ok(Array.isArray(payload.input));
+  assert.deepEqual(payload.input.slice(0, observed.input.length), observed.input);
+  assert.deepEqual(payload.input.slice(observed.input.length), [{ role: "user", content: [{ type: "input_text", text: "new suffix" }] }]);
+  for (const field of ["instructions", "tools", "prompt_cache_key", "prompt_cache_retention", "prompt_cache_options"] as const) {
+    assert.deepEqual(payload[field], observed[field]);
+  }
+  assert.ok(providerRequestFor(tracker.current(), sessionId, target, current, inputs), "The observed run prompt remains valid");
+  assert.equal(providerRequestFor(tracker.current(), sessionId, target, current, { ...baseInputs, systemPrompt: "unobserved prompt" }), undefined);
+  assert.equal(providerRequestFor(tracker.current(), sessionId, target, [system("edited head"), user()], baseInputs), undefined);
+});
+
+const unknownSettings = { ...inputs.settings, futureRequestPolicy: "changed" };
+const changedRequestInputs: readonly (readonly [string, Partial<ProviderRequestInputs>])[] = [
+  ["thinking level", { thinkingLevel: "high" }],
+  ["active tools", { activeTools: ["router"] }],
+  ["tool definitions", { tools: inputs.tools.map((tool) => ({ ...tool, parameters: { type: "object", properties: { path: { type: "string" } } } })) }],
+  ["transport", { settings: { transport: "websocket" } }],
+  ["image blocking", { settings: { images: { blockImages: true } } }],
+  ["thinking budgets", { settings: { thinkingBudgets: { low: 2_048 } } }],
+  ["unknown setting", { settings: unknownSettings }],
+];
+
+for (const [name, change] of changedRequestInputs) {
+  test(`a settled prompt alias rejects changed ${name} both at settlement and reuse`, () => {
+    const canonical = [system(), user()];
+    const baseInputs = { ...inputs, systemPrompt: "base prompt" };
+    const changed = { ...baseInputs, ...change };
+    const rejected = observedRequest(canonical, wirePayload());
+    rejected.recordSettledRun(sessionId, target, () => changed);
+    assert.equal(rejected.current().providerRequest?.settledInputsKey, undefined);
+    assert.equal(providerRequestFor(rejected.current(), sessionId, target, canonical, baseInputs), undefined);
+    assert.equal(providerRequestFor(rejected.current(), sessionId, target, canonical, changed), undefined);
+    const accepted = observedRequest(canonical, wirePayload());
+    accepted.recordSettledRun(sessionId, target, () => baseInputs);
+    assert.ok(providerRequestFor(accepted.current(), sessionId, target, canonical, baseInputs));
+    assert.equal(providerRequestFor(accepted.current(), sessionId, target, canonical, changed), undefined);
+  });
+}
+
+test("settlement records one base prompt per snapshot and the next provider request replaces it", () => {
+  const canonical = [system(), user()];
+  const tracker = observedRequest(canonical, wirePayload());
+  const baseInputs = { ...inputs, systemPrompt: "first base prompt" };
+  const laterInputs = { ...inputs, systemPrompt: "later base prompt" };
+  tracker.recordSettledRun(sessionId, target, () => baseInputs);
+  tracker.recordSettledRun(sessionId, target, () => laterInputs);
+  assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs));
+  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, laterInputs), undefined);
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt,
+    () => ({ payload: { ...wirePayload(), prompt_cache_key: "next-request" }, inputs }));
+  assert.equal(tracker.current().providerRequest?.settledInputsKey, undefined);
+  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs), undefined);
+  assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, inputs));
+  tracker.recordSettledRun(sessionId, target, () => laterInputs);
+  const latest = providerRequestFor(tracker.current(), sessionId, target, canonical, laterInputs);
+  assert.equal(latest?.fields.prompt_cache_key, "next-request");
+  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs), undefined);
+});
+
+for (const scope of ["session", "model", "backend", "unsupported model"] as const) {
+  test(`settlement for another ${scope} cannot authorize prompt reuse`, () => {
+    const canonical = [system(), user()];
+    const tracker = observedRequest(canonical, wirePayload());
+    const baseInputs = { ...inputs, systemPrompt: "base prompt" };
+    const settledTarget = scope === "unsupported model" ? undefined
+      : scope === "model" ? { ...target, model: { ...model, id: "gpt-other" }, identity: { ...target.identity, modelId: "gpt-other" } }
+      : scope === "backend" ? { ...target, identity: { ...target.identity, endpoint: "https://other.example/responses" } } : target;
+    tracker.recordSettledRun(scope === "session" ? "other-session" : sessionId, settledTarget, () => baseInputs);
+    assert.equal(tracker.current().providerRequest?.settledInputsKey, undefined);
+    assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs), undefined);
+    tracker.recordSettledRun(sessionId, target, () => baseInputs);
+    assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs));
+  });
+}
+
+const interfaceSettings: readonly ProviderRequestInputs["settings"][] = [
+  { autocompleteMaxVisible: 12 },
+  { collapseChangelog: true },
+  { doubleEscapeAction: "tree" },
+  { editorPaddingX: 2 },
+  { externalEditor: "code --wait" },
+  { fullscreenCopyOnSelect: true },
+  { fullscreenExitOutput: "resume-hint" },
+  { fullscreenScrollbar: "always" },
+  { fullscreenWheelScrollLines: 5 },
+  { hideThinkingBlock: true },
+  { lastChangelogVersion: "1.0.4" },
+  { markdown: { codeBlockIndent: "    ", mermaid: "off" } },
+  { outputPad: 0 },
+  { quietStartup: true },
+  { showCacheMissNotices: false },
+  { showHardwareCursor: true },
+  { terminal: { showImages: false, imageWidthCells: 40, clearOnShrink: true, showTerminalProgress: false, hyperlinks: false, images: false, trueColor: false } },
+  { theme: "light" },
+  { treeFilterMode: "user-only" },
+  { tuiMode: "fullscreen" },
+  { warnings: { anthropicExtraUsage: false } },
+];
+
+for (const settings of interfaceSettings) {
+  test(`changing interface setting ${Object.keys(settings)[0]} preserves observed and settled snapshots`, () => {
+    const canonical = [system(), user()];
+    const tracker = observedRequest(canonical, wirePayload());
+    const changed = { ...inputs, settings };
+    assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, changed));
+    const baseInputs = { ...changed, systemPrompt: "base prompt" };
+    tracker.recordSettledRun(sessionId, target, () => baseInputs);
+    assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs));
+    assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, { ...baseInputs, settings: inputs.settings }));
+    const observedWithSetting = observedRequest(canonical, wirePayload(), changed);
+    assert.ok(providerRequestFor(observedWithSetting.current(), sessionId, target, canonical, inputs), "Removing a display setting also preserves reuse");
+  });
+}

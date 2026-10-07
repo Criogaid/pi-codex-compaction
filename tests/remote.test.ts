@@ -263,7 +263,7 @@ test("the final V2 payload preserves declarations through snapshot reuse and che
     context: { messages: [{ role: "user", content: marker, timestamp: 1 }],
       tools: [{ name: "internal_read", description: "private-schema", parameters: { type: "object", properties: {} } }],
     },
-    providerRequest: { sessionId: "session", identity, sourceFingerprints: [], inputsKey: "fixture",
+    providerRequest: { sessionId: "session", identity, sourceFingerprints: [], systemPrompt: "Keep the effective prompt", inputsKey: "fixture",
       fields: { instructions: "Keep the effective prompt", tools: [schema], prompt_cache_key: "same-session" },
       prefix: { boundary, contextLength: 1, contextual: [false, false],
         input: [{ type: "additional_tools", role: "developer", tools: [schema] }, markerItem] },
