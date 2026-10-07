@@ -20,7 +20,7 @@
 | 查询时最新稳定版 | `rust-v0.160.1` | `d27764b82f7118f674371e6d6e76271d9d606edb` | 排除只对旧版本成立的结论 |
 | 查询时默认分支 | `main` | `c0c230e6730b3b3c9101b8aff4b9aea4027cea5b` | 检查尚未稳定发布的相关变化 |
 
-稳定版发布于 **2026-10-05 18:29:37 UTC**，`prerelease: false`。[稳定版发布记录][stable-release]、[发布元数据][stable-release-metadata]。基线与稳定版的 annotated tag 分别解析到上表 commit，见 [基线 tag 对象][baseline-tag]和[稳定版 tag 对象][stable-tag]。2026-10-06 13:43:24 UTC 再次核对时，最新稳定版仍为 `rust-v0.160.1`；main 保留初次查询时固定的 commit，三个引用不能混作同一个版本。
+稳定版发布于 **2026-10-05 18:29:37 UTC**，`prerelease: false`。[稳定版发布记录][stable-release]、[发布元数据][stable-release-metadata]。基线与稳定版的 annotated tag 分别解析到上表 commit，见 [基线 tag 对象][baseline-tag]和[稳定版 tag 对象][stable-tag]。2026-10-06 13:43:24 UTC 再次核对时，最新稳定版仍为 `rust-v0.160.1`；main 保留初次查询时固定的 commit，三个引用不能混作同一个版本。2026-10-07 补充核对：最新稳定版为 `rust-v0.161.0`，发布于 **2026-10-07 15:58:45 UTC**，`prerelease: false`，annotated tag 对象 `7e21416b38834816c224ea0dfd135c3de94b2f15` 解析到 commit `979011409de0a60b52f179721948e65531d26144`。上表固定引用不变，差异记录在第 7 节末尾。
 
 ## 逐项对照
 
@@ -63,7 +63,7 @@ V2 保留顶层 `tools`、输入中的 `additional_tools` 和工具搜索声明�
 
 临时提示词结束后恢复到未改变的源提示词时，快照仍使用同一有效提示词匹配。复用字段包含 `parallel_tool_calls`、完整 `text` 和 `prompt_cache_options` 的模式/TTL；预热操作、诊断响应 ID、旧输出上限和传输开关不被复制。依赖服务端会话引用的 input 不作为完整前缀复用，仍由 Pi 重建本地历史。
 
-Pi 在 context hook 之后应用隐藏工具投影，且未公开可见性修订号。只改变隐藏状态而公开工具列表、选择和设置不变时，旧快照仍可能被复用；没有快照时，序列化后的声明也未必等于普通请求经过隐藏投影后的声明。本扩展没有完整移植 Codex 的工具与权限状态刷新。
+Pi 在 context hook 之后应用隐藏工具投影，且未公开可见性修订号。Pi 1.0 起系统提示词也省略隐藏工具，隐藏变化若改变提示词中的工具或规则文本，会经有效提示词使快照失效；只改变隐藏状态而提示词、公开工具列表、选择和设置都不变时，旧快照仍可能被复用；没有快照时，序列化后的声明也未必等于普通请求经过隐藏投影后的声明。本扩展没有完整移植 Codex 的工具与权限状态刷新。
 
 测试验证符合复用条件时的工具声明和历史前缀一致性，不保证服务端命中缓存。后续扩展仍可能改变请求；模型路由和服务端缓存状态也影响结果，本轮未用真实服务测量缓存或费用。
 
@@ -85,7 +85,7 @@ Codex 还会按作者/接收者关系、消息类型和 10,000 token 上限保�
 
 上游收集器在收到 completed 后要求 **恰好一条** compaction 的 OutputItemDone；最终 response.output 不会再作为另一份输出来源。[compact_remote_v2.rs 440–501][collector] 插件保留了这个关键约束。本轮 `response.done` 修复源自 Pi Codex adapter 在 raw observer 之后才规范化成功事件；它是对 Pi provider 合同的适配，不能倒过来说上游 Codex 自身以 response.done 作为 V2 必需事件。
 
-上游重试包住整个“发起请求 + 收集流”过程，仅对可重试错误执行重试，每种传输最多额外重试 `min(provider stream retry, 2)` 次；这里的 2 不是请求总次数。常量见 [compact_remote_v2.rs 75–79][v2-constants]；[请求循环][retry-loop]和[重试策略][retry-policy]还处理 WebSocket 到 HTTP 的切换，并在切换成功后重置重试计数。普通重试会等待 server retry advice 指定的时间或本地 backoff；但 WS→HTTPS 切换的首次请求尚未等待该建议，源码 L98 对此留有 TODO。
+上游重试包住整个“发起请求 + 收集流”过程，仅对可重试错误执行重试，每种传输最多额外重试 `min(provider stream retry, 2)` 次；这里的 2 不是请求总次数。常量见 [compact_remote_v2.rs 75–79][v2-constants]；[请求循环][retry-loop]和[重试策略][retry-policy]还处理 WebSocket 到 HTTP 的切换，并在切换成功后重置重试计数。普通重试会等待 server retry advice 指定的时间或本地 backoff；但 WS→HTTPS 切换的首次请求尚未等待该建议，源码 L98 对此留有 TODO；`rust-v0.161.0` 已补上这一等待，见第 7 节末尾。
 
 插件通过整个 V2 attempt 的外层重试覆盖 SSE 中途断开，见 [remote.ts](../../src/remote.ts) 和 [remote-retry.ts](../../src/remote-retry.ts)：默认最多额外 2 次，Pi 配置较小时按较小值；provider 内层 `maxRetries` 固定为 0，每次 attempt 最多调用一次 fetch，避免重试层数相乘。
 
@@ -136,6 +136,8 @@ Git tree 对照未截断。以下文件在基线、最新稳定版和查询时 m
 | `codex-api/src/endpoint/responses.rs` | `9c41a802eadd57cf20ffc733121921d8d3ba9d08` |
 
 稳定版 `0.160.1` 的 `compact_remote_v2.rs` 相对基线仅把 retry handler 的参数从 turn context 改为 step context，retention/collector 算法未变，也没有把 V2 失败改成文字回退。[稳定版 V2 源码][stable-v2] 另外，手动压缩遇到 `UsageLimitExceeded` 时增加生命周期通知；sampling 的 content-filter 错误会记录指导消息。分别见 [stable task L71–L80][stable-task]和 [stable retry L65–L81][stable-retry]。
+
+`rust-v0.161.0` 相对 `0.160.1`：上表五个文件的 blob SHA 不变。`compact_remote_v2.rs`、`compact_remote_v2_attempt.rs` 和 `compact.rs` 只在压缩历史元数据中增加压缩输入里用户目标消息的 `input_goal_ids`，并把 world-state baseline 改为快照类型；保留、图片、工具输出裁剪、收集和截断算法未变。`responses_retry.rs` 删除了 L98 的 TODO，改为切换到 HTTP 前等待服务端给出的重试截止时间。本扩展固定 SSE、不实现该切换，因此对齐范围不受影响。
 
 main 已有额外的生命周期变化，应独立列出：
 
