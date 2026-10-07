@@ -122,6 +122,27 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     });
   }
 
+  test(`${api} changing the theme preserves the observed tools and input prefix`, { timeout: 20_000 }, async () => {
+    const fixture = await sessionFixture({ api, extensions: [
+      hiddenLoadout(["router", "internal_read"], () => {}), createCodexCompactionExtension(),
+    ] });
+    try {
+      for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(prompt(turn));
+      const ordinary = fixture.requests.at(-1)!.payload;
+      assert.doesNotMatch(JSON.stringify(declarations(ordinary)), /internal_read/);
+      fixture.session.settingsManager.setTheme("light");
+      await fixture.session.compact();
+      const compacting = fixture.requests.at(-1)!.payload;
+      assert.deepEqual(declarations(compacting), declarations(ordinary));
+      assert.ok(Array.isArray(ordinary.input) && Array.isArray(compacting.input));
+      assert.deepEqual(compacting.input.slice(0, ordinary.input.length), ordinary.input);
+      assert.deepEqual(compacting.input.at(-1), { type: "compaction_trigger" });
+      assert.deepEqual(fixture.errors, []);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   for (const change of ["reload", "unobserved loadout"] as const) {
     test(`${api} compaction uses serialized declarations after ${change} invalidates the snapshot`, { timeout: 20_000 }, async () => {
       let controls: ExtensionAPI | undefined;

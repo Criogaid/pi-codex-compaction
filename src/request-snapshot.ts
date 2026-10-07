@@ -153,7 +153,9 @@ export interface ProviderRequestSnapshot extends SnapshotScope {
 }
 
 function requestInputsKey(target: CapableModel, inputs: ProviderRequestInputs): string {
-  return JSON.stringify({ model: target.model, ...inputs });
+  // Theme selection changes presentation, not the provider request. Keep other settings conservative.
+  const { theme: _theme, ...settings } = inputs.settings;
+  return JSON.stringify({ model: target.model, ...inputs, settings });
 }
 
 function captureProviderRequest(
