@@ -1,7 +1,7 @@
 // Own Pi lifecycle integration, active-session ownership, checkpoint replay hooks, and compaction orchestration.
 import { resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, Model, Tool } from "@earendil-works/pi-ai";
+import type { Tool } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
   getAgentDir,
@@ -39,6 +39,8 @@ import { compactionRequest, providerRequestFor, RequestSnapshotTracker, type Pro
 
 const STATUS_KEY = "codex-compaction";
 const COMPLETION_ENTRY_TYPE = "pi-codex-compaction-completed";
+const INCOMPATIBLE_BACKEND_WARNING =
+  "The active Codex checkpoint cannot replay on this provider backend; only its fallback marker and retained recent messages remain available.";
 
 interface CompletionEntryData {
   message: string;
@@ -61,12 +63,6 @@ async function compatibleIdentity(
   if (!auth.ok) return undefined;
   const supported = capableModel(model, auth.baseUrl);
   return supported && sameBackend(details, supported.identity) ? supported : undefined;
-}
-
-function selectedModelKey(model: Model<Api> | undefined): string {
-  return JSON.stringify(model ? { provider: model.provider, api: model.api, id: model.id,
-    baseUrl: model.baseUrl, endpoint: capableModel(model)?.identity.endpoint,
-    contextWindow: model.contextWindow, maxTokens: model.maxTokens } : null);
 }
 
 function activeTools(pi: ExtensionAPI): Tool[] {
@@ -130,9 +126,9 @@ function notifyFailure(ctx: ExtensionContext, error: unknown): void {
   ctx.ui.notify(`Codex remote compaction failed; using Pi compaction. ${errorMessage(error)}`, "warning");
 }
 
-function sessionStillOwned(ctx: ExtensionContext, sessionId: string, signal: AbortSignal, modelKey: string): boolean {
-  return !signal.aborted && ctx.sessionManager.getSessionId() === sessionId &&
-    selectedModelKey(ctx.model) === modelKey;
+/** A model switch never cancels compaction; it finishes with the model selected when it started, as Pi's does. */
+function sessionStillOwned(ctx: ExtensionContext, sessionId: string, signal: AbortSignal): boolean {
+  return !signal.aborted && ctx.sessionManager.getSessionId() === sessionId;
 }
 
 async function compactFallback(
@@ -142,11 +138,10 @@ async function compactFallback(
   sessionId: string,
   configuration: CompactionConfiguration,
   remoteError: unknown,
-  modelKey: string,
 ) {
   let announced = false;
   try {
-    if (!sessionStillOwned(ctx, sessionId, event.signal, modelKey)) return { cancel: true };
+    if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
     const result = await requestFallbackCompaction({
       configuration: configuration.fallback,
       modelRegistry: ctx.modelRegistry,
@@ -156,7 +151,7 @@ async function compactFallback(
       signal: event.signal,
       sessionId,
       onPrepared: ({ model, thinkingLevel }) => {
-        if (!sessionStillOwned(ctx, sessionId, event.signal, modelKey)) throw new Error("Compaction session or selected model changed");
+        if (!sessionStillOwned(ctx, sessionId, event.signal)) throw new Error("Compaction session changed");
         if (announced) return;
         announced = true;
         ctx.ui.setStatus(STATUS_KEY, "Pi fallback compaction...");
@@ -168,11 +163,11 @@ async function compactFallback(
         }
       },
     });
-    if (!sessionStillOwned(ctx, sessionId, event.signal, modelKey)) return { cancel: true };
+    if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
     if (!result && remoteError !== undefined) notifyFailure(ctx, remoteError);
     return result;
   } catch (error) {
-    if (sessionStillOwned(ctx, sessionId, event.signal, modelKey) && ctx.hasUI) {
+    if (sessionStillOwned(ctx, sessionId, event.signal) && ctx.hasUI) {
       ctx.ui.notify(`Configured fallback compaction failed; compaction stopped. ${errorMessage(error)}`, "error");
     }
     // Returning undefined would make Pi send the same context to the active chat model.
@@ -191,9 +186,8 @@ async function compactRemotely(
   snapshots: RequestSnapshots = {},
 ) {
   const supported = capableModel(ctx.model);
-  const modelKey = selectedModelKey(ctx.model);
   const sessionId = ctx.sessionManager.getSessionId();
-  const owned = () => sessionStillOwned(ctx, sessionId, event.signal, modelKey);
+  const owned = () => sessionStillOwned(ctx, sessionId, event.signal);
   if (!owned()) return { cancel: true };
   let configuration: CompactionConfiguration;
   try {
@@ -205,7 +199,7 @@ async function compactRemotely(
     return { cancel: true };
   }
   if (!owned()) return { cancel: true };
-  if (!configuration.remoteCompactionEnabled || !supported) return compactFallback(pi, event, ctx, sessionId, configuration, undefined, modelKey);
+  if (!configuration.remoteCompactionEnabled || !supported) return compactFallback(pi, event, ctx, sessionId, configuration, undefined);
   const reasoning = pi.getThinkingLevel();
   const settings = pi.getSettings();
   let announced = false;
@@ -237,7 +231,7 @@ async function compactRemotely(
       maxRetryDelayMs: settings.retry?.provider?.maxRetryDelayMs,
       signal: event.signal,
       onPrepared: () => {
-        if (!owned()) throw new Error("Compaction session or selected model changed");
+        if (!owned()) throw new Error("Compaction session changed");
         // Provider retries prepare the payload again; announce the compaction once.
         if (announced) return;
         announced = true;
@@ -280,7 +274,7 @@ async function compactRemotely(
     if (!owned()) {
       return { cancel: true };
     }
-    return await compactFallback(pi, event, ctx, sessionId, configuration, error, modelKey);
+    return await compactFallback(pi, event, ctx, sessionId, configuration, error);
   } finally {
     if (ctx.sessionManager.getSessionId() === sessionId) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -322,7 +316,7 @@ export function createCodexCompactionExtension(
       compactRemotely(pi, event, ctx, compactionSettingsPath, options.fetch, snapshots.current()),
     );
 
-    pi.on("session_compact", (event) => {
+    pi.on("session_compact", async (event, ctx) => {
       if (!event.fromExtension) return;
       const details = parseCheckpointDetails(event.compactionEntry.details);
       if (!details) return;
@@ -331,6 +325,9 @@ export function createCodexCompactionExtension(
         protocol: REMOTE_COMPACTION_PROTOCOL,
         checkpointId: details.checkpointId,
       });
+      // The model may have switched to another backend while compaction ran.
+      if (await compatibleIdentity(details, ctx)) return;
+      warnOnce(ctx, `${details.checkpointId}:backend`, INCOMPATIBLE_BACKEND_WARNING);
     });
 
     pi.on("context", async (event, ctx) => {
@@ -374,8 +371,7 @@ export function createCodexCompactionExtension(
     pi.on("model_select", async (event, ctx) => {
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || await compatibleIdentity(checkpoint.details, ctx, event.model)) return;
-      warnOnce(ctx, `${event.model.provider}:${event.model.id}`,
-        "The active Codex checkpoint cannot replay on this provider backend; only its fallback marker and retained recent messages remain available.");
+      warnOnce(ctx, `${event.model.provider}:${event.model.id}`, INCOMPATIBLE_BACKEND_WARNING);
     });
 
     pi.on("session_shutdown", (_event, ctx) => {

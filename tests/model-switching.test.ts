@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { latestCheckpoint } from "../src/checkpoint.js";
 import { createCodexCompactionExtension } from "../src/index.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
@@ -126,31 +127,90 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     } finally { await fixture.close(); }
   });
 
-  test(`${api} discards a compaction result when the selected model changes during its stream`, async () => {
-    let switchDuringCompaction = false;
-    const fixture = await sessionFixture({ api,
-      extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
-      models: (base) => [configuredModel(base, base.id, 32_000), configuredModel(base, "gpt-peer", 32_000)],
-      respond: async ({ payload }) => {
-        if (switchDuringCompaction && hasItem(payload, "compaction_trigger")) {
-          switchDuringCompaction = false;
-          await fixture.session.setModel(fixture.models[1]);
+  for (const phase of ["preparation", "request", "retry", "response"] as const) {
+    for (const backend of ["same", "different"] as const) {
+      test(`${api} completes on the original model after a ${backend}-backend switch during ${phase}`, { timeout: 20_000 }, async () => {
+        async function run(switchModel: boolean) {
+          let changeSelection: (() => Promise<void>) | undefined;
+          let attempts = 0;
+          let switched = false;
+          const change = async () => {
+            if (!switchModel || switched) return;
+            assert.ok(changeSelection);
+            await changeSelection();
+            switched = true;
+          };
+          const observe: ExtensionFactory = (pi) => {
+            pi.on("before_provider_request", (event) => {
+              assert.ok(isObject(event.payload));
+              return { ...event.payload, prompt_cache_key: "switch-fixture", prompt_cache_retention: "24h",
+                prompt_cache_options: { mode: "explicit", ttl: "30m" } };
+            });
+            pi.on("session_start", (_event, ctx) => {
+              const registry = ctx.modelRegistry;
+              const streamSimple = registry.streamSimple.bind(registry);
+              registry.streamSimple = (model, context, options) => {
+                const attempt = ++attempts;
+                return streamSimple(model, context, { ...options, onPayload: async (payload, preparedModel) => {
+                  if (phase === "preparation" || (phase === "retry" && attempt === 2)) await change();
+                  return options?.onPayload?.(payload, preparedModel);
+                }, onProviderStreamEvent: async (event, currentModel) => {
+                  await options?.onProviderStreamEvent?.(event, currentModel);
+                  if (phase === "response" && isObject(event) && event.type === "response.completed") await change();
+                } });
+              };
+            });
+          };
+          let fetches = 0;
+          const fixture = await sessionFixture({ api,
+            extensions: (fetch) => [observe, createCodexCompactionExtension({ fetch })],
+            models: (base) => [configuredModel(base, base.id, 32_000),
+              { ...configuredModel(base, "gpt-peer", 32_000), ...(backend === "different" ? { baseUrl: "https://different.example/v1" } : {}) }],
+            settings: { retry: { enabled: false, provider: { maxRetries: 1, maxRetryDelayMs: 1 } } },
+            respond: async ({ payload }) => {
+              if (!hasItem(payload, "compaction_trigger")) return undefined;
+              fetches++;
+              if (phase === "request") await change();
+              return phase === "retry" && fetches === 1
+                ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } }) : undefined;
+            },
+          });
+          try {
+            changeSelection = async () => { await fixture.session.setModel(fixture.models[1]); };
+            for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}: ${"Keep the approved decisions. ".repeat(80)}`);
+            const ordinary = fixture.requests.at(-1)?.payload;
+            assert.ok(ordinary && Array.isArray(ordinary.input));
+            const count = fixture.requests.length;
+            await fixture.session.compact();
+            const checkpoint = latestCheckpoint(fixture.session.sessionManager.getBranch());
+            assert.ok(checkpoint);
+            assert.equal(checkpoint.details.modelId, fixture.model.id);
+            assert.equal(checkpoint.details.baseUrl, fixture.model.baseUrl);
+            assert.equal(checkpoint.details.provider, fixture.model.provider);
+            assert.equal(fixture.session.model?.id, switchModel ? fixture.models[1].id : fixture.model.id);
+            assert.equal(switched, switchModel);
+            const requests = fixture.requests.slice(count);
+            assert.equal(requests.length, phase === "retry" ? 2 : 1);
+            for (const request of requests) {
+              assert.equal(request.payload.model, fixture.model.id);
+              assert.deepEqual(request.payload, requests[0].payload);
+              assert.ok(Array.isArray(request.payload.input));
+              assert.deepEqual(request.payload.input.slice(0, ordinary.input.length), ordinary.input);
+              for (const field of ["instructions", "tools", "prompt_cache_key", "prompt_cache_retention", "prompt_cache_options"]) {
+                assert.deepEqual(request.payload[field], ordinary[field]);
+              }
+            }
+            assert.deepEqual(fixture.errors, []);
+            const cwd = fixture.session.sessionManager.getCwd();
+            return requests.map(({ payload, url }) => ({ url,
+              body: JSON.stringify(payload).replaceAll(JSON.stringify(cwd).slice(1, -1), "<fixture-cwd>").replaceAll(cwd.replaceAll("\\", "/"), "<fixture-cwd>"),
+            }));
+          } finally { await fixture.close(); }
         }
-        return undefined;
-      },
-    });
-    try {
-      const original = await seed(fixture);
-      switchDuringCompaction = true;
-      const count = fixture.requests.length;
-      await assert.rejects(fixture.session.compact(), /Compaction cancelled/);
-      assert.equal(fixture.requests.length, count + 1);
-      assert.equal(latestCheckpoint(fixture.session.sessionManager.getBranch())?.entry.id, original.entry.id);
-      await fixture.session.prompt("Continue from the unchanged checkpoint.");
-      assert.ok(hasItem(fixture.requests.at(-1)!.payload, "compaction"));
-      assert.deepEqual(fixture.errors, []);
-    } finally { await fixture.close(); }
-  });
+        assert.deepEqual(await run(true), await run(false), "Model selection cannot alter the request body, endpoint, or attempt count");
+      });
+    }
+  }
 }
 
 test("opaque replay preserves the model routing already applied to the ordinary payload", async () => {

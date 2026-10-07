@@ -1535,3 +1535,114 @@ for (const { virtualMaxTokens, reserveTokens, expected } of [
     assert.equal(registry.find("summary-router", "virtual-summary")?.maxTokens, virtualMaxTokens);
   });
 }
+
+for (const selection of ["unchanged", "same backend", "different backend", "no model"] as const) {
+  test(`checkpoint installation warns once only when ${selection} cannot replay it`, async () => {
+    const mock = mockPi();
+    const current = await context();
+    const selected: Model<"openai-responses"> | undefined = selection === "no model" ? undefined
+      : selection === "unchanged" ? model : { ...model, id: "gpt-peer",
+        ...(selection === "different backend" ? { baseUrl: "https://other.example/v1", compat: undefined } : {}) };
+    createCodexCompactionExtension({ fetch: async () => {
+      current.ctx.model = selected;
+      return sseResponse();
+    } })(mock.pi);
+    const result = await mock.events.get("session_before_compact")?.[0]?.(compactEvent(), current.ctx) as SessionBeforeCompactResult;
+    assert.ok(result?.compaction);
+    const details = parseCheckpointDetails(result.compaction.details);
+    assert.ok(details);
+    assert.equal(details.modelId, model.id);
+    assert.equal(current.ctx.model, selected);
+    const warnings = () => current.notifications.filter((notice) => notice.level === "warning");
+    assert.equal(warnings().length, 0, "No backend warning precedes installation");
+    const event = { type: "session_compact", fromExtension: true, compactionEntry: { details } };
+    const installed = mock.events.get("session_compact")?.[0];
+    assert.ok(installed);
+    await installed(event, current.ctx);
+    const expected = selection === "different backend" || selection === "no model" ? 1 : 0;
+    assert.equal(warnings().length, expected);
+    assert.equal(mock.appendedEntries.length, 1, "Completion is recorded even if the new backend cannot replay it");
+    await installed(event, current.ctx);
+    assert.equal(warnings().length, expected, "The same checkpoint cannot warn twice");
+    await installed({ ...event, compactionEntry: { details: { ...details, checkpointId: "another-checkpoint" } } }, current.ctx);
+    assert.equal(warnings().length, expected * 2, "A different checkpoint has its own warning scope");
+  });
+}
+
+for (const phase of ["authentication", "preparation", "prepared request", "request", "response", "retry"] as const) {
+  for (const interruption of ["session change", "abort"] as const) {
+    test(`${interruption} during ${phase} cancels V2 without installing a result or retrying transport`, async () => {
+      const controller = new AbortController();
+      const mock = mockPi("low", { transport: "sse", retry: { provider: { maxRetries: 1, maxRetryDelayMs: 1 } } });
+      let sessionId = "session";
+      let interrupted = false;
+      const interrupt = () => {
+        interrupted = true;
+        if (interruption === "abort") controller.abort();
+        else sessionId = "replacement-session";
+      };
+      const provider = fakeProvider();
+      const registry = await testRegistry({ ...provider, streamSimple(currentModel, context, options) {
+        return provider.streamSimple(currentModel, context, { ...options,
+          onPayload: async (payload, preparedModel) => {
+            if (phase === "preparation") interrupt();
+            const result = await options?.onPayload?.(payload, preparedModel);
+            if (phase === "prepared request") interrupt();
+            return result;
+          },
+          onProviderStreamEvent: async (event, currentModel) => {
+            await options?.onProviderStreamEvent?.(event, currentModel);
+            if (phase === "response" && isObject(event) && event.type === "response.completed") interrupt();
+          },
+        });
+      } }, async () => {
+        if (phase === "authentication") interrupt();
+        return { auth: { apiKey: "fixture-key" } };
+      });
+      let requests = 0;
+      createCodexCompactionExtension({ fetch: async () => {
+        requests++;
+        if (phase === "request" || phase === "retry") interrupt();
+        return phase === "retry" ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } }) : sseResponse();
+      } })(mock.pi);
+      const current = await context({ modelRegistry: registry, sessionManager: { getSessionId: () => sessionId, getBranch: branch } });
+      const result = await mock.events.get("session_before_compact")?.[0]?.(compactEvent(controller.signal), current.ctx);
+      assert.ok(interrupted);
+      assert.deepEqual(result, { cancel: true });
+      const sent = phase === "authentication" || phase === "preparation" || (phase === "prepared request" && interruption === "abort") ? 0 : 1;
+      assert.equal(requests, sent);
+      assert.deepEqual(mock.appendedEntries, []);
+      assert.deepEqual(current.notifications.filter((notice) => notice.level !== "info"), []);
+    });
+  }
+}
+
+for (const backend of ["same", "different"] as const) {
+  test(`a ${backend}-backend chat model switch during configured fallback keeps the original summary model`, async () => {
+    await configureFallback();
+    const selected = { ...model, id: "gpt-peer", ...(backend === "different" ? { provider: "other-provider" } : {}) };
+    const fixture = await fallbackFixture({ onRequest: () => { fixture.ctx.model = selected; } });
+    const result = await fixture.run();
+    assert.ok(result?.compaction);
+    assert.equal(fixture.calls.length, 1);
+    assert.equal(fixture.calls[0].model.provider, fallbackModel.provider);
+    assert.equal(fixture.calls[0].model.id, fallbackModel.id);
+    assert.equal(fixture.ctx.model, selected);
+    assert.match(result.compaction.summary, /Keep working on the cache fix/);
+    fixture.sessionManager.appendCompaction(result.compaction.summary, result.compaction.firstKeptEntryId,
+      result.compaction.tokensBefore, result.compaction.details, true, result.compaction.usage);
+    assert.ok(fixture.sessionManager.getBranch().some((entry) => entry.type === "compaction"));
+    assert.deepEqual(fixture.notifications.filter((notice) => notice.level !== "info"), []);
+  });
+}
+
+test("an aborted signal during configured fallback discards the summary", async () => {
+  await configureFallback();
+  const controller = new AbortController();
+  const fixture = await fallbackFixture({ onRequest: () => { controller.abort(); } });
+  fixture.event.signal = controller.signal;
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.calls.length, 1);
+  assert.deepEqual(fixture.mock.appendedEntries, []);
+  assert.deepEqual(fixture.notifications.filter((notice) => notice.level !== "info"), []);
+});
