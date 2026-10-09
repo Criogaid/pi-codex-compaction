@@ -9,9 +9,6 @@ import { isolateAgentConfig, sessionFixture } from "./helpers.js";
 
 isolateAgentConfig();
 
-// Remove this once checkpoint projection no longer depends on where other context handlers load.
-const PENDING = "checkpoint projection still depends on context handler load order";
-
 const annotation = "Request-local note after the compaction boundary.";
 
 // Generic request-local edits that reach checkpoint-retained messages when they run first.
@@ -31,6 +28,11 @@ const transforms = {
     return [...messages.slice(0, index + 1), note, ...messages.slice(index + 1)];
   },
 } satisfies Record<string, (messages: AgentMessage[]) => AgentMessage[]>;
+
+// Each fixture runs in its own temporary directory, which Pi includes in the system prompt.
+function withoutFixtureDirectory(input: readonly JsonObject[]): unknown {
+  return JSON.parse(JSON.stringify(input).replace(/pi-compaction-session-[^/\\"]+/g, "pi-compaction-session"));
+}
 
 function countType(input: readonly unknown[], type: string): number {
   return input.filter((item) => isObject(item) && item.type === type).length;
@@ -72,11 +74,13 @@ async function run(
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   for (const [name, transform] of Object.entries(transforms)) {
     test(`${api} replays a checkpoint identically whichever side a ${name} context hook loads on`,
-      { timeout: 30_000, todo: PENDING }, async () => {
+      { timeout: 30_000 }, async () => {
         const before = await run(api, transform, "before");
         const after = await run(api, transform, "after");
-        assert.deepEqual(before.ordinary, after.ordinary, "Load order must not change the ordinary request");
-        assert.deepEqual(before.compact, after.compact, "Load order must not change the V2 request");
+        assert.deepEqual(withoutFixtureDirectory(before.ordinary), withoutFixtureDirectory(after.ordinary),
+          "Load order must not change the ordinary request");
+        assert.deepEqual(withoutFixtureDirectory(before.compact), withoutFixtureDirectory(after.compact),
+          "Load order must not change the V2 request");
       });
   }
 }

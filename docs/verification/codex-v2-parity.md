@@ -28,7 +28,7 @@
 | --- | --- | --- | --- |
 | 启用条件 | 默认关闭 TokenBudget 的通常路径按 provider capability 选择 V2/local；配置型 provider 的 OpenAI、识别为 Azure Responses 的 provider 支持 V2。这里没有模型 ID 包含 `gpt` 的规则。 | 显式 `compat.remoteCompaction` 优先；否则按两个 Responses API 和 `gpt` 子串决定是否尝试；允许自定义 provider 和同源端点。 | 有意扩展的 Pi 启用策略，不能说复制了原生模型门控。 |
 | 功能请求头 | 会话构造时无条件把 `remote_compaction_v2` 加入 beta feature 列表，正常 Responses 传输使用这份列表；配置中的旧 feature 开关已经移除。 | 通过 Pi 请求头变换器为压缩请求合并该 feature，固定 SSE，避免 Pi 既有 WebSocket 握手缺少新头。 | 压缩请求携带同一标识；头的生命周期和传输策略不同。 |
-| 端点与 V2 触发 | provider 的正常 `/responses` 路由；在输入末尾附加 `CompactionTrigger`。 | 根据 Pi API 推导正常 Responses/Codex Responses 地址，可同源覆盖；精确替换旧 checkpoint marker 后，追加唯一末尾 trigger。 | 核心 V2 形状一致；不是单独调用 `/responses/compact` 的实现。 |
+| 端点与 V2 触发 | provider 的正常 `/responses` 路由；在输入末尾附加 `CompactionTrigger`。 | 根据 Pi API 推导正常 Responses/Codex Responses 地址，可同源覆盖；替换唯一的旧 checkpoint marker（保留其他钩子在同一项前后添加的内容）后，追加唯一末尾 trigger。 | 核心 V2 形状一致；不是单独调用 `/responses/compact` 的实现。 |
 | 请求声明 | 从冻结的 step/tool router 取得模型可见工具与基础指令；走正常 ModelClient，沿用 reasoning、service tier、prompt cache key 等构造。 | 由 Pi ModelRegistry 序列化与认证，按会话、模型、后端、历史前缀及当前设置约束复用普通请求的完整 wire 前缀和缓存相关字段。 | 覆盖已观察到的中途声明及历史投影；Pi 未公开隐藏状态修订号，不能等同于 Codex 的当前工具路由状态。 |
 | 思考等级 | `reasoning_effort_for_request(..., Compaction)` 可复用该窗口已经固定的原始 effort；失败不改变 live pin。 | 使用 Pi 当前 thinking level；满足条件时复用观察到的 reasoning 字段。Pi 没有移植 Codex 的 configuration-update/effort-pin 状态机。 | 普通情况相近；动态 effort override 状态机不同。 |
 | 压缩前容量裁剪 | 粗估模型可见内容，计入基础指令；从末尾开始替换工具输出，删掉附属 resize notice；遇到非输出项停止。有效窗口百分比默认 95，来自模型配置。 | 相同方向、替换文案、停止条件、notice 分组和主要估算项；直接采用 Pi `contextWindow × 95%`。 | 支持的 Pi 数据子集内移植程度高；95% 为固定默认，未读取 Codex 模型专有调整。 |
@@ -109,7 +109,7 @@ Codex 自身还记录 `compaction_model_hash`、compaction response ID、窗口 
 
 Pi 0.99.1 的公开模型目录没有提供服务端 `comp_hash`，本扩展不解析或保存模型兼容性标识及创建窗口。v1 检查点格式、marker、历史摘要和指纹保持不变。同后端允许切换模型，服务端决定它是否接受旧 opaque 项。
 
-后端不匹配或保留消息投影失败时，扩展跳过加密历史，普通请求继续使用 Pi 可读取的上下文。普通请求的 payload 模型路由保持不变；扩展不因路由后的模型 ID 不同而取消请求。
+后端不匹配、保留消息与会话历史指纹不符、请求缺少压缩摘要或消息来源有歧义时，扩展跳过加密历史，普通请求继续使用 Pi 可读取的上下文。普通请求的 payload 模型路由保持不变；扩展不因路由后的模型 ID 不同而取消请求。
 
 模型切换本身不发起压缩，也不依赖原模型准备更小窗口。后续 V2 使用当前对话模型；明文保留使用固定预算，普通上下文窗口处理由 Pi 和 provider 决定。这些边界与 Codex 的完整模型切换状态机不同。
 

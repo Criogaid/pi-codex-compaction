@@ -27,8 +27,8 @@ import {
   keptMessages,
   latestCheckpoint,
   parseCheckpointDetails,
-  projectCheckpointContext,
   projectCheckpointRequest,
+  projectCheckpointTranscript,
 } from "./checkpoint.js";
 import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker, withoutInputImages } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
@@ -330,26 +330,31 @@ export function createCodexCompactionExtension(
       warnOnce(ctx, `${details.checkpointId}:backend`, INCOMPATIBLE_BACKEND_WARNING);
     });
 
-    pi.on("context", async (event, ctx) => {
+    pi.on("context", (_event, ctx) => {
       snapshots.recordContext(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => canonicalMessages(ctx));
-      const checkpoint = activeCheckpoint(ctx);
-      if (!checkpoint || !await compatibleIdentity(checkpoint.details, ctx)) return undefined;
-      const messages = projectCheckpointContext(event.messages, checkpoint.details);
-      if (messages) return { messages };
-      snapshots.reset();
-      warnOnce(ctx, `${checkpoint.details.checkpointId}:projection`,
-        "The active Codex checkpoint no longer matches the retained messages, so its opaque history is not replayed.");
-      return undefined;
     });
 
-    pi.on("context_with_system", (event, ctx) => {
+    // Pi runs every extension's `context` handlers first, so none of them sees the marker and load order cannot
+    // change the projection. Later `context_with_system` handlers still see and can change it.
+    pi.on("context_with_system", async (event, ctx) => {
+      let messages: AgentMessage[] | undefined;
+      const checkpoint = activeCheckpoint(ctx);
+      if (checkpoint && await compatibleIdentity(checkpoint.details, ctx)) {
+        messages = projectCheckpointTranscript(event.messages, canonicalMessages(ctx), checkpoint.details);
+        if (!messages) {
+          snapshots.reset();
+          warnOnce(ctx, `${checkpoint.details.checkpointId}:projection`,
+            "The active Codex checkpoint no longer matches this request's retained messages, so its opaque history is not replayed.");
+        }
+      }
       snapshots.recordProjectedRequest(
         ctx.sessionManager.getSessionId(),
         capableModel(ctx.model),
         () => canonicalMessages(ctx),
         () => activeCheckpoint(ctx)?.details,
-        event.messages,
+        messages ?? event.messages,
       );
+      return messages ? { messages } : undefined;
     });
 
     pi.on("before_provider_request", async (event, ctx) => {

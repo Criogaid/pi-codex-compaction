@@ -108,21 +108,27 @@ export function createCompactionCollector(): CompactionCollector {
   };
 }
 
-function markerText(item: unknown): string | undefined {
-  if (
-    !isObject(item) ||
-    item.role !== "user" ||
-    !Array.isArray(item.content) ||
-    item.content.length !== 1
-  ) {
-    return undefined;
-  }
-  const content = item.content[0];
-  return isObject(content) &&
-    content.type === "input_text" &&
-    typeof content.text === "string"
-    ? content.text
-    : undefined;
+function markerCount(item: unknown, marker: string): number {
+  if (!isObject(item) || item.role !== "user" || !Array.isArray(item.content)) return 0;
+  return item.content.reduce<number>((count, part) => isObject(part) && part.type === "input_text" &&
+    typeof part.text === "string" ? count + part.text.split(marker).length - 1 : count, 0);
+}
+
+// Later request hooks may tag or join user text around the private marker; replace only the marker itself.
+function replaceMarker(item: JsonObject, marker: string, replacementHistory: readonly unknown[]): unknown[] {
+  const content = item.content as unknown[];
+  const index = content.findIndex((part) => isObject(part) && part.type === "input_text" &&
+    typeof part.text === "string" && part.text.includes(marker));
+  const part = content[index] as JsonObject & { text: string };
+  const at = part.text.indexOf(marker);
+  const text = (value: string) => value.trim() ? [{ ...part, text: value }] : [];
+  const before = [...content.slice(0, index), ...text(part.text.slice(0, at))];
+  const after = [...text(part.text.slice(at + marker.length)), ...content.slice(index + 1)];
+  return [
+    ...(before.length > 0 ? [{ ...item, content: before }] : []),
+    ...structuredClone(replacementHistory),
+    ...(after.length > 0 ? [{ ...item, content: after }] : []),
+  ];
 }
 
 export function rewriteCheckpointMarker(
@@ -133,20 +139,19 @@ export function rewriteCheckpointMarker(
   if (!isObject(payload) || !Array.isArray(payload.input)) {
     throw new CodexCompactionProtocolError("Codex payload is missing an input array");
   }
-  const matches = payload.input
-    .map((item, index) => (markerText(item) === marker ? index : -1))
-    .filter((index) => index >= 0);
-  if (matches.length !== 1) {
+  const counts = payload.input.map((item) => markerCount(item, marker));
+  const total = counts.reduce((sum, count) => sum + count, 0);
+  if (total !== 1) {
     throw new CodexCompactionProtocolError(
-      `Provider payload contained ${matches.length} checkpoint markers; expected exactly one`,
+      `Provider payload contained ${total} checkpoint markers; expected exactly one`,
     );
   }
-  const index = matches[0];
+  const index = counts.indexOf(1);
   return {
     ...payload,
     input: [
       ...payload.input.slice(0, index),
-      ...structuredClone(replacementHistory),
+      ...replaceMarker(payload.input[index] as JsonObject, marker, replacementHistory),
       ...payload.input.slice(index + 1),
     ],
   };
@@ -178,6 +183,6 @@ export function hasCheckpointMarker(payload: unknown, marker: string): boolean {
   return (
     isObject(payload) &&
     Array.isArray(payload.input) &&
-    payload.input.some((item) => markerText(item) === marker)
+    payload.input.some((item) => markerCount(item, marker) > 0)
   );
 }

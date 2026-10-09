@@ -123,29 +123,29 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   test(`${api} does not bind a request projection that failed checkpoint replay`, { timeout: 20_000 }, async () => {
-    let rewriteRetained = false;
+    let dropSummary = false;
     const transform: ExtensionFactory = (pi) => {
       pi.on("context", (event) => {
-        if (!rewriteRetained) return;
-        return { messages: event.messages.map((message) => message.role === "user"
-          ? { ...message, content: "Changed request-local retained content" } : message) };
+        if (!dropSummary) return;
+        return { messages: event.messages.filter((message) => message.role !== "compactionSummary") };
       });
     };
     const fixture = await sessionFixture({ api, extensions: [transform, createCodexCompactionExtension()] });
     try {
       for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the task. ".repeat(80)}`);
       await fixture.session.compact();
-      rewriteRetained = true;
+      dropSummary = true;
       for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Continue ${turn}. ${"Retain these decisions. ".repeat(80)}`);
       const ordinary = fixture.requests.at(-1)?.payload;
       assert.ok(ordinary && Array.isArray(ordinary.input));
       assert.ok(!ordinary.input.some((item) => isObject(item) && item.type === "compaction"));
       await fixture.session.compact();
+      // Reusing the marker-free projection would fail V2 replay and fall back to Pi's text compaction.
       const compact = fixture.requests.at(-1)?.payload;
       assert.ok(compact && Array.isArray(compact.input));
       assert.equal(compact.input.filter((item) => isObject(item) && item.type === "compaction_trigger").length, 1);
       assert.equal(compact.input.filter((item) => isObject(item) && item.type === "compaction").length, 1);
-      assert.ok(!JSON.stringify(compact.input).includes("Changed request-local retained content"));
+      assert.ok(!JSON.stringify(compact.input).includes("PI_CODEX_REMOTE_CHECKPOINT"));
       assert.deepEqual(fixture.errors, []);
     } finally {
       await fixture.close();

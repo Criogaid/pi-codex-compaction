@@ -258,18 +258,32 @@ async function compactSession(
   return checkpoint;
 }
 
+/** Emit one request's context as Pi does: `context` sees only the conversation, then `context_with_system` sees all. */
+async function projectContext(
+  mock: ReturnType<typeof mockPi>,
+  messages: AgentMessage[],
+  ctx: ExtensionContext,
+): Promise<AgentMessage[] | undefined> {
+  const conversation = messages.filter((message) => message.role !== "system");
+  const changed = await mock.events.get("context")?.[0]?.({ type: "context", messages: conversation }, ctx);
+  assert.equal(changed, undefined, "Other extensions' context handlers must see Pi's own messages");
+  const projected = await mock.events.get("context_with_system")?.[0]?.(
+    { type: "context_with_system", messages }, ctx) as ContextEventResult | undefined;
+  return projected?.messages;
+}
+
 async function assertSessionReplay(
   mock: ReturnType<typeof mockPi>,
   sessionManager: SessionManager,
   current: Awaited<ReturnType<typeof context>>,
   details: NonNullable<ReturnType<typeof parseCheckpointDetails>>,
 ) {
-  const messages = sessionManager.buildSessionProjection().messages.filter((message) => message.role !== "system");
-  const projected = await mock.events.get("context")?.[0]?.({ type: "context", messages }, current.ctx) as ContextEventResult | undefined;
-  assert.ok(projected?.messages, "checkpoint must replay through Pi's canonical context");
-  assert.equal(projected.messages.length, 1, "retained messages must be replaced exactly once");
+  const projected = await projectContext(mock, sessionManager.buildSessionProjection().messages, current.ctx);
+  assert.ok(projected, "checkpoint must replay through Pi's canonical context");
+  const conversation = projected.filter((message) => message.role !== "system");
+  assert.equal(conversation.length, 1, "retained messages must be replaced exactly once");
   const marker = checkpointMarker(details.checkpointId);
-  const markerMessage = projected.messages[0];
+  const markerMessage = conversation[0];
   assert.ok(markerMessage.role === "user");
   assert.deepEqual(markerMessage.content, [{ type: "text", text: marker }]);
   const rewritten = await mock.events.get("before_provider_request")?.[0]?.({
@@ -415,11 +429,10 @@ test("creates and resumes a checkpoint for a configured custom provider", async 
   };
   const kept = initial[1].type === "message" ? initial[1].message : assert.fail("message");
   const later = { role: "user" as const, content: [{ type: "text" as const, text: "later" }], timestamp: 4 };
-  const project = mock.events.get("context")?.[0];
-  const projected = await project?.({ type: "context", messages: [summary, kept, later] }, replay.ctx) as {
-    messages: Array<{ content: Array<{ text: string }> }>;
-  };
-  const marker = projected.messages[0].content[0].text;
+  const projected = await projectContext(mock, [summary, kept, later], replay.ctx);
+  const markerMessage = projected?.[0];
+  assert.ok(markerMessage?.role === "user" && Array.isArray(markerMessage.content) && markerMessage.content[0]?.type === "text");
+  const marker = markerMessage.content[0].text;
   const rewrite = mock.events.get("before_provider_request")?.[0];
   const rewritten = await rewrite?.({
     type: "before_provider_request",
@@ -465,8 +478,7 @@ test("provider switches do not replay opaque history", async () => {
   };
   const switchedModel = { ...model, provider: "other" };
   const switched = await context({ model: switchedModel, entries: [entry] });
-  const project = mock.events.get("context")?.[0];
-  assert.equal(await project?.({ type: "context", messages: [] }, switched.ctx), undefined);
+  assert.equal(await projectContext(mock, [], switched.ctx), undefined);
   const select = mock.events.get("model_select")?.[0];
   await select?.({ type: "model_select", model: switchedModel }, switched.ctx);
   assert.equal(switched.notifications[0]?.level, "warning");
@@ -646,10 +658,12 @@ async function providerCompaction(messages: SessionMessage[], options: {
     const source = options.prepareOrdinarySource?.(canonical) ?? canonical;
     const head = getCurrentSystemMessage(convertToLlm(source));
     assert.ok(head);
-    const projected = await mock.events.get("context")?.[0]?.({ type: "context", messages: source.filter((message) => message.role !== "system") }, current.ctx) as ContextEventResult | undefined;
-    let transformed = projected?.messages ? [head, ...projected.messages] : source;
-    if (options.ordinaryProjection) transformed = options.ordinaryProjection(transformed);
-    await mock.events.get("context_with_system")?.[0]?.({ type: "context_with_system", messages: transformed }, current.ctx);
+    const changed = await mock.events.get("context")?.[0]?.({ type: "context", messages: source.filter((message) => message.role !== "system") }, current.ctx);
+    assert.equal(changed, undefined, "Other extensions' context handlers must see Pi's own messages");
+    // Other extensions' context handlers all run before this extension's system-inclusive projection.
+    const hooked = options.ordinaryProjection?.(source) ?? source;
+    const projected = await mock.events.get("context_with_system")?.[0]?.({ type: "context_with_system", messages: hooked }, current.ctx) as ContextEventResult | undefined;
+    const transformed = projected?.messages ?? hooked;
     runtimePrompt = options.ordinaryPrompt ?? getSystemMessageText(head);
     const transcript = convertToLlm(transformed);
     const ordinaryContext: Context = { messages: options.ordinaryPrompt === undefined ? transcript : [
@@ -1003,12 +1017,10 @@ test("warns about failed projection once per session and checkpoint and resets o
   append();
   let sessionId = "first-session";
   const current = await context({ sessionManager: { getSessionId: () => sessionId, getBranch: () => session.getBranch() } });
-  const project = mock.events.get("context")?.[0];
-  assert.ok(project);
   const failProjection = async () => {
-    const messages = session.buildSessionProjection().messages.filter((message) => message.role !== "system")
-      .map((message) => message.role === "user" ? { ...message, content: "changed by another context hook" } : message);
-    assert.equal(await project({ type: "context", messages }, current.ctx), undefined);
+    // Another context handler dropped the checkpoint summary from this request.
+    const messages = session.buildSessionProjection().messages.filter((message) => message.role !== "compactionSummary");
+    assert.equal(await projectContext(mock, messages, current.ctx), undefined);
   };
   await failProjection();
   await failProjection();
@@ -1037,7 +1049,7 @@ test("keeps projection failures silent without a UI or a compatible model identi
     const mock = mockPi();
     createCodexCompactionExtension()(mock.pi);
     const current = await context({ sessionManager: session, ...overrides });
-    assert.equal(await mock.events.get("context")?.[0]?.({ type: "context", messages: [] }, current.ctx), undefined);
+    assert.equal(await projectContext(mock, [], current.ctx), undefined);
     assert.deepEqual(current.notifications, []);
   }
 });

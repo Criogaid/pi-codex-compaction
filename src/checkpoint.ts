@@ -1,4 +1,4 @@
-// Own the versioned checkpoint format, endpoint binding, and exact Pi session projection.
+// Own the versioned checkpoint format, endpoint binding, exact Pi session projection, and request-time replay projection.
 // Normalize legacy fingerprints from their creation-time branch without rewriting session entries.
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -207,30 +207,88 @@ export function latestCheckpoint(
   return undefined;
 }
 
+/** Locate the checkpoint summary and its exact retained messages in a conversation without system messages. */
+function checkpointRange(
+  messages: readonly AgentMessage[],
+  details: CodexCheckpointDetails,
+): { readonly start: number; readonly end: number } | undefined {
+  const summaries = new Set([fallbackSummary(details.checkpointId), legacyFallbackSummary(details.checkpointId)]);
+  const start = messages.findIndex(
+    (message) => message.role === "compactionSummary" && summaries.has(message.summary),
+  );
+  if (start < 0) return undefined;
+  const end = start + 1 + details.keptMessageFingerprints.length;
+  if (end > messages.length) return undefined;
+  for (let index = start + 1; index < end; index++) {
+    if (fingerprintMessage(messages[index]) !== details.keptMessageFingerprints[index - start - 1]) {
+      return undefined;
+    }
+  }
+  return { start, end };
+}
+
 export function projectCheckpointContext(
   messages: readonly AgentMessage[],
   details: CodexCheckpointDetails,
 ): AgentMessage[] | undefined {
-  const summaries = new Set([fallbackSummary(details.checkpointId), legacyFallbackSummary(details.checkpointId)]);
-  const summaryIndex = messages.findIndex(
-    (message) => message.role === "compactionSummary" && summaries.has(message.summary),
-  );
-  if (summaryIndex < 0) return undefined;
-  const keptStart = summaryIndex + 1;
-  const keptEnd = keptStart + details.keptMessageFingerprints.length;
-  if (keptEnd > messages.length) return undefined;
-  for (let index = keptStart; index < keptEnd; index++) {
-    if (
-      fingerprintMessage(messages[index]) !== details.keptMessageFingerprints[index - keptStart]
-    ) {
-      return undefined;
-    }
-  }
-  return [
-    ...messages.slice(0, summaryIndex),
-    markerMessage(details.checkpointId, messages[summaryIndex].timestamp),
-    ...messages.slice(keptEnd),
+  const range = checkpointRange(messages, details);
+  return range && [
+    ...messages.slice(0, range.start),
+    markerMessage(details.checkpointId, messages[range.start].timestamp),
+    ...messages.slice(range.end),
   ];
+}
+
+// Pi derives each request from the canonical transcript; request-local edits replace content, not provenance.
+function provenance(message: AgentMessage): string {
+  return JSON.stringify([
+    message.role,
+    message.timestamp,
+    message.role === "toolResult" ? message.toolCallId : message.role === "custom" ? message.customType : null,
+  ]);
+}
+
+function withSystemHead(messages: readonly AgentMessage[], conversation: AgentMessage[]): AgentMessage[] {
+  const head = getCurrentSystemMessage(messages.filter((message): message is Message => message.role === "system"));
+  return head ? [head, ...conversation] : conversation;
+}
+
+/**
+ * Project Pi's final request transcript after every extension's `context` handler, so load order cannot change
+ * what those handlers see or what replays. The checkpoint must match the canonical transcript exactly. Request
+ * messages traced to its summary or retained messages become one marker at the first of them; inserted, edited,
+ * and later messages keep their places. Like a changed `context` result, system messages collapse into one head.
+ * Return undefined when the request omits the summary or a request message traces to both compacted and live history.
+ */
+export function projectCheckpointTranscript(
+  request: readonly AgentMessage[],
+  canonical: readonly AgentMessage[],
+  details: CodexCheckpointDetails,
+): AgentMessage[] | undefined {
+  const conversation = withoutSystemMessages(request);
+  // Unchanged retained messages keep the exact projection and its cached request prefix.
+  const exact = projectCheckpointContext(conversation, details);
+  if (exact) return withSystemHead(request, exact);
+  const source = withoutSystemMessages(canonical);
+  const range = checkpointRange(source, details);
+  if (!range) return undefined;
+  const summary = provenance(source[range.start]);
+  const compacted = new Set(source.slice(range.start, range.end).map(provenance));
+  const live = new Set([...source.slice(0, range.start), ...source.slice(range.end)].map(provenance));
+  if (!conversation.some((message) => provenance(message) === summary)) return undefined;
+  const projected: AgentMessage[] = [];
+  let marked = false;
+  for (const message of conversation) {
+    const key = provenance(message);
+    if (!compacted.has(key)) {
+      projected.push(message);
+      continue;
+    }
+    if (live.has(key)) return undefined;
+    if (!marked) projected.push(markerMessage(details.checkpointId, source[range.start].timestamp));
+    marked = true;
+  }
+  return withSystemHead(request, projected);
 }
 
 /**
@@ -242,9 +300,7 @@ export function projectCheckpointRequest(
   details: CodexCheckpointDetails,
 ): AgentMessage[] | undefined {
   const projected = projectCheckpointContext(withoutSystemMessages(messages), details);
-  if (!projected) return undefined;
-  const head = getCurrentSystemMessage(messages.filter((message): message is Message => message.role === "system"));
-  return head ? [head, ...projected] : projected;
+  return projected && withSystemHead(messages, projected);
 }
 
 export function createCheckpointDetails(input: {

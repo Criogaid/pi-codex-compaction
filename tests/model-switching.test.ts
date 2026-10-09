@@ -231,18 +231,18 @@ test("opaque replay preserves the model routing already applied to the ordinary 
   } finally { await fixture.close(); }
 });
 
-test("a context projection mismatch continues the ordinary request without opaque replay", async () => {
-  let rewrite = false;
+test("a context handler that drops the checkpoint summary continues the ordinary request without opaque replay", async () => {
+  let drop = false;
   const fixture = await sessionFixture({ extensions: (fetch) => [
-    (pi) => pi.on("context", (event) => rewrite ? { messages: event.messages.map((message) =>
-      message.role === "user" ? { ...message, content: "Rewritten context." } : message) } : undefined),
+    (pi) => pi.on("context", (event) => drop ? { messages: event.messages.filter((message) =>
+      message.role !== "compactionSummary") } : undefined),
     createCodexCompactionExtension({ fetch }),
   ] });
   try {
     const original = await seed(fixture);
     const count = fixture.requests.length;
-    rewrite = true;
-    await fixture.session.prompt("Continue after the context rewrite.");
+    drop = true;
+    await fixture.session.prompt("Continue without the compaction summary.");
     assert.equal(fixture.requests.length, count + 1);
     assert.ok(!hasItem(fixture.requests.at(-1)!.payload, "compaction"));
     assert.equal(latestCheckpoint(fixture.session.sessionManager.getBranch())?.entry.id, original.entry.id);

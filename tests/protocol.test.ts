@@ -133,6 +133,30 @@ test("replays one marker and appends one final trigger", () => {
   assert.throws(() => appendCompactionTrigger({ input: [{ type: "compaction_trigger" }] }), CodexCompactionProtocolError);
 });
 
+test("replaces only the marker when request hooks tag or join the marker item", () => {
+  const marker = "[PI_CODEX_REMOTE_CHECKPOINT:id] marker";
+  const replacement = [{ type: "compaction", encrypted_content: "prior" }];
+  const image = { type: "input_image", image_url: "data:image/png;base64,AA==" };
+  const tagged = rewriteCheckpointMarker({ input: [
+    { role: "user", content: [{ type: "input_text", text: `[tagged] ${marker}` }] },
+  ] }, marker, replacement);
+  assert.deepEqual(tagged.input, [{ role: "user", content: [{ type: "input_text", text: "[tagged] " }] }, ...replacement]);
+  const joined = rewriteCheckpointMarker({ input: [
+    { role: "user", content: [image, { type: "input_text", text: `${marker}\n\nlater` }, image] },
+  ] }, marker, replacement);
+  assert.deepEqual(joined.input, [
+    { role: "user", content: [image] },
+    ...replacement,
+    { role: "user", content: [{ type: "input_text", text: "\n\nlater" }, image] },
+  ]);
+  assert.throws(() => rewriteCheckpointMarker({ input: [
+    { role: "user", content: [{ type: "input_text", text: `${marker} ${marker}` }] },
+  ] }, marker, replacement), CodexCompactionProtocolError);
+  assert.throws(() => rewriteCheckpointMarker({ input: [
+    { role: "assistant", content: [{ type: "input_text", text: marker }] },
+  ] }, marker, replacement), CodexCompactionProtocolError);
+});
+
 test("recognizes non-null objects while rejecting arrays and primitives", () => {
   for (const value of [undefined, null, [], ["item"], "text", 1, false, () => ({})]) {
     assert.equal(isObject(value), false);

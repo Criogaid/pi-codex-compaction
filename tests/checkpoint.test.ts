@@ -18,6 +18,8 @@ import {
   latestCheckpoint,
   parseCheckpointDetails,
   projectCheckpointContext,
+  projectCheckpointRequest,
+  projectCheckpointTranscript,
   withoutSystemMessages,
 } from "../src/checkpoint.js";
 import { legacyCheckpointSummary } from "./helpers.js";
@@ -88,6 +90,52 @@ test("projects exact retained messages for resume and rejects corrupt state", ()
   assert.match(JSON.stringify(projected?.[0]), /PI_CODEX_REMOTE_CHECKPOINT/);
   assert.equal(projectCheckpointContext([summary, user("changed", 2), after], details), undefined);
   assert.equal(parseCheckpointDetails({ ...details, replacementHistory: [] }), undefined);
+});
+
+function toolResult(toolCallId: string, text: string, timestamp: number): ToolResultMessage {
+  return { role: "toolResult", toolCallId, toolName: "read", content: [{ type: "text", text }], isError: false, timestamp };
+}
+
+function transcript(kept: AgentMessage[], after: AgentMessage[]) {
+  const details = checkpoint(kept);
+  const system: AgentMessage = { role: "system", content: "prompt", timestamp: 0 };
+  const summary: AgentMessage = { role: "compactionSummary", summary: fallbackSummary(details.checkpointId), tokensBefore: 100, timestamp: 1 };
+  const update: AgentMessage = { role: "system", content: "update", timestamp: 5 };
+  return { details, summary, canonical: [system, summary, ...kept, update, ...after] };
+}
+
+test("projects an unchanged request transcript exactly as a canonical request", () => {
+  const { details, canonical } = transcript([user("kept", 2)], [user("after", 6)]);
+  const projected = projectCheckpointTranscript(canonical, canonical, details);
+  assert.deepEqual(projected, projectCheckpointRequest(canonical, details));
+  assert.deepEqual(projected?.map((message) => message.role), ["system", "user", "user"]);
+  assert.equal(projected?.[0].role === "system" && projected[0].content, "prompt\n\nupdate");
+});
+
+test("traces request-local edits of retained messages to one marker without moving other messages", () => {
+  const kept = [user("kept", 2), toolResult("call-kept", "kept output", 3)];
+  const after = [user("after", 6), toolResult("call-after", "after output", 3)];
+  const { details, summary, canonical } = transcript(kept, after);
+  const note: AgentMessage = { role: "custom", customType: "note", content: "request-local note", display: false, timestamp: 1 };
+  const request = [canonical[0], summary, note, { ...user("[tagged] kept", 2) }, canonical[4], { ...user("[tagged] after", 6) }, after[1]];
+  const projected = projectCheckpointTranscript(request, canonical, details);
+  assert.ok(projected);
+  const exact = projectCheckpointRequest(canonical, details);
+  assert.ok(exact);
+  assert.deepEqual(projected.slice(0, 2), exact.slice(0, 2), "the head and marker match the canonical projection");
+  assert.deepEqual(projected.slice(2), [note, request[5], after[1]]);
+  const pruned = projectCheckpointTranscript([summary, ...after], canonical, details);
+  assert.deepEqual(pruned?.slice(1), after, "removed retained messages need no marker of their own");
+});
+
+test("skips request projection without the summary, with ambiguous provenance, or with changed canonical history", () => {
+  const { details, summary, canonical } = transcript([user("kept", 2)], [user("after", 6)]);
+  assert.equal(projectCheckpointTranscript([user("[tagged] kept", 2), user("after", 6)], canonical, details), undefined);
+  const repeated = transcript([user("kept", 2)], [user("same time", 2)]);
+  assert.equal(projectCheckpointTranscript([repeated.summary, user("[tagged] kept", 2), user("same time", 2)],
+    repeated.canonical, repeated.details), undefined);
+  const edited = canonical.map((message) => message.role === "user" && message.timestamp === 2 ? user("edited", 2) : message);
+  assert.equal(projectCheckpointTranscript([summary, user("[tagged] kept", 2)], edited, details), undefined);
 });
 
 test("selects checkpoints from the active fork only", () => {
