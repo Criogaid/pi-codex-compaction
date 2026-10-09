@@ -7,7 +7,7 @@ import { latestCheckpoint } from "../src/checkpoint.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
 import { createCodexCompactionExtension } from "../src/index.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
-import { isolateAgentConfig, sessionFixture } from "./helpers.js";
+import { fixtureImage as image, isolateAgentConfig, sessionFixture } from "./helpers.js";
 
 const configPath = join(isolateAgentConfig(), COMPACTION_SETTINGS_RELATIVE_PATH);
 const originalFact = "The approved project color is cerulean.";
@@ -69,8 +69,6 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   }
 
   test(`${api} applies image blocking to ordinary and recursive checkpoint replay`, { timeout: 20_000 }, async () => {
-    const image = { type: "image" as const, mimeType: "image/png",
-      data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==" };
     const fixture = await sessionFixture({ api, extensions: [createCodexCompactionExtension()] });
     try {
       await fixture.session.prompt("Preserve the constraints in this image. ".repeat(80), { images: [image] });

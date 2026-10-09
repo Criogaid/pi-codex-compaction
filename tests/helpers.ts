@@ -6,11 +6,14 @@ import { join } from "node:path";
 import { after } from "node:test";
 import { zstdDecompressSync } from "node:zlib";
 import assert from "node:assert/strict";
-import { InMemoryCredentialStore, InMemoryModelsStore, type Api, type AuthResult, type Model, type Provider } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, InMemoryModelsStore, type Api, type AuthResult, type ImageContent, type Model, type Provider } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { isObject, type JsonObject } from "../src/protocol.js";
+
+export const fixtureImage: ImageContent = { type: "image", mimeType: "image/png",
+  data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==" };
 
 export async function testRegistry(provider: Provider, resolve: () => Promise<AuthResult | undefined> = async () => ({ auth: { apiKey: "fixture-key" } })): Promise<ModelRegistry> {
   const runtime = await ModelRuntime.create({
