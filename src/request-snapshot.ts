@@ -30,8 +30,16 @@ export interface PromptOverride extends SnapshotScope {
   readonly text: string;
 }
 
-export interface ContextSnapshot extends SnapshotScope {
+interface SourceSnapshot extends SnapshotScope {
   readonly sourceFingerprints: readonly string[];
+}
+
+interface ProjectedSourceSnapshot extends SourceSnapshot {
+  /** Content visible only in the projection; a matching new source message makes the suffix ambiguous. */
+  readonly projectionOnlyFingerprints: ReadonlySet<string>;
+}
+
+export interface ContextSnapshot extends ProjectedSourceSnapshot {
   readonly messages: readonly AgentMessage[];
 }
 
@@ -56,11 +64,23 @@ function requestSource(messages: readonly AgentMessage[]): AgentMessage[] {
   return head ? [head, ...conversation] : conversation;
 }
 
-/** Context handlers see only conversation messages; a snapshot needs them to equal the persisted ones. */
-export function matchesConversation(fingerprints: readonly string[], canonical: readonly AgentMessage[]): boolean {
-  const conversation = withoutSystemMessages(canonical);
-  return fingerprints.length === conversation.length &&
-    fingerprints.every((fingerprint, index) => fingerprintMessage(conversation[index]) === fingerprint);
+/** Compare Pi-visible content across persistence, which can change timestamps and custom-message metadata. */
+function contentFingerprints(messages: readonly AgentMessage[]): string[] {
+  return convertToLlm([...messages]).filter((message) => message.role !== "system").map((message) =>
+    fingerprintMessage({ ...message, timestamp: 0, ...(message.role === "user" && typeof message.content === "string"
+      ? { content: [{ type: "text" as const, text: message.content }] } : {}) }));
+}
+
+function projectionOnlyFingerprints(source: readonly AgentMessage[], projected: readonly AgentMessage[]): ReadonlySet<string> {
+  const remaining = new Map<string, number>();
+  for (const key of contentFingerprints(source)) remaining.set(key, (remaining.get(key) ?? 0) + 1);
+  const unmatched = new Set<string>();
+  for (const key of contentFingerprints(projected)) {
+    const count = remaining.get(key) ?? 0;
+    if (count > 0) remaining.set(key, count - 1);
+    else unmatched.add(key);
+  }
+  return unmatched;
 }
 
 /**
@@ -102,20 +122,31 @@ export function captureContextSnapshot(
     sessionId,
     identity: target.identity,
     sourceFingerprints: requestSource(source).map(fingerprintMessage),
+    projectionOnlyFingerprints: projectionOnlyFingerprints(source, projected),
     messages: structuredClone(projected),
   };
 }
 
-function matchingSource(messages: readonly AgentMessage[], snapshot: Pick<ContextSnapshot, "sourceFingerprints">): AgentMessage[] | undefined {
+function matchingSource(messages: readonly AgentMessage[], snapshot: Pick<SourceSnapshot, "sourceFingerprints">): AgentMessage[] | undefined {
   const source = requestSource(messages);
   return source.length < snapshot.sourceFingerprints.length || snapshot.sourceFingerprints.some(
     (fingerprint, index) => fingerprintMessage(source[index]) !== fingerprint,
   ) ? undefined : source;
 }
 
+function matchingProjectionSource(messages: readonly AgentMessage[], snapshot: ProjectedSourceSnapshot): AgentMessage[] | undefined {
+  const source = matchingSource(messages, snapshot);
+  if (!source) return undefined;
+  // A transient message may have been persisted after the request. Rebuilding is safer than guessing whether
+  // the new entry is that message or an intentional repetition, which could duplicate or delete user content.
+  const suffix = source.slice(snapshot.sourceFingerprints.length);
+  return snapshot.projectionOnlyFingerprints.size > 0 && contentFingerprints(suffix).some((key) =>
+    snapshot.projectionOnlyFingerprints.has(key)) ? undefined : source;
+}
+
 /** Reuse the projected request while its source is an unchanged prefix, then append newer messages. */
 export function reuseContextSnapshot(messages: AgentMessage[], snapshot: ContextSnapshot | undefined): AgentMessage[] {
-  const source = snapshot && matchingSource(messages, snapshot);
+  const source = snapshot && matchingProjectionSource(messages, snapshot);
   return source ? [...structuredClone(snapshot.messages), ...source.slice(snapshot.sourceFingerprints.length)] : messages;
 }
 
@@ -148,8 +179,7 @@ interface ProviderRequestFields {
   readonly service_tier?: string;
 }
 
-export interface ProviderRequestSnapshot extends SnapshotScope {
-  readonly sourceFingerprints: readonly string[];
+export interface ProviderRequestSnapshot extends ProjectedSourceSnapshot {
   /** The effective prompt `ctx.getSystemPrompt()` reported for the observed request. */
   readonly systemPrompt: string;
   readonly inputsKey: string;
@@ -198,6 +228,7 @@ function captureProviderRequest(
     payload.input.some((item) => item.type === "item_reference");
   return {
     sessionId: context.sessionId, identity: context.identity, sourceFingerprints: context.sourceFingerprints,
+    projectionOnlyFingerprints: context.projectionOnlyFingerprints,
     systemPrompt: inputs.systemPrompt, inputsKey: requestInputsKey(target, inputs),
     fields: structuredClone({ instructions, tools, reasoning, parallel_tool_calls, text, prompt_cache_key,
       prompt_cache_retention, prompt_cache_options: cachePolicy, service_tier }),
@@ -216,7 +247,7 @@ export function providerRequestFor(
   const override = promptOverrideFor(snapshots.promptOverride, sessionId, target, current, inputs.systemPrompt);
   const effectiveInputs = override ? { ...inputs, systemPrompt: override.text } : inputs;
   const key = requestInputsKey(target, effectiveInputs);
-  return snapshot && matchingSource(current, snapshot) &&
+  return snapshot && matchingProjectionSource(current, snapshot) &&
     (snapshot.inputsKey === key || snapshot.settledInputsKey === key) ? snapshot : undefined;
 }
 
@@ -257,8 +288,8 @@ export interface RequestSnapshots {
 
 interface TrackedSnapshots {
   promptOverride?: PromptOverride;
-  pendingSource?: { readonly sessionId: string; readonly fingerprints: readonly string[] };
-  pendingContext?: ContextSnapshot;
+  pendingSource?: SourceSnapshot;
+  pendingContext?: { readonly source: SourceSnapshot; readonly context: ContextSnapshot };
   context?: ContextSnapshot;
   providerRequest?: ProviderRequestSnapshot;
 }
@@ -281,13 +312,14 @@ export class RequestSnapshotTracker {
     return this.state;
   }
 
-  /** `context`: record the conversation handlers received. Pi clones these messages per request, so hash only for V2. */
-  recordContext(sessionId: string, target: CapableModel | undefined, messages: readonly AgentMessage[]): void {
-    this.state.pendingSource = target ? { sessionId, fingerprints: messages.map(fingerprintMessage) } : undefined;
+  /** `context`: bind to canonical history independently of earlier request-local transformations. */
+  recordContext(sessionId: string, target: CapableModel | undefined, canonical: () => readonly AgentMessage[]): void {
+    this.state.pendingSource = target ? { sessionId, identity: target.identity,
+      sourceFingerprints: requestSource(canonical()).map(fingerprintMessage) } : undefined;
     this.state.pendingContext = undefined;
   }
 
-  /** `context_with_system`: capture Pi's projected request when its source equals the persisted conversation. */
+  /** `context_with_system`: bind the projection only while its canonical source and scope remain unchanged. */
   recordProjectedRequest(
     sessionId: string,
     target: CapableModel | undefined,
@@ -295,16 +327,16 @@ export class RequestSnapshotTracker {
     checkpoint: () => CodexCheckpointDetails | undefined,
     projected: readonly AgentMessage[],
   ): void {
-    const pending = this.state.pendingSource;
+    const pending = target && snapshotFor(this.state.pendingSource, sessionId, target);
     this.state.pendingSource = undefined;
     this.state.pendingContext = undefined;
-    if (!target || pending?.sessionId !== sessionId) return;
+    if (!target || !pending) return;
     const messages = canonical();
-    // Request-local, unpersisted messages cannot be aligned safely with the session's future suffix.
-    if (!matchesConversation(pending.fingerprints, messages)) return;
+    const matched = matchingSource(messages, pending);
+    if (!matched || matched.length !== pending.sourceFingerprints.length) return;
     const prior = checkpoint();
     const source = prior ? projectCheckpointRequest(messages, prior) : messages;
-    if (source) this.state.pendingContext = captureContextSnapshot(sessionId, target, source, projected);
+    if (source) this.state.pendingContext = { source: pending, context: captureContextSnapshot(sessionId, target, source, projected) };
   }
 
   /** `before_provider_request`: record the effective prompt and publish the pending context. */
@@ -315,11 +347,16 @@ export class RequestSnapshotTracker {
     systemPrompt: () => string,
     observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs },
   ): void {
-    this.state.promptOverride = target && capturePromptOverride(canonical(), sessionId, target, systemPrompt());
-    // Keep the pending snapshot for retries that prepare a payload without running context hooks again.
-    this.state.context = this.state.pendingContext;
+    const messages = target ? canonical() : undefined;
+    this.state.promptOverride = target && messages && capturePromptOverride(messages, sessionId, target, systemPrompt());
+    // Keep a valid pending snapshot for retries that do not run context hooks again. Any source change
+    // invalidates that binding before publishing, including changes made by later context handlers.
+    const pending = this.state.pendingContext;
+    const source = target && messages && pending && snapshotFor(pending.source, sessionId, target) && matchingSource(messages, pending.source);
+    if (!source || source.length !== pending?.source.sourceFingerprints.length) this.state.pendingContext = undefined;
+    const context = this.state.pendingContext?.context;
+    this.state.context = context;
     this.state.providerRequest = undefined;
-    const context = target && snapshotFor(this.state.context, sessionId, target);
     if (context && target) {
       const { payload, inputs } = observation();
       this.state.providerRequest = captureProviderRequest(context, target, payload, inputs);

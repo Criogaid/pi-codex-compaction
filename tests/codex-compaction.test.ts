@@ -756,14 +756,18 @@ test("an image-bearing projected prefix survives a failed HTTP compaction attemp
   assert.deepEqual(messages, saved);
 });
 
-test("compaction does not reuse an ordinary context whose source includes unpersisted messages", async () => {
+test("compaction reuses request-local messages while their canonical source stays unchanged", async () => {
   const result = await providerCompaction(toolHistory(), { ordinaryProjection: packToolHistory,
     prepareOrdinarySource(messages) {
       return [...messages, { role: "user", content: "request-local message", timestamp: 4 }];
     },
   });
-  assert.match(JSON.stringify(result.payload.input), /Original tool output/);
-  assert.doesNotMatch(JSON.stringify(result.payload.input), /obs_fixture|request-local message/);
+  const ordinary = result.ordinaryPayload;
+  assert.ok(ordinary && Array.isArray(ordinary.input) && Array.isArray(result.payload.input));
+  assert.equal(JSON.stringify(result.payload.input.slice(0, ordinary.input.length)), JSON.stringify(ordinary.input));
+  assert.match(JSON.stringify(result.payload.input), /obs_fixture/);
+  assert.match(JSON.stringify(result.payload.input), /request-local message/);
+  assert.doesNotMatch(JSON.stringify(result.payload.input), /Original tool output/);
 });
 
 for (const change of ["edit", "system", "session-start", "session-shutdown", "session-id", "model", "backend"] as const) {

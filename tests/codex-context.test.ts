@@ -78,17 +78,17 @@ if (!process.execArgv.includes(mockFlag)) {
       };
       const ctx = { model: currentModel, sessionManager: session, hasUI: false, getSystemPrompt: () => "Canonical prompt" } as unknown as ExtensionContext;
       const providerEvent: BeforeProviderRequestEvent = { type: "before_provider_request", payload: {} };
-      return { ctx, event, projected, providerEvent, tracker, async run(input: HookEvent) {
+      return { ctx, event, projected, providerEvent, tracker, canonical, async run(input: HookEvent) {
         const hook = hooks.get(input.type);
         assert.ok(hook, `${input.type} must be registered`);
         return hook(input, ctx);
       } };
     }
 
-    await t.test("supported context hashes every conversation message and captures the real projection", async () => {
+    await t.test("supported context hashes canonical history and captures the real projection", async () => {
       const current = fixture(supported);
       assert.equal(await current.run(current.event), undefined);
-      assert.deepEqual(fingerprint.mock.calls.map((call) => call.arguments[0]), current.event.messages);
+      assert.deepEqual(fingerprint.mock.calls.map((call) => call.arguments[0]), current.canonical);
       assert.equal(current.tracker.current().context, undefined, "capture waits for the system-inclusive projection");
       await current.run(current.projected);
       assert.equal(current.tracker.current().context, undefined, "publish waits for the provider request");
@@ -141,14 +141,14 @@ if (!process.execArgv.includes(mockFlag)) {
       const tracker = new snapshots.RequestSnapshotTracker();
       const canonical = [{ role: "user" as const, content: "source", timestamp: 1 }];
       fingerprint.mock.resetCalls();
-      tracker.recordContext("session", undefined, canonical);
+      tracker.recordContext("session", undefined, () => assert.fail("unsupported context must not read canonical"));
       assert.equal(fingerprint.mock.callCount(), 0);
       const target = { model: supported, identity: { provider: supported.provider, api: supported.api,
         modelId: supported.id, baseUrl: supported.baseUrl, endpoint: `${supported.baseUrl}/responses` } };
-      tracker.recordContext("session", target, canonical);
+      tracker.recordContext("session", target, () => canonical);
       tracker.recordProjectedRequest("session", target, () => canonical, () => undefined, canonical);
       fingerprint.mock.resetCalls();
-      tracker.recordContext("session", undefined, structuredClone(canonical));
+      tracker.recordContext("session", undefined, () => assert.fail("unsupported context must not read canonical"));
       assert.equal(fingerprint.mock.callCount(), 0);
       tracker.recordProviderRequest("session", undefined, () => assert.fail("canonical must stay lazy"),
         () => assert.fail("prompt must stay lazy"), () => assert.fail("payload must stay lazy"));

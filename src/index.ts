@@ -331,11 +331,12 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("context", async (event, ctx) => {
-      snapshots.recordContext(ctx.sessionManager.getSessionId(), capableModel(ctx.model), event.messages);
+      snapshots.recordContext(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => canonicalMessages(ctx));
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !await compatibleIdentity(checkpoint.details, ctx)) return undefined;
       const messages = projectCheckpointContext(event.messages, checkpoint.details);
       if (messages) return { messages };
+      snapshots.reset();
       warnOnce(ctx, `${checkpoint.details.checkpointId}:projection`,
         "The active Codex checkpoint no longer matches the retained messages, so its opaque history is not replayed.");
       return undefined;
