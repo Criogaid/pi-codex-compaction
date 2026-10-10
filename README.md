@@ -192,7 +192,7 @@ npm run pack:check
 <details>
 <summary><strong>发布流程</strong></summary>
 
-[Publish](.github/workflows/publish.yml) 在推送 `v*` 标签时运行。标签须与 `package.json` 的版本一致，例如版本 `0.5.0` 对应标签 `v0.5.0`。目前只发布正式版本，不接受 `-beta`、`-rc` 等预发布后缀。
+[Publish](.github/workflows/publish.yml) 在推送 `v*` 标签时运行。标签须与 `package.json` 的版本一致，例如版本 `0.5.1` 对应标签 `v0.5.1`。目前只发布正式版本，不接受 `-beta`、`-rc` 等预发布后缀。
 
 首次发布前，在仓库的 **Settings → Secrets and variables → Actions** 中添加 `NPM_TOKEN`。按 [npm 文档](https://docs.npmjs.com/creating-and-viewing-access-tokens)创建 granular access token，授予 `@criogaid` 作用域的发布权限（Read and write / publish and stage），并启用 Bypass two-factor authentication。包创建后，可以将 token 权限缩小到该包。
 
