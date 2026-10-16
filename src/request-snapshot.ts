@@ -251,7 +251,20 @@ export function providerRequestFor(
     (snapshot.inputsKey === key || snapshot.settledInputsKey === key) ? snapshot : undefined;
 }
 
-/** Replace the serialized prefix up to the private boundary; never let that boundary reach the provider. */
+/** Marks the end of the transcript; Pi serializes request-level items after it. */
+function transcriptEndBoundary(boundary: string): string {
+  return `${boundary}_END`;
+}
+
+function boundaryIndex(input: readonly JsonObject[], text: string): number {
+  const matches = input.flatMap((item, index) => item.role === "user" && Array.isArray(item.content) &&
+    item.content.length === 1 && isObject(item.content[0]) && item.content[0].type === "input_text" &&
+    item.content[0].text === text ? [index] : []);
+  if (matches.length !== 1) throw new CodexCompactionProtocolError("Prepared request must contain exactly one of each snapshot boundary");
+  return matches[0];
+}
+
+/** Replace the serialized prefix up to the private boundaries; never let a boundary reach the provider. */
 export function applyProviderRequest(
   payload: JsonObject, target: CapableModel, snapshot: ProviderRequestSnapshot | undefined,
   contextItems: ReadonlySet<JsonObject> = new Set(),
@@ -263,19 +276,25 @@ export function applyProviderRequest(
   if (!prefix) return { payload: compatible ? { ...payload, ...structuredClone(snapshot.fields) } : payload,
     contextual: input?.map((item) => contextItems.has(item)) ?? [] };
   if (!input) throw new CodexCompactionProtocolError("Prepared request cannot locate the snapshot boundary");
-  const matches = input.flatMap((item, index) => item.role === "user" && Array.isArray(item.content) &&
-    item.content.length === 1 && isObject(item.content[0]) && item.content[0].type === "input_text" &&
-    item.content[0].text === prefix.boundary ? [index] : []);
-  if (matches.length !== 1) throw new CodexCompactionProtocolError("Prepared request must contain exactly one snapshot boundary");
-  const boundaryIndex = matches[0];
-  const suffix = input.slice(boundaryIndex + 1);
-  if (!compatible) {
-    const unmarked = [...input.slice(0, boundaryIndex), ...suffix];
+  const start = boundaryIndex(input, prefix.boundary);
+  const end = boundaryIndex(input, transcriptEndBoundary(prefix.boundary));
+  if (end < start) throw new CodexCompactionProtocolError("Prepared request reordered the snapshot boundaries");
+  const suffix = input.slice(start + 1, end);
+  // Pi appends request-level items, such as its effort update, after the transcript. The observed
+  // input ends with its own request's items, which belong to that request rather than the prefix.
+  const tail = input.slice(end + 1);
+  const kept = prefix.input.length - tail.length;
+  const tailMatches = kept >= 0 && tail.every((item, index) =>
+    item.type === prefix.input[kept + index].type && item.role === prefix.input[kept + index].role);
+  if (!compatible || !tailMatches) {
+    // An unrecognized request tail could make the joined input invalid; send Pi's own serialization.
+    const unmarked = [...input.slice(0, start), ...suffix, ...tail];
     return { payload: { ...payload, input: unmarked }, contextual: unmarked.map((item) => contextItems.has(item)) };
   }
+  const fresh = [...suffix, ...tail];
   return {
-    payload: { ...payload, ...structuredClone(snapshot.fields), input: [...structuredClone(prefix.input), ...suffix] },
-    contextual: [...prefix.contextual, ...suffix.map((item) => contextItems.has(item))],
+    payload: { ...payload, ...structuredClone(snapshot.fields), input: [...structuredClone(prefix.input.slice(0, kept)), ...fresh] },
+    contextual: [...prefix.contextual.slice(0, kept), ...fresh.map((item) => contextItems.has(item))],
   };
 }
 
@@ -413,12 +432,14 @@ export function compactionRequest(
   const override = snapshots.promptOverride && promptOverrideFor(snapshots.promptOverride, sessionId, target, current, declarations.systemPrompt());
   const reused = reuseContextSnapshot(current, snapshotFor(snapshots.context, sessionId, target));
   // The provider serializes the full transcript so grammar declarations and historical IDs keep their context.
-  // This private user item marks the join; applyProviderRequest removes it and everything before it.
+  // Private user items mark the join and the transcript end; applyProviderRequest removes both,
+  // replaces everything before the join, and keeps the request-level items Pi serializes after the end.
   const prefix = providerRequest?.prefix;
   const messages: AgentMessage[] = prefix ? [
     ...reused.slice(0, prefix.contextLength),
     { role: "user", content: prefix.boundary, timestamp: 0 },
     ...reused.slice(prefix.contextLength),
+    { role: "user", content: transcriptEndBoundary(prefix.boundary), timestamp: 0 },
   ] : reused;
   const converted = convertToLlm(messages);
   const llmMessages = declarations.blockImages ? withoutImages(converted) : converted;
