@@ -272,7 +272,8 @@ test("observed declarations and cache fields survive newer messages without copy
   observed.tools[0].name = "mutated-after-capture";
   observed.input[0].content?.push({ type: "input_text", text: "mutated-after-capture" });
   const fresh = { model: model.id, input: [{ role: "system", content: "fresh prompt" },
-    { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] }, { role: "user", content: "new turn" }],
+    { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] }, { role: "user", content: "new turn" },
+    { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] }],
     tools: [], text: { verbosity: "high" }, max_output_tokens: 4_096, store: false, stream: true };
   const { payload: result } = applyProviderRequest(fresh, target, snapshot);
   const original = wirePayload();
@@ -292,13 +293,14 @@ test("observed declarations and cache fields survive newer messages without copy
 });
 
 for (const scenario of [
-  { name: "equal effort updates", prefixEffort: "low", suffixEffort: "low", newMessage: true, trim: true },
-  { name: "different effort updates", prefixEffort: "low", suffixEffort: "high", newMessage: true, trim: true },
-  { name: "only an effort update after the boundary", prefixEffort: "low", suffixEffort: "low", newMessage: false, trim: true },
-  { name: "only a trailing prefix update", prefixEffort: "low", suffixEffort: undefined, newMessage: true, trim: false },
-  { name: "only a leading suffix update", prefixEffort: undefined, suffixEffort: "high", newMessage: true, trim: false },
-  { name: "neither side has an update", prefixEffort: undefined, suffixEffort: undefined, newMessage: true, trim: false },
-  { name: "an empty suffix", prefixEffort: "low", suffixEffort: undefined, newMessage: false, trim: false },
+  { name: "equal effort updates", prefixEffort: "low", suffixEffort: "low", tailEffort: "low", newMessage: true, trim: true },
+  { name: "different effort updates", prefixEffort: "low", suffixEffort: "high", tailEffort: "high", newMessage: true, trim: true },
+  { name: "only a request-level update after the join", prefixEffort: "low", suffixEffort: undefined, tailEffort: "low", newMessage: false, trim: true },
+  { name: "only a trailing prefix update", prefixEffort: "low", suffixEffort: undefined, tailEffort: undefined, newMessage: true, trim: false },
+  { name: "only a leading suffix update", prefixEffort: undefined, suffixEffort: "high", tailEffort: undefined, newMessage: true, trim: false },
+  { name: "neither side has an update", prefixEffort: undefined, suffixEffort: undefined, tailEffort: undefined, newMessage: true, trim: false },
+  { name: "an empty suffix and tail", prefixEffort: "low", suffixEffort: undefined, tailEffort: undefined, newMessage: false, trim: false },
+  { name: "a matching tail without a leading suffix update", prefixEffort: "low", suffixEffort: undefined, tailEffort: "high", newMessage: true, trim: true },
 ]) {
   test(`wire prefix join preserves input and contextual alignment for ${scenario.name}`, () => {
     const canonical = [system(), user()];
@@ -311,21 +313,81 @@ for (const scenario of [
     const suffix: JsonObject[] = [];
     if (scenario.suffixEffort) suffix.push({ type: "configuration_update", reasoning: { effort: scenario.suffixEffort } });
     if (scenario.newMessage) suffix.push({ role: "user", content: "new turn" });
+    const tail: JsonObject[] = scenario.tailEffort
+      ? [{ type: "configuration_update", reasoning: { effort: scenario.tailEffort } }] : [];
     const fresh = { model: model.id, input: [
       { role: "user", content: "discarded serialization" },
       { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] },
       ...suffix,
+      { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] },
+      ...tail,
     ] };
-    const contextItems = new Set(suffix.filter((item) => item.type === "configuration_update"));
+    const contextItems = new Set([...suffix, ...tail].filter((item) => item.type === "configuration_update"));
     const before = structuredClone({ snapshot, fresh });
     const result = applyProviderRequest(fresh, target, snapshot, contextItems);
     const keptPrefix = scenario.trim ? prefix.slice(0, -1) : prefix;
-    assert.deepEqual(result.payload.input, [...keptPrefix, ...suffix]);
+    assert.deepEqual(result.payload.input, [...keptPrefix, ...suffix, ...tail]);
     assert.deepEqual(result.contextual, [
-      ...keptPrefix.map((_, index) => index === 0), ...suffix.map((item) => contextItems.has(item)),
+      ...keptPrefix.map((_, index) => index === 0), ...[...suffix, ...tail].map((item) => contextItems.has(item)),
     ]);
     assert.ok(Array.isArray(result.payload.input));
     assert.equal(result.contextual.length, result.payload.input.length);
+    assert.deepEqual({ snapshot, fresh }, before);
+  });
+}
+
+test("matching multi-item request tails replace observed values and preserve contextual flags", () => {
+  const canonical = [system(), user()];
+  const history = { role: "user", content: "observed source" };
+  const observedTail = [{ type: "configuration_update", reasoning: { effort: "low" } },
+    { type: "request_options", policy: "previous" }];
+  const tracker = observedRequest(canonical, { model: model.id, input: [history, ...observedTail] });
+  const captured = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+  assert.ok(captured?.prefix);
+  const snapshot = { ...captured, prefix: { ...captured.prefix, contextual: [true, false, true] } };
+  const suffix = { role: "user", content: "new turn" };
+  const tail = [{ type: "configuration_update", reasoning: { effort: "high" } },
+    { type: "request_options", policy: "current" }];
+  const fresh = { model: model.id, input: [
+    { role: "user", content: "fresh serialization" },
+    { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] },
+    suffix,
+    { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] },
+    ...tail,
+  ] };
+  const before = structuredClone({ snapshot, fresh });
+  const result = applyProviderRequest(fresh, target, snapshot, new Set([tail[0]]));
+  assert.deepEqual(result.payload.input, [history, suffix, ...tail]);
+  assert.deepEqual(result.contextual, [true, false, true, false]);
+  assert.deepEqual({ snapshot, fresh }, before);
+});
+
+for (const scenario of [
+  { name: "different item type", tail: [{ type: "request_options" }] },
+  { name: "different item role", tail: [{ type: "configuration_update", role: "user" }] },
+  { name: "more tail items than observed input", tail: [
+    { type: "configuration_update" }, { type: "configuration_update" }, { type: "configuration_update" },
+  ] },
+]) {
+  test(`a request tail with ${scenario.name} uses fresh serialization and fields`, () => {
+    const canonical = [system(), user()];
+    const tracker = observedRequest(canonical, { ...wirePayload(), input: [
+      { role: "user", content: "observed source" },
+      { type: "configuration_update", reasoning: { effort: "low" } },
+    ] });
+    const snapshot = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+    assert.ok(snapshot?.prefix);
+    const head = { role: "user", content: "fresh source" };
+    const suffix = { role: "user", content: "new turn" };
+    const fresh = { model: model.id, instructions: "fresh prompt", tools: [], input: [
+      head, { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] },
+      suffix, { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] },
+      ...scenario.tail,
+    ] };
+    const before = structuredClone({ snapshot, fresh });
+    const result = applyProviderRequest(fresh, target, snapshot, new Set([head, scenario.tail[0]]));
+    assert.deepEqual(result.payload, { ...fresh, input: [head, suffix, ...scenario.tail] });
+    assert.deepEqual(result.contextual, [true, false, ...scenario.tail.map((_, index) => index === 0)]);
     assert.deepEqual({ snapshot, fresh }, before);
   });
 }
@@ -349,10 +411,14 @@ test("wire snapshots reject session, backend, source, prompt, tool, thinking and
   const snapshot = providerRequestFor(snapshots, sessionId, target, canonical, inputs);
   assert.ok(snapshot?.prefix);
   const fresh = wirePayload();
-  const marked = { ...fresh, input: [...fresh.input, { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] }] };
+  const start = { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] };
+  const end = { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] };
+  const marked = { ...fresh, input: [...fresh.input, start, end] };
   assert.deepEqual(applyProviderRequest(marked, otherBackend, snapshot).payload, fresh);
   assert.throws(() => applyProviderRequest(fresh, target, snapshot), /boundary/);
-  assert.throws(() => applyProviderRequest({ ...marked, input: [...marked.input, marked.input.at(-1)] }, target, snapshot), /boundary/);
+  for (const boundaries of [[start], [end], [start, start, end], [start, end, end], [end, start]]) {
+    assert.throws(() => applyProviderRequest({ ...fresh, input: [...fresh.input, ...boundaries] }, target, snapshot), /boundar/);
+  }
 });
 
 test("missing wire fields remove obsolete defaults and malformed observations discard earlier snapshots", () => {
@@ -363,7 +429,8 @@ test("missing wire fields remove obsolete defaults and malformed observations di
   assert.ok(snapshot?.prefix);
   const fresh = wirePayload();
   const actual = applyProviderRequest({ ...fresh, input: [...fresh.input,
-    { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] }] }, target, snapshot).payload;
+    { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] },
+    { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] }] }, target, snapshot).payload;
   assert.equal(actual.instructions, undefined);
   assert.equal(actual.tools, undefined);
   assert.equal(actual.prompt_cache_key, undefined);

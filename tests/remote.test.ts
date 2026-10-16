@@ -256,7 +256,8 @@ test("the final V2 payload preserves declarations through snapshot reuse and che
     baseUrl: model.baseUrl, endpoint: `${model.baseUrl}/responses` };
   const boundary = "snapshot boundary";
   const registry = await testRegistry(providerInput([markerItem,
-    { role: "user", content: [{ type: "input_text", text: boundary }] }, ...input.slice(1)]));
+    { role: "user", content: [{ type: "input_text", text: boundary }] }, ...input.slice(1),
+    { role: "user", content: [{ type: "input_text", text: `${boundary}_END` }] }]));
   const attempts: unknown[] = [];
   const result = await requestRemoteCompaction({ ...request(registry),
     maxRetries: 1, maxRetryDelayMs: 1,
