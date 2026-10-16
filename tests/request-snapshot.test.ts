@@ -8,7 +8,7 @@ import { getDeclaredTools, normalizeContext } from "@earendil-works/pi-ai/utils/
 import type { CapableModel } from "../src/capability.js";
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, fingerprintMessage } from "../src/checkpoint.js";
 import { applyProviderRequest, compactionRequest, providerRequestFor, RequestSnapshotTracker, type ProviderRequestInputs, type RequestDeclarations } from "../src/request-snapshot.js";
-import { isObject } from "../src/protocol.js";
+import { isObject, type JsonObject } from "../src/protocol.js";
 
 const sessionId = "snapshot-session";
 const model: Model<"openai-responses"> = {
@@ -290,6 +290,45 @@ test("observed declarations and cache fields survive newer messages without copy
   assert.equal(result.stream, fresh.stream);
   assert.deepEqual(fresh.tools, []);
 });
+
+for (const scenario of [
+  { name: "equal effort updates", prefixEffort: "low", suffixEffort: "low", newMessage: true, trim: true },
+  { name: "different effort updates", prefixEffort: "low", suffixEffort: "high", newMessage: true, trim: true },
+  { name: "only an effort update after the boundary", prefixEffort: "low", suffixEffort: "low", newMessage: false, trim: true },
+  { name: "only a trailing prefix update", prefixEffort: "low", suffixEffort: undefined, newMessage: true, trim: false },
+  { name: "only a leading suffix update", prefixEffort: undefined, suffixEffort: "high", newMessage: true, trim: false },
+  { name: "neither side has an update", prefixEffort: undefined, suffixEffort: undefined, newMessage: true, trim: false },
+  { name: "an empty suffix", prefixEffort: "low", suffixEffort: undefined, newMessage: false, trim: false },
+]) {
+  test(`wire prefix join preserves input and contextual alignment for ${scenario.name}`, () => {
+    const canonical = [system(), user()];
+    const prefix: JsonObject[] = [{ role: "user", content: "source" }];
+    if (scenario.prefixEffort) prefix.push({ type: "configuration_update", reasoning: { effort: scenario.prefixEffort } });
+    const tracker = observedRequest(canonical, { model: model.id, input: prefix });
+    const captured = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+    assert.ok(captured?.prefix);
+    const snapshot = { ...captured, prefix: { ...captured.prefix, contextual: prefix.map((_, index) => index === 0) } };
+    const suffix: JsonObject[] = [];
+    if (scenario.suffixEffort) suffix.push({ type: "configuration_update", reasoning: { effort: scenario.suffixEffort } });
+    if (scenario.newMessage) suffix.push({ role: "user", content: "new turn" });
+    const fresh = { model: model.id, input: [
+      { role: "user", content: "discarded serialization" },
+      { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] },
+      ...suffix,
+    ] };
+    const contextItems = new Set(suffix.filter((item) => item.type === "configuration_update"));
+    const before = structuredClone({ snapshot, fresh });
+    const result = applyProviderRequest(fresh, target, snapshot, contextItems);
+    const keptPrefix = scenario.trim ? prefix.slice(0, -1) : prefix;
+    assert.deepEqual(result.payload.input, [...keptPrefix, ...suffix]);
+    assert.deepEqual(result.contextual, [
+      ...keptPrefix.map((_, index) => index === 0), ...suffix.map((item) => contextItems.has(item)),
+    ]);
+    assert.ok(Array.isArray(result.payload.input));
+    assert.equal(result.contextual.length, result.payload.input.length);
+    assert.deepEqual({ snapshot, fresh }, before);
+  });
+}
 
 test("wire snapshots reject session, backend, source, prompt, tool, thinking and settings changes", () => {
   const canonical = [system(), user()];

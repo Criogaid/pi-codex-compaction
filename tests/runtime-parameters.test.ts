@@ -8,6 +8,9 @@ import { normalizeContext } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { closeOpenAICodexWebSocketSessions } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import { capableModel } from "../src/capability.js";
+import { isObject, type JsonObject } from "../src/protocol.js";
+import { compactionRequest, providerRequestFor, RequestSnapshotTracker, type ProviderRequestInputs } from "../src/request-snapshot.js";
 import { requestRemoteCompaction } from "../src/remote.js";
 import { testRegistry } from "./helpers.js";
 
@@ -85,6 +88,86 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     });
   }
 }
+
+test("Pi 1.3 mid-conversation effort simulation sends no adjacent updates in compacted wire input", async () => {
+  const provider = openaiProvider();
+  const compat = { supportsLongCacheRetention: true, supportsMidConvoEffort: true };
+  const model: Model<"openai-responses"> = {
+    id: "gpt-fixture", name: "Fixture", api: "openai-responses", provider: provider.id,
+    baseUrl: "https://gateway.example/v1", reasoning: true, input: ["text"],
+    contextWindow: 100_000, maxTokens: 10_000,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    compat: { ...compat },
+  };
+  const target = capableModel(model);
+  assert.ok(target);
+  const update = { type: "configuration_update", reasoning: { effort: "low" } };
+  const registry = await testRegistry({ ...provider,
+    streamSimple(current, context, options) {
+      assert.equal(current.id, model.id);
+      return provider.streamSimple(model, context, { ...options,
+        onPayload: async (payload, preparedModel) => {
+          assert.ok(isObject(payload) && Array.isArray(payload.input) && payload.input.every(isObject));
+          // The pinned Pi 1.0.4 adapter lacks Responses effort updates; simulate Pi 1.3 serialization here.
+          const input = compat.supportsMidConvoEffort
+            ? [...payload.input.flatMap((item) => item.role === "assistant" ? [update, item] : [item]), update]
+            : payload.input;
+          const simulated = { ...payload, input };
+          return await options?.onPayload?.(simulated, preparedModel) ?? simulated;
+        },
+      });
+    },
+  });
+  const canonical = [{ role: "system" as const, content: "Preserve settings.", timestamp: 0 },
+    { role: "user" as const, content: "source", timestamp: 1 }];
+  const inputs: ProviderRequestInputs = { systemPrompt: "Preserve settings.", thinkingLevel: "low", settings: {}, activeTools: [], tools: [] };
+  const tracker = new RequestSnapshotTracker();
+  tracker.recordContext(sessionId, target, () => canonical);
+  tracker.recordProjectedRequest(sessionId, target, () => canonical, () => undefined, canonical);
+  let observed: JsonObject | undefined;
+  const assistant = await registry.streamSimple(model, { messages: canonical }, {
+    reasoning: "low", transport: "sse",
+    onPayload: (payload) => {
+      assert.ok(isObject(payload));
+      observed = structuredClone(payload);
+      tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt, () => ({ payload, inputs }));
+    },
+    fetch: async () => response(),
+  }).result();
+  assert.notEqual(assistant.stopReason, "error", assistant.errorMessage ?? "ordinary request failed");
+  assert.ok(observed && Array.isArray(observed.input));
+  assert.deepEqual(observed.input.at(-1), update);
+  const current = [...canonical, { ...assistant, content: [{ type: "text" as const, text: "reply" }], timestamp: 2 }];
+  const snapshot = providerRequestFor(tracker.current(), sessionId, target, current, inputs);
+  assert.ok(snapshot?.prefix);
+  const request = compactionRequest(tracker.current(), sessionId, target, current,
+    { blockImages: false, systemPrompt: () => inputs.systemPrompt, tools: () => [] }, snapshot);
+  let sent: JsonObject | undefined;
+  const result = await requestRemoteCompaction({
+    modelRegistry: registry, model, context: request.context, providerRequest: snapshot,
+    reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000),
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      const bytes = Buffer.from(await request.arrayBuffer());
+      const decoded = request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
+      const payload: unknown = JSON.parse(decoded.toString("utf8"));
+      assert.ok(isObject(payload));
+      sent = payload;
+      return response();
+    },
+  });
+  assert.ok(sent && Array.isArray(sent.input) && sent.input.every(isObject));
+  assert.deepEqual(sent.input.at(-1), { type: "compaction_trigger" });
+  const wireInput = sent.input.slice(0, -1);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.promptInput)), wireInput);
+  assert.equal(result.contextual.length, wireInput.length);
+  assert.deepEqual(wireInput.slice(0, observed.input.length - 1), observed.input.slice(0, -1));
+  assert.equal(wireInput.filter((item) => item.type === "configuration_update").length, 2);
+  assert.ok(wireInput.some((item) => item.role === "assistant"));
+  for (let index = 1; index < wireInput.length; index++) {
+    assert.ok(wireInput[index - 1].type !== "configuration_update" || wireInput[index].type !== "configuration_update");
+  }
+});
 
 test("V2 uses a fresh HTTP request with its feature header after an ordinary WebSocket request", async () => {
   const provider = openaiCodexProvider();
