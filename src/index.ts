@@ -377,7 +377,7 @@ export function createCodexCompactionExtension(
     pi.on("model_select", async (event, ctx) => {
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || await compatibleIdentity(checkpoint.details, ctx, event.model)) return;
-      warnOnce(ctx, `${event.model.provider}:${event.model.id}`, INCOMPATIBLE_BACKEND_WARNING);
+      warnOnce(ctx, `${checkpoint.details.checkpointId}:${event.model.provider}:${event.model.id}`, INCOMPATIBLE_BACKEND_WARNING);
     });
 
     pi.on("session_shutdown", (_event, ctx) => {

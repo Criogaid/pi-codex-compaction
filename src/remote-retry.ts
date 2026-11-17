@@ -71,7 +71,8 @@ function classifyError(value: unknown): { code?: string; permanent: boolean; inv
   let invalid = value.error !== undefined && !isObject(value.error);
   const codes: string[] = [];
   for (const record of records) {
-    if (record.code !== undefined) {
+    // OpenAI error bodies carry `"code": null`; classify those by `type` like an absent code.
+    if (record.code !== undefined && record.code !== null) {
       if (typeof record.code === "string" && record.code) codes.push(record.code);
       else invalid = true;
     } else if (typeof record.type === "string" && record.type !== "error" &&
