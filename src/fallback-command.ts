@@ -2,21 +2,25 @@
 import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
 import { getSelectListTheme, getSettingsListTheme, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Container, fuzzyFilter, Input, SelectList, SettingsList, Text } from "@earendil-works/pi-tui";
-import { loadCompactionSettings, type FallbackConfiguration } from "./fallback-settings.js";
+import { loadCompactionSettings, type SummaryModel } from "./fallback-settings.js";
 
 const COMMAND_NAME = "codex-compaction";
-const SUMMARY_SWITCH_LABEL = "Use separate summary model";
-const SUMMARY_MODEL_LABEL = "Summary model and thinking level";
+const REMOTE_LABEL = "Remote Compaction V2";
+const SUMMARY_MODEL_LABEL = "Summary model";
+const CHAT_MODEL_LABEL = "Chat model";
+const USE_CHAT_MODEL = "Use the chat model";
 const TEXT_SUMMARY_DESCRIPTION = "Text summaries are used when V2 is off, unsupported, or fails.";
 const MAX_VISIBLE_MODELS = 10;
-type SettingsAction = "model" | "toggle" | "remote";
+type SettingsAction = "remote" | "model";
+/** The chat model is the absence of a summary model, offered as the first choice. */
+type ModelChoice = Model<Api> | typeof USE_CHAT_MODEL;
 
-/** A fallback that failed validation stays editable: V2 can still be toggled and a new model replaces it. */
-type FallbackState =
-  | { readonly value: FallbackConfiguration | undefined; readonly error?: never }
+/** A summary model that failed validation stays editable: V2 can still be toggled and a new choice replaces it. */
+type SummaryState =
+  | { readonly value: SummaryModel | undefined; readonly error?: never }
   | { readonly value?: never; readonly error: string };
 
-function readFallback(read: () => FallbackConfiguration | undefined): FallbackState {
+function readSummaryModel(read: () => SummaryModel | undefined): SummaryState {
   try {
     return { value: read() };
   } catch (error) {
@@ -24,44 +28,35 @@ function readFallback(read: () => FallbackConfiguration | undefined): FallbackSt
   }
 }
 
-function fallbackModelLabel(selection: FallbackConfiguration | undefined): string | undefined {
-  return selection?.model === undefined ? undefined : `${selection.provider}/${selection.model} (${selection.thinkingLevel})`;
-}
-
-function describeFallback(selection: FallbackConfiguration | undefined): string {
-  const model = fallbackModelLabel(selection);
-  if (model === undefined) return "No separate summary model configured; inactive. Pi uses the chat model.";
-  return selection?.enabled ? `Text summaries will use ${model}. The chat model is unchanged.`
-    : `Separate summary model is Off. Pi will use the chat model for text compaction. Saved model: ${model}.`;
+function describeSummaryModel(summary: SummaryModel | undefined): string {
+  return summary === undefined ? "Text summaries use the chat model."
+    : `Text summaries use ${summary.provider}/${summary.model} (${summary.thinkingLevel}). The chat model is unchanged.`;
 }
 
 async function chooseAction(
   ctx: ExtensionCommandContext,
   remoteCompactionEnabled: boolean,
-  fallback: FallbackState,
+  summary: SummaryState,
   selected: SettingsAction,
 ): Promise<SettingsAction | undefined> {
-  const current = fallback.value;
-  const invalid = fallback.error !== undefined;
-  const description = fallback.error ?? `${TEXT_SUMMARY_DESCRIPTION} ${describeFallback(current)}`;
+  const description = summary.error ?? `${TEXT_SUMMARY_DESCRIPTION} ${describeSummaryModel(summary.value)}`;
   const remoteValue = remoteCompactionEnabled ? "On" : "Off";
-  const switchValue = invalid ? "Invalid" : current?.enabled ? "On" : "Off";
+  const modelValue = summary.error !== undefined ? "Invalid"
+    : summary.value === undefined ? CHAT_MODEL_LABEL : `${summary.value.provider}/${summary.value.model} (${summary.value.thinkingLevel})`;
   if (ctx.mode !== "tui") {
-    const switchLabel = `${SUMMARY_SWITCH_LABEL}: ${switchValue}`;
-    const remoteLabel = `Remote Compaction V2: ${remoteValue}`;
-    const action = await ctx.ui.select(description, [remoteLabel, switchLabel, SUMMARY_MODEL_LABEL]);
+    const remoteLabel = `${REMOTE_LABEL}: ${remoteValue}`;
+    const modelLabel = `${SUMMARY_MODEL_LABEL}: ${modelValue}`;
+    const action = await ctx.ui.select(description, [remoteLabel, modelLabel]);
     if (action === undefined) return undefined;
-    if (action === SUMMARY_MODEL_LABEL) return "model";
-    if (action === switchLabel) return "toggle";
     if (action === remoteLabel) return "remote";
+    if (action === modelLabel) return "model";
     throw new Error("Select a listed compaction setting");
   }
   return ctx.ui.custom<SettingsAction | undefined>((tui, _theme, _keys, done) => {
     const list = new SettingsList([
-      { id: "remote", label: "Remote Compaction V2", currentValue: remoteValue, values: ["Off", "On"], description: "When On, try V2 with the chat model. When Off, unsupported, or failed, use text summaries. The settings below choose their model. Turning V2 off does not affect previously compressed chat history." },
-      { id: "toggle", label: SUMMARY_SWITCH_LABEL, currentValue: switchValue, values: invalid ? ["Invalid"] : ["Off", "On"], description },
-      { id: "model", label: SUMMARY_MODEL_LABEL, currentValue: invalid ? "Invalid" : fallbackModelLabel(current) ?? "Not configured", values: ["Choose"], description: invalid ? "Choose a model to replace the invalid fallback settings." : `Choose the model and thinking level used when "${SUMMARY_SWITCH_LABEL}" is On. Choosing a model does not enable the switch or change the chat model. ${TEXT_SUMMARY_DESCRIPTION}` },
-    ], 3, getSettingsListTheme(), (id) => done(id === "toggle" ? "toggle" : id === "remote" ? "remote" : "model"), () => done(undefined));
+      { id: "remote", label: REMOTE_LABEL, currentValue: remoteValue, values: ["Off", "On"], description: "When On, try V2 with the chat model. When Off, unsupported, or failed, use text summaries. Turning V2 off does not affect previously compressed chat history." },
+      { id: "model", label: SUMMARY_MODEL_LABEL, currentValue: modelValue, values: ["Choose"], description },
+    ], 2, getSettingsListTheme(), (id) => done(id === "remote" ? "remote" : "model"), () => done(undefined));
     list.selectItem(selected);
     return {
       render: (width) => list.render(width),
@@ -75,25 +70,29 @@ function modelLabel(model: Model<Api>): string {
   return `${model.provider}/${model.id} (${model.name})`;
 }
 
-async function chooseModel(ctx: ExtensionCommandContext, models: readonly Model<Api>[]): Promise<Model<Api> | undefined> {
+async function chooseModel(ctx: ExtensionCommandContext, models: readonly Model<Api>[]): Promise<ModelChoice | undefined> {
   if (ctx.mode !== "tui") {
     const query = await ctx.ui.input("Search summary models (provider, ID, or name)", "Leave empty to show all models");
     if (query === undefined) return undefined;
     const matches = fuzzyFilter([...models], query, modelLabel);
-    const chosen = await ctx.ui.select("Choose the model for text summaries", matches.map(modelLabel));
+    const chosen = await ctx.ui.select("Choose the model for text summaries", [USE_CHAT_MODEL, ...matches.map(modelLabel)]);
     if (chosen === undefined) return undefined;
+    if (chosen === USE_CHAT_MODEL) return USE_CHAT_MODEL;
     const model = matches.find((candidate) => modelLabel(candidate) === chosen);
-    if (!model) throw new Error("Select a listed fallback model");
+    if (!model) throw new Error("Select a listed summary model");
     return model;
   }
-  return ctx.ui.custom<Model<Api> | undefined>((tui, _theme, keys, done) => {
+  return ctx.ui.custom<ModelChoice | undefined>((tui, _theme, keys, done) => {
     const input = new Input();
     const container = new Container();
     let list: SelectList;
     const update = () => {
       const matches = fuzzyFilter([...models], input.getValue(), modelLabel);
-      list = new SelectList(matches.map((model, index) => ({ value: String(index), label: model.id, description: `${model.provider} · ${model.name}` })), MAX_VISIBLE_MODELS, getSelectListTheme());
-      list.onSelect = (item) => done(matches[Number(item.value)]);
+      list = new SelectList([
+        { value: USE_CHAT_MODEL, label: USE_CHAT_MODEL, description: "No separate summary model" },
+        ...matches.map((model, index) => ({ value: String(index), label: model.id, description: `${model.provider} · ${model.name}` })),
+      ], MAX_VISIBLE_MODELS, getSelectListTheme());
+      list.onSelect = (item) => done(item.value === USE_CHAT_MODEL ? USE_CHAT_MODEL : matches[Number(item.value)]);
       list.onCancel = () => done(undefined);
       container.clear();
       container.addChild(new Text("Summary model: type to search by provider, ID, or name", 0, 0));
@@ -119,6 +118,24 @@ async function chooseModel(ctx: ExtensionCommandContext, models: readonly Model<
   });
 }
 
+/** Undefined means the dialog was cancelled; `{ value: undefined }` selects the chat model. */
+async function chooseSummaryModel(ctx: ExtensionCommandContext): Promise<{ readonly value: SummaryModel | undefined } | undefined> {
+  const models = [...ctx.modelRegistry.getAvailable()].sort((left, right) => {
+    const a = modelLabel(left);
+    const b = modelLabel(right);
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  const model = await chooseModel(ctx, models);
+  if (model === undefined) return undefined;
+  if (model === USE_CHAT_MODEL) return { value: undefined };
+  const levels = getSupportedThinkingLevels(model);
+  const chosenLevel = await ctx.ui.select(`Thinking level for ${model.provider}/${model.id}`, [...levels]);
+  if (chosenLevel === undefined) return undefined;
+  const thinkingLevel = levels.find((level) => level === chosenLevel);
+  if (thinkingLevel === undefined) throw new Error("Select a supported summary thinking level");
+  return { value: { provider: model.provider, model: model.id, thinkingLevel } };
+}
+
 async function configureCompaction(path: string, ctx: ExtensionCommandContext): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify(`/${COMMAND_NAME} requires interactive or RPC mode; edit ${path} directly.`, "warning");
@@ -128,45 +145,22 @@ async function configureCompaction(path: string, ctx: ExtensionCommandContext): 
   while (true) {
     const settings = await loadCompactionSettings(path);
     const configuration = settings.configuration;
-    const fallback = readFallback(() => configuration.fallback);
-    const current = fallback.value;
-    const action = await chooseAction(ctx, configuration.remoteCompactionEnabled, fallback, selected);
+    const summary = readSummaryModel(() => configuration.summaryModel);
+    const action = await chooseAction(ctx, configuration.remoteCompactionEnabled, summary, selected);
     if (action === undefined) return;
     selected = action;
     if (action === "remote") {
       const remoteCompactionEnabled = !configuration.remoteCompactionEnabled;
-      // Save a valid fallback in normalized form; omit an invalid one so the file keeps it as written.
-      await settings.save(fallback.error === undefined ? { remoteCompactionEnabled, fallback: current } : { remoteCompactionEnabled });
+      // Omitting summaryModel keeps the file's value as written, including one that fails validation.
+      await settings.save({ remoteCompactionEnabled });
       ctx.ui.notify(remoteCompactionEnabled
-        ? "Remote Compaction V2 is On. Supported models try V2 before text fallback."
-        : "Remote Compaction V2 is Off. Text compaction uses the configured fallback when enabled; otherwise Pi uses the chat model.", "info");
-    } else if (action === "toggle" && fallback.error !== undefined) {
-      ctx.ui.notify(`${fallback.error}. Choose a model to replace it, or edit the file directly.`, "error");
-    } else if (action === "toggle") {
-      const selection = { ...current, enabled: !current?.enabled };
-      await settings.save({ remoteCompactionEnabled: configuration.remoteCompactionEnabled, fallback: selection });
-      ctx.ui.notify(describeFallback(selection), "info");
+        ? "Remote Compaction V2 is On. Supported models try V2 before text summaries."
+        : "Remote Compaction V2 is Off. Compaction writes text summaries.", "info");
     } else {
-      const models = [...ctx.modelRegistry.getAvailable()].sort((left, right) => {
-        const a = modelLabel(left);
-        const b = modelLabel(right);
-        return a < b ? -1 : a > b ? 1 : 0;
-      });
-      if (models.length === 0) {
-        ctx.ui.notify("No authenticated models are available. Configure a model in Pi first.", "warning");
-      } else {
-        const model = await chooseModel(ctx, models);
-        if (model !== undefined) {
-          const levels = getSupportedThinkingLevels(model);
-          const chosenLevel = await ctx.ui.select(`Thinking level for ${model.provider}/${model.id}`, [...levels]);
-          if (chosenLevel !== undefined) {
-            const thinkingLevel = levels.find((level) => level === chosenLevel);
-            if (thinkingLevel === undefined) throw new Error("Select a supported fallback thinking level");
-            const selection = { enabled: current?.enabled ?? false, provider: model.provider, model: model.id, thinkingLevel };
-            await settings.save({ remoteCompactionEnabled: configuration.remoteCompactionEnabled, fallback: selection });
-            ctx.ui.notify(describeFallback(selection), "info");
-          }
-        }
+      const choice = await chooseSummaryModel(ctx);
+      if (choice !== undefined) {
+        await settings.save({ remoteCompactionEnabled: configuration.remoteCompactionEnabled, summaryModel: choice.value });
+        ctx.ui.notify(describeSummaryModel(choice.value), "info");
       }
     }
     // TUI keeps the same row selected so repeated Enter presses toggle in place.
@@ -176,7 +170,7 @@ async function configureCompaction(path: string, ctx: ExtensionCommandContext): 
 
 export function registerCompactionCommand(pi: ExtensionAPI, path: string): void {
   pi.registerCommand(COMMAND_NAME, {
-    description: "Configure V2 and fallback compaction settings",
+    description: "Configure V2 and summary model settings",
     handler: async (args, ctx) => {
       try {
         if (args.trim()) throw new Error(`Usage: /${COMMAND_NAME}`);

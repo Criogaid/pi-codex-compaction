@@ -1,7 +1,7 @@
-// Own configured fallback selection and Pi's native text summarization through the model registry.
+// Own summary-model resolution and Pi's native text summarization through the model registry.
 import { getSupportedThinkingLevels, type Api, type AssistantMessage, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { compact, SettingsManager, type ExtensionAPI, type ModelRegistry } from "@earendil-works/pi-coding-agent";
-import type { FallbackConfiguration } from "./fallback-settings.js";
+import type { SummaryModel } from "./fallback-settings.js";
 
 const REQUEST_TIMEOUT_MS = 300_000;
 
@@ -11,7 +11,7 @@ interface FallbackModel {
 }
 
 export interface FallbackCompactionRequest {
-  readonly configuration: FallbackConfiguration | undefined;
+  readonly summaryModel: SummaryModel | undefined;
   readonly modelRegistry: ModelRegistry;
   readonly preparation: Parameters<typeof compact>[0];
   readonly settings: ReturnType<ExtensionAPI["getSettings"]>;
@@ -22,22 +22,22 @@ export interface FallbackCompactionRequest {
   readonly onPrepared: (selection: FallbackModel) => void;
 }
 
-function selectFallback(fallback: FallbackConfiguration | undefined, registry: ModelRegistry): FallbackModel | undefined {
-  if (!fallback?.enabled || fallback.model === undefined) return undefined;
-  const model = registry.find(fallback.provider, fallback.model);
-  if (!model) throw new Error(`fallback.model must name a configured model: ${fallback.provider}/${fallback.model}`);
+function selectFallback(summary: SummaryModel | undefined, registry: ModelRegistry): FallbackModel | undefined {
+  if (!summary) return undefined;
+  const model = registry.find(summary.provider, summary.model);
+  if (!model) throw new Error(`summaryModel.model must name a configured model: ${summary.provider}/${summary.model}`);
   const supportedLevels = getSupportedThinkingLevels(model);
-  const thinkingLevel = supportedLevels.find((level) => level === fallback.thinkingLevel);
+  const thinkingLevel = supportedLevels.find((level) => level === summary.thinkingLevel);
   if (thinkingLevel === undefined) {
-    throw new Error(`fallback.thinkingLevel must be supported by ${model.provider}/${model.id}: ${supportedLevels.join(", ")}`);
+    throw new Error(`summaryModel.thinkingLevel must be supported by ${model.provider}/${model.id}: ${supportedLevels.join(", ")}`);
   }
   return { model, thinkingLevel };
 }
 
-/** Return undefined when fallback is disabled or unconfigured. Failures must stop native compaction on the chat model. */
+/** Return undefined when no summary model is configured. Failures must stop native compaction on the chat model. */
 export async function requestFallbackCompaction(request: FallbackCompactionRequest) {
   request.signal.throwIfAborted();
-  const selection = selectFallback(request.configuration, request.modelRegistry);
+  const selection = selectFallback(request.summaryModel, request.modelRegistry);
   request.signal.throwIfAborted();
   if (!selection) return undefined;
   request.onPrepared(selection);

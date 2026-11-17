@@ -4,6 +4,7 @@ import type { Api, Context, Model, ProviderHeaders, ThinkingBudgets, Usage } fro
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, type ProviderIdentity } from "./capability.js";
 import { trimToolOutputsToContextWindow } from "./context-window.js";
+import { applyCodexEffortUpdates } from "./effort-updates.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
 import { CodexCompactionProtocolError, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
@@ -149,7 +150,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
               }
               // Re-authenticate each attempt, but never let a new serialization change the compacted input.
               request.onPrepared?.();
-              return structuredClone(preparedPayload);
+              return applyCodexEffortUpdates(structuredClone(preparedPayload));
             }
             if (!isObject(payload)) throw new CodexCompactionProtocolError("Prepared compaction payload must be an object");
             const applied = applyProviderRequest(payload, resolved, request.providerRequest,
@@ -173,7 +174,8 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
             images = estimates;
             preparedPayload = structuredClone(prepared);
             request.onPrepared?.();
-            return prepared;
+            // V2 bypasses Pi's request hooks; send the same sparse effort history ordinary requests send.
+            return applyCodexEffortUpdates(prepared);
           } catch (error) {
             attempt.blockRetry(error);
             throw error;

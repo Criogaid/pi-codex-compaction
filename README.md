@@ -36,8 +36,8 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 | 情况 | 压缩方式 | 使用的模型 |
 | --- | --- | --- |
 | V2 开启，模型支持 V2，请求成功 | V2 远程压缩 | 当前对话模型 |
-| V2 请求失败 | Pi 原生压缩 | 独立摘要模型，未启用时为当前对话模型 |
-| 模型不支持 V2，或 V2 已关闭 | Pi 原生压缩 | 独立摘要模型，未启用时为当前对话模型 |
+| V2 请求失败 | Pi 原生压缩 | 摘要模型，未指定时为当前对话模型 |
+| 模型不支持 V2，或 V2 已关闭 | Pi 原生压缩 | 摘要模型，未指定时为当前对话模型 |
 
 压缩完成后继续原来的对话，当前对话模型和思考等级保持不变。V2 失败、改用独立摘要模型时，Pi 会显示提示及实际使用的模型。
 
@@ -51,13 +51,21 @@ V2 对一次完整的 SSE 请求及其响应收集进行有限重试，覆盖可
 
 无效压缩结果、重复输出、权限或额度等永久错误、取消操作，以及无法确认属于暂时故障的错误，不会重试。服务端要求等待的时间超过允许上限时也会停止重试。重试耗尽后按上表转为 Pi 文字摘要。HTTP 重定向沿用 provider 和 fetch 的处理方式。
 
+## 思考等级改写
+
+Pi 1.3 起，对支持中途调整思考等级的 `openai-responses` 模型，Pi 会在每条助手输出前和每次请求末尾各写入一个 `configuration_update`。扩展按 Codex 的稀疏规则改写普通请求和 V2 压缩请求：上下文窗口内只在第一轮和思考等级实际变化时保留更新，压缩后的第一轮不写更新，请求级 `reasoning.effort` 使用窗口基线，V2 请求末尾不追加更新。
+
+- 改写在检查点重放之后执行，每一项是否保留只取决于它前面的内容，同一段历史在后续请求中序列化结果不变，不破坏提示词缓存。
+- Pi 没有发送 `configuration_update` 时，请求原样发送。
+- 在本扩展之后加载的扩展，其 `before_provider_request` 看到的是改写后的请求。
+- 本功能原先由 `@criogaid/pi-codex-reasoning-effort` 提供，现已内置，无需另装；同时安装时不会重复改写。
+
 ## 独立摘要模型
 
 假设你平时用 `gpt-6-astra` 聊天，希望退回原生压缩时改用 `gpt-6.1-sol` 生成摘要：
 
 1. 执行 `/codex-compaction` 打开设置菜单。
-2. 在 `Summary model and thinking level` 中选择 `gpt-6.1-sol` 及其思考等级。
-3. 打开 `Use separate summary model`。
+2. 在 `Summary model` 中选择 `gpt-6.1-sol` 及其思考等级。
 
 之后的压缩过程如下：
 
@@ -70,7 +78,7 @@ V2 对一次完整的 SSE 请求及其响应收集进行有限重试，覆盖可
 独立摘要模型的登录凭据沿用 Pi 的配置。选择虚拟模型时，Pi 按它的配置路由到实际发送请求的模型。
 
 > [!IMPORTANT]
-> 已启用的独立摘要模型不可用或请求失败时，本次压缩会停止，不会悄悄改用当前对话模型。摘要为空、生成被中断或因长度限制被截断时，也会停止压缩。
+> 已指定的摘要模型不可用或请求失败时，本次压缩会停止，不会悄悄改用当前对话模型。摘要为空、生成被中断或因长度限制被截断时，也会停止压缩。
 
 ## 配置
 
@@ -81,12 +89,11 @@ V2 对一次完整的 SSE 请求及其响应收集进行有限重试，覆盖可
 | 设置 | 默认 | 用途 |
 | --- | --- | --- |
 | `Remote Compaction V2` | On | 是否优先尝试 V2 远程压缩 |
-| `Use separate summary model` | Off | 退回原生压缩时是否使用独立摘要模型 |
-| `Summary model and thinking level` | 未选择 | 独立摘要模型及其思考等级 |
+| `Summary model` | `Chat model` | 生成文字摘要的模型及其思考等级；`Chat model` 表示使用当前对话模型 |
 
 - 终端菜单中按回车或空格切换开关，修改立即保存，光标停留在原来的行。选中一项时，列表下方会说明它的用途及与其他设置的关系。
 - 模型可以按服务商（Provider）、ID 或名称搜索；取消选择不会保存。
-- 关闭 `Use separate summary model` 会保留已选模型，之后重新打开即可使用。
+- 在模型列表顶部选择 `Use the chat model` 可取消摘要模型，恢复使用当前对话模型。
 - 通过 RPC 使用 Pi 的客户端会在选择框标题中看到何时使用文字摘要以及当前选用的模型，每次操作后退出菜单。
 
 ### 配置文件
@@ -95,12 +102,11 @@ V2 对一次完整的 SSE 请求及其响应收集进行有限重试，覆盖可
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "remoteCompaction": {
     "enabled": true
   },
-  "fallback": {
-    "enabled": true,
+  "summaryModel": {
     "provider": "openai-codex",
     "model": "gpt-6.1-sol",
     "thinkingLevel": "high"
@@ -111,10 +117,11 @@ V2 对一次完整的 SSE 请求及其响应收集进行有限重试，覆盖可
 | 字段 | 对应菜单项 | 说明 |
 | --- | --- | --- |
 | `remoteCompaction.enabled` | `Remote Compaction V2` | 省略 `remoteCompaction` 时默认开启 |
-| `fallback.enabled` | `Use separate summary model` | 旧配置省略此字段时按开启处理 |
-| `fallback.provider`、`fallback.model`、`fallback.thinkingLevel` | `Summary model and thinking level` | 使用 Pi 中的实际 ID 和该模型支持的思考等级；三项须同时提供或同时省略 |
+| `summaryModel.provider`、`summaryModel.model`、`summaryModel.thinkingLevel` | `Summary model` | 使用 Pi 中的实际 ID 和该模型支持的思考等级；三项须同时提供 |
 
-省略整个 `fallback` 表示未指定独立摘要模型。配置文件不保存 API key，模型和认证须先在 Pi 中配置好。
+省略整个 `summaryModel` 表示使用当前对话模型生成文字摘要。V2 开关与摘要模型互不影响。
+
+仍可读取 `"version": 1` 的旧配置：`fallback.enabled` 为 `true`（或省略）且填写了模型时按摘要模型处理，其余情况按未指定处理；下次通过菜单保存时改写为版本 2，已关闭的旧模型选择不会保留。配置文件不保存 API key，模型和认证须先在 Pi 中配置好。
 
 <details>
 <summary><strong>读取时机与校验规则</strong></summary>
@@ -122,8 +129,8 @@ V2 对一次完整的 SSE 请求及其响应收集进行有限重试，覆盖可
 - 配置文件须为 UTF-8 JSON，大小不超过 16 KiB。
 - 每次压缩开始时读取一次配置，压缩途中的修改在下次生效。
 - 文件无法读取、JSON 格式错误或 V2 设置无效时，停止压缩。
-- `fallback` 部分只在需要原生压缩时校验，因此它填错不会影响成功的 V2 压缩。
-- `fallback` 无效时菜单显示 `Invalid`。你仍可切换 V2，已填写的内容会原样保留；重新选择模型即可修复，之后需要打开 `Use separate summary model` 才会使用它。
+- `summaryModel` 只在需要原生压缩时校验，因此它填错不会影响成功的 V2 压缩。
+- `summaryModel` 无效时菜单显示 `Invalid`。你仍可切换 V2，已填写的内容会原样保留；重新选择模型或 `Use the chat model` 即可修复。
 - 多个 Pi 进程保存同一个配置时会互斥；同一旧版本只能有一个修改成功，其他菜单须重新打开。直接编辑文件时仍会在保存前检查版本；外部编辑器不参与 Pi 的保存锁。
 
 </details>

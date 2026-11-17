@@ -30,6 +30,7 @@ import {
   projectCheckpointRequest,
   projectCheckpointTranscript,
 } from "./checkpoint.js";
+import { applyCodexEffortUpdates } from "./effort-updates.js";
 import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker, withoutInputImages } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
 import { requestFallbackCompaction } from "./fallback.js";
@@ -143,7 +144,7 @@ async function compactFallback(
   try {
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
     const result = await requestFallbackCompaction({
-      configuration: configuration.fallback,
+      summaryModel: configuration.summaryModel,
       modelRegistry: ctx.modelRegistry,
       preparation: event.preparation,
       settings: pi.getSettings(),
@@ -157,7 +158,7 @@ async function compactFallback(
         ctx.ui.setStatus(STATUS_KEY, "Pi fallback compaction...");
         if (ctx.hasUI) {
           if (remoteError !== undefined) {
-            ctx.ui.notify(`Codex remote compaction failed; using the configured fallback model. ${errorMessage(remoteError)}`, "warning");
+            ctx.ui.notify(`Codex remote compaction failed; using the configured summary model. ${errorMessage(remoteError)}`, "warning");
           }
           ctx.ui.notify(`Using Pi text compaction with ${model.provider}/${model.id} (${thinkingLevel}).`, "info");
         }
@@ -168,7 +169,7 @@ async function compactFallback(
     return result;
   } catch (error) {
     if (sessionStillOwned(ctx, sessionId, event.signal) && ctx.hasUI) {
-      ctx.ui.notify(`Configured fallback compaction failed; compaction stopped. ${errorMessage(error)}`, "error");
+      ctx.ui.notify(`Configured summary model failed; compaction stopped. ${errorMessage(error)}`, "error");
     }
     // Returning undefined would make Pi send the same context to the active chat model.
     return { cancel: true };
@@ -367,7 +368,9 @@ export function createCodexCompactionExtension(
         // Keep the wire marker in the snapshot; ordinary requests and V2 each replay it exactly once.
         () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx) }),
       );
-      return payload;
+      // Replay first: the rewrite recognizes a compacted window by the replayed compaction item.
+      const rewritten = applyCodexEffortUpdates(payload ?? event.payload);
+      return rewritten === event.payload ? undefined : rewritten;
     });
 
     pi.on("agent_settled", (_event, ctx) => {
