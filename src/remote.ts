@@ -168,6 +168,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
               input: trimToolOutputsToContextWindow(objectItems(history.input), history.instructions, preparedModel.contextWindow, estimates),
             }));
             if (prepared.model !== model.id) throw new CodexCompactionProtocolError("Provider payload used an unexpected model");
+            // The checkpoint keeps Pi's dense input: later requests replay against Pi's own payloads.
             const sent = objectItems(prepared.input).slice(0, -1);
             contextual = sent.map((item) => contextItems.has(item));
             sentInput = structuredClone(sent);
@@ -175,6 +176,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
             preparedPayload = structuredClone(prepared);
             request.onPrepared?.();
             // V2 bypasses Pi's request hooks; send the same sparse effort history ordinary requests send.
+            // Retries rewrite the dense copy again: rewriting an already sparse copy would drop real changes.
             return applyCodexEffortUpdates(prepared);
           } catch (error) {
             attempt.blockRetry(error);
