@@ -89,7 +89,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   }
 }
 
-test("Pi 1.3 mid-conversation effort simulation sends no adjacent updates in compacted wire input", async () => {
+test("Pi 1.3 effort simulation keeps dense checkpoint input and sends sparse identical V2 attempts", async () => {
   const provider = openaiProvider();
   const compat = { supportsLongCacheRetention: true, supportsMidConvoEffort: true };
   const model: Model<"openai-responses"> = {
@@ -142,27 +142,33 @@ test("Pi 1.3 mid-conversation effort simulation sends no adjacent updates in com
   assert.ok(snapshot?.prefix);
   const request = compactionRequest(tracker.current(), sessionId, target, current,
     { blockImages: false, systemPrompt: () => inputs.systemPrompt, tools: () => [] }, snapshot);
-  let sent: JsonObject | undefined;
+  const attempts: JsonObject[] = [];
   const result = await requestRemoteCompaction({
     modelRegistry: registry, model, context: request.context, providerRequest: snapshot,
-    reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000),
+    reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 1, maxRetryDelayMs: 1,
     fetch: async (input, init) => {
       const request = new Request(input, init);
       const bytes = Buffer.from(await request.arrayBuffer());
       const decoded = request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
       const payload: unknown = JSON.parse(decoded.toString("utf8"));
       assert.ok(isObject(payload));
-      sent = payload;
-      return response();
+      attempts.push(payload);
+      return attempts.length === 1
+        ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } })
+        : response();
     },
   });
-  assert.ok(sent && Array.isArray(sent.input) && sent.input.every(isObject));
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[1], attempts[0]);
+  const sent = attempts[0];
+  assert.ok(Array.isArray(sent.input) && sent.input.every(isObject));
   assert.deepEqual(sent.input.at(-1), { type: "compaction_trigger" });
   const wireInput = sent.input.slice(0, -1);
-  assert.deepEqual(JSON.parse(JSON.stringify(result.promptInput)), wireInput);
-  assert.equal(result.contextual.length, wireInput.length);
+  const denseInput = JSON.parse(JSON.stringify(result.promptInput));
+  assert.deepEqual(denseInput, [...wireInput, update]);
+  assert.equal(result.contextual.length, denseInput.length);
   assert.deepEqual(wireInput.slice(0, observed.input.length - 1), observed.input.slice(0, -1));
-  assert.equal(wireInput.filter((item) => item.type === "configuration_update").length, 2);
+  assert.equal(wireInput.filter((item) => item.type === "configuration_update").length, 1);
   assert.ok(wireInput.some((item) => item.role === "assistant"));
   for (let index = 1; index < wireInput.length; index++) {
     assert.ok(wireInput[index - 1].type !== "configuration_update" || wireInput[index].type !== "configuration_update");

@@ -1061,7 +1061,7 @@ const astraModel: Model<"openai-responses"> = { ...model, id: "astra", compat: u
 
 async function configureFallback(thinkingLevel = "high") {
   await writeFile(fallbackSettingsPath, JSON.stringify({
-    version: 1, fallback: { provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel },
+    version: 2, summaryModel: { provider: fallbackModel.provider, model: fallbackModel.id, thinkingLevel },
   }));
 }
 
@@ -1661,4 +1661,25 @@ test("an aborted signal during configured fallback discards the summary", async 
   assert.equal(fixture.calls.length, 1);
   assert.deepEqual(fixture.mock.appendedEntries, []);
   assert.deepEqual(fixture.notifications.filter((notice) => notice.level !== "info"), []);
+});
+
+test("model selection warns once per checkpoint for the same incompatible model", async () => {
+  const mock = mockPi();
+  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  const sessionManager = SessionManager.inMemory();
+  sessionManager.appendMessage({ role: "user", content: "older", timestamp: 0 });
+  const kept = sessionManager.appendMessage({ role: "user", content: "keep", timestamp: 1 });
+  const current = await context({ sessionManager });
+  const select = mock.events.get("model_select")?.[0];
+  assert.ok(select);
+  const warnings = () => current.notifications.filter((notice) => notice.level === "warning").length;
+  for (let checkpoint = 0; checkpoint < 2; checkpoint++) {
+    current.ctx.model = model;
+    await compactSession(mock, sessionManager, kept, current);
+    current.ctx.model = { ...model, baseUrl: "https://different.example/v1", compat: undefined };
+    await select({ type: "model_select", model: current.ctx.model, previousModel: model, source: "set" }, current.ctx);
+    assert.equal(warnings(), checkpoint + 1);
+    await select({ type: "model_select", model: current.ctx.model, previousModel: model, source: "set" }, current.ctx);
+    assert.equal(warnings(), checkpoint + 1);
+  }
 });

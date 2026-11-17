@@ -19,7 +19,7 @@ const model = process.argv[3];
 process.once("message", async () => {
   try {
     await settings.save({ remoteCompactionEnabled: false,
-      fallback: { enabled: true, provider: "fixture", model, thinkingLevel: "off" } });
+      summaryModel: { provider: "fixture", model, thinkingLevel: "off" } });
     process.send({ ok: true, model });
   } catch (error) {
     process.send({ ok: false, model, error: error instanceof Error ? error.message : String(error) });
@@ -100,8 +100,8 @@ for (const existing of [true, false]) {
     assert.equal(conflicted.length, 1, JSON.stringify(results));
     assert.match(conflicted[0].error ?? "", /changed while the menu was open/);
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-      version: 1, remoteCompaction: { enabled: false },
-      fallback: { enabled: true, provider: "fixture", model: saved[0].model, thinkingLevel: "off" },
+      version: 2, remoteCompaction: { enabled: false },
+      summaryModel: { provider: "fixture", model: saved[0].model, thinkingLevel: "off" },
     });
     if (process.platform !== "win32") assert.equal((await stat(settingsPath)).mode & 0o777, originalMode);
     assert.deepEqual(await readdir(settingsDirectory), ["config.json"]);

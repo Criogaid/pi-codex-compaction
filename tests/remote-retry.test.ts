@@ -275,6 +275,26 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     });
   }
 
+  for (const code of [undefined, null, "server_error"] as const) {
+    test(`${api}: retries a server_error type with code=${String(code)}`, async () => {
+      const f = await fixture(api);
+      await requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies((attempt) => attempt === 1
+        ? new Response(JSON.stringify({ error: { type: "server_error", code } }), {
+          status: 503, headers: { "content-type": "application/json", "retry-after-ms": "1" },
+        }) : success()) });
+      f.assertAttempts(2);
+    });
+  }
+
+  test(`${api}: a permanent string code overrides a transient error type`, async () => {
+    const f = await fixture(api);
+    await assert.rejects(requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(() =>
+      new Response(JSON.stringify({ error: { type: "server_error", code: "insufficient_quota" } }), {
+        status: 503, headers: { "content-type": "application/json", "retry-after-ms": "1" },
+      })) }), Error);
+    f.assertAttempts(1);
+  });
+
   test(`${api}: never retries HTTP authentication errors`, async () => {
     const f = await fixture(api);
     await assert.rejects(requestRemoteCompaction({ ...f.request,

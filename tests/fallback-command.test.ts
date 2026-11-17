@@ -17,12 +17,12 @@ const model: Model<"openai-responses"> = {
   baseUrl: "https://example.test/v1", reasoning: true, input: ["text"],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 10_000,
 };
-const currentSettings = '\uFEFF{\r\n  "version": 1,\r\n  "fallback": {"provider":"cheap","model":"cheap/model","thinkingLevel":"low"}\r\n}\r\n';
+const currentSettings = '\uFEFF{\r\n  "version": 2,\r\n  "summaryModel": {"provider":"cheap","model":"cheap/model","thinkingLevel":"low"}\r\n}\r\n';
 type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
 type Choice = string | undefined | ((options: readonly string[]) => Promise<string | undefined>);
 const firstChoice: Choice = async (options) => options[0];
-const switchChoice: Choice = async (options) => options[1];
-const modelChoice: Choice = async (options) => options[2];
+const modelChoice: Choice = async (options) => options[1];
+const availableModelChoice: Choice = async (options) => options[1];
 
 beforeEach(() => rm(settingsDirectory, { recursive: true, force: true }));
 
@@ -68,11 +68,15 @@ async function fixture(choices: readonly Choice[], availableModel: Model<"openai
 }
 
 test("the command saves an available model and its supported thinking level without changing the chat model", async () => {
-  const current = await fixture([modelChoice, firstChoice, "high"]);
+  const current = await fixture([modelChoice, availableModelChoice, "high"]);
   const chatModel = current.ctx.model;
   await current.run();
+  assert.equal(current.dialogs[0].options.length, 2);
+  assert.match(current.dialogs[0].options[0], /Remote Compaction V2.*On/);
+  assert.match(current.dialogs[0].options[1], /Summary model.*Chat model/);
+  assert.equal(current.dialogs[1].options[0], "Use the chat model");
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 2, remoteCompaction: { enabled: true }, summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
   assert.equal(current.ctx.model, chatModel);
   assert.equal(current.ctx.thinkingLevel, "off");
@@ -83,7 +87,7 @@ test("the command saves an available model and its supported thinking level with
 for (const stage of ["action", "model", "thinking"] as const) {
   test(`cancelling the ${stage} selector preserves existing settings byte for byte`, async () => {
     await writeSettings();
-    const choices = stage === "action" ? [undefined] : stage === "model" ? [modelChoice, undefined] : [modelChoice, firstChoice, undefined];
+    const choices = stage === "action" ? [undefined] : stage === "model" ? [modelChoice, undefined] : [modelChoice, availableModelChoice, undefined];
     const current = await fixture(choices);
     await current.run();
     assert.equal(await readFile(settingsPath, "utf8"), currentSettings);
@@ -92,48 +96,45 @@ for (const stage of ["action", "model", "thinking"] as const) {
 }
 
 test("cancelling an unconfigured command creates no configuration file", async () => {
-  const current = await fixture([modelChoice, firstChoice, undefined]);
+  const current = await fixture([modelChoice, availableModelChoice, undefined]);
   await current.run();
   await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
 });
 
-test("fallback can be switched off and back on without losing the saved model or thinking level", async () => {
+test("choosing the chat model clears the summary model without changing V2", async () => {
   await writeSettings();
-  const disabled = await fixture([switchChoice]);
-  await disabled.run();
-  assert.equal(disabled.dialogs.length, 1);
-  const selection = { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "low" };
-  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, remoteCompaction: { enabled: true }, fallback: selection });
-
-
-  const enabled = await fixture([switchChoice]);
-  await enabled.run();
-  assert.equal(enabled.dialogs.length, 1);
-  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, remoteCompaction: { enabled: true }, fallback: { ...selection, enabled: true } });
-});
-
-test("enabling without a model saves only the switch and remains inactive", async () => {
-  const current = await fixture([switchChoice]);
-  await current.run();
-  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), { version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true } });
-  assert.equal(current.dialogs.length, 1);
-});
-
-test("configuring a model after enabling the switch preserves the on state", async () => {
-  await writeSettings(JSON.stringify({ version: 1, fallback: { enabled: true } }));
-  const current = await fixture([modelChoice, firstChoice, "high"]);
+  const current = await fixture([modelChoice, firstChoice]);
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 2, remoteCompaction: { enabled: true },
+  });
+  assert.equal(current.dialogs.length, 2);
+});
+
+test("choosing the chat model without prior settings saves no separate summary model", async () => {
+  const current = await fixture([modelChoice, firstChoice]);
+  await current.run();
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 2, remoteCompaction: { enabled: true },
+  });
+  assert.equal(current.dialogs.length, 2);
+});
+
+test("configuring a summary model migrates an enabled model-less v1 configuration", async () => {
+  await writeSettings(JSON.stringify({ version: 1, fallback: { enabled: true } }));
+  const current = await fixture([modelChoice, availableModelChoice, "high"]);
+  await current.run();
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 2, remoteCompaction: { enabled: true }, summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
 });
 
-test("changing the model or thinking level while disabled preserves the off state", async () => {
+test("choosing a summary model replaces a disabled legacy selection", async () => {
   await writeSettings(JSON.stringify({ version: 1, fallback: { enabled: false, provider: "removed", model: "old", thinkingLevel: "low" } }));
-  const current = await fixture([modelChoice, firstChoice, "high"]);
+  const current = await fixture([modelChoice, availableModelChoice, "high"]);
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 2, remoteCompaction: { enabled: true }, summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
 });
 
@@ -146,14 +147,14 @@ test("a settings action outside the offered choices cannot be saved", async () =
 });
 
 test("only off is offered for a model without reasoning", async () => {
-  const current = await fixture([modelChoice, firstChoice, firstChoice], { ...model, reasoning: false });
+  const current = await fixture([modelChoice, availableModelChoice, firstChoice], { ...model, reasoning: false });
   await current.run();
   assert.deepEqual(current.dialogs[2].options, ["off"]);
-  assert.equal(JSON.parse(await readFile(settingsPath, "utf8")).fallback.thinkingLevel, "off");
+  assert.equal(JSON.parse(await readFile(settingsPath, "utf8")).summaryModel.thinkingLevel, "off");
 });
 
 test("a thinking level outside the offered choices cannot be saved", async () => {
-  const current = await fixture([modelChoice, firstChoice, "high"], { ...model, reasoning: false });
+  const current = await fixture([modelChoice, availableModelChoice, "high"], { ...model, reasoning: false });
   await current.run();
   await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
   assert.equal(current.notices[0].level, "error");
@@ -167,16 +168,16 @@ test("a model outside the offered choices cannot be saved", async () => {
 });
 
 test("an unavailable saved model can be replaced without being used for authentication or completion", async () => {
-  await writeSettings(JSON.stringify({ version: 1, fallback: { provider: "removed", model: "old", thinkingLevel: "high" } }));
-  const current = await fixture([modelChoice, firstChoice, "off"]);
+  await writeSettings(JSON.stringify({ version: 2, summaryModel: { provider: "removed", model: "old", thinkingLevel: "high" } }));
+  const current = await fixture([modelChoice, availableModelChoice, "off"]);
   await current.run();
-  assert.equal(JSON.parse(await readFile(settingsPath, "utf8")).fallback.provider, model.provider);
+  assert.equal(JSON.parse(await readFile(settingsPath, "utf8")).summaryModel.provider, model.provider);
 });
 
 test("external edits made during the menu are preserved and reported as a conflict", async () => {
   await writeSettings();
-  const replacement = JSON.stringify({ version: 1, fallback: { provider: "other", model: "changed", thinkingLevel: "off" } });
-  const current = await fixture([modelChoice, firstChoice, async () => {
+  const replacement = JSON.stringify({ version: 2, summaryModel: { provider: "other", model: "changed", thinkingLevel: "off" } });
+  const current = await fixture([modelChoice, availableModelChoice, async () => {
     await writeFile(settingsPath, replacement);
     return "high";
   }]);
@@ -188,7 +189,7 @@ test("external edits made during the menu are preserved and reported as a confli
 });
 
 test("a newly created configuration is not overwritten by an older unconfigured menu", async () => {
-  const current = await fixture([modelChoice, firstChoice, async () => {
+  const current = await fixture([modelChoice, availableModelChoice, async () => {
     await writeSettings();
     return "high";
   }]);
@@ -200,7 +201,7 @@ test("a newly created configuration is not overwritten by an older unconfigured 
 test("malformed configuration is not overwritten or echoed to the UI", async () => {
   const secret = "private-invalid-configuration";
   await writeSettings(secret);
-  const current = await fixture([modelChoice, firstChoice, "high"]);
+  const current = await fixture([modelChoice, availableModelChoice, "high"]);
   await current.run();
   assert.equal(await readFile(settingsPath, "utf8"), secret);
   assert.deepEqual(current.dialogs, []);
@@ -237,7 +238,7 @@ test("an atomic settings update does not replace a symbolic link", async (t) => 
     }
     throw error;
   }
-  const current = await fixture([modelChoice, firstChoice, "high"]);
+  const current = await fixture([modelChoice, availableModelChoice, "high"]);
   await current.run();
   assert.equal(await readFile(target, "utf8"), currentSettings);
   assert.equal(current.notices[0].level, "error");
@@ -272,30 +273,30 @@ function driveTui(current: Awaited<ReturnType<typeof fixture>>, screens: readonl
   };
 }
 
-test("TUI Enter toggles twice on the same settings row without a secondary screen", async () => {
+test("TUI keeps the summary row selected after choosing a model and then the chat model", async () => {
   await writeSettings();
-  const current = await fixture([]);
-  driveTui(current, [["\u001b[B", "\r"], ["\r"], ["\u001b"]]);
+  const current = await fixture(["high"]);
+  driveTui(current, [["\u001b[B", "\r"], ["\u001b[B", "\r"], ["\r"], ["\r"], ["\u001b"]]);
   await current.run();
   assert.equal(current.notices.length, 2);
-  assert.equal(current.dialogs.length, 0);
+  assert.equal(current.dialogs.length, 1);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+    version: 2, remoteCompaction: { enabled: true },
   });
 });
 
-test("TUI fuzzy search filters models by name while keeping the switch off", async () => {
+test("TUI fuzzy search filters summary models by name", async () => {
   const current = await fixture(["high"], model, true, [{ ...model, id: "aaa-unrelated", name: "Unrelated" }]);
-  driveTui(current, [["\u001b[B", "\u001b[B", "\r"], ["CheapModel", "\r"], ["\u001b"]]);
+  driveTui(current, [["\u001b[B", "\r"], ["CheapModel", "\u001b[B", "\r"], ["\u001b"]]);
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 2, remoteCompaction: { enabled: true }, summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
 });
 
-test("TUI an unmatched search cannot select a model and Escape leaves settings unchanged", async () => {
+test("TUI cancelling an unmatched search leaves settings unchanged", async () => {
   const current = await fixture([]);
-  driveTui(current, [["\u001b[B", "\u001b[B", "\r"], ["no-such-model", "\r", "\u001b"], ["\u001b"]]);
+  driveTui(current, [["\u001b[B", "\r"], ["no-such-model", "\u001b"], ["\u001b"]]);
   await current.run();
   await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
   assert.deepEqual(current.notices, []);
@@ -305,25 +306,25 @@ test("RPC model search filters the offered choices", async () => {
   const current = await fixture([modelChoice, undefined]);
   current.ctx.ui.input = async () => "no-such-model";
   await current.run();
-  assert.deepEqual(current.dialogs[1].options, []);
+  assert.deepEqual(current.dialogs[1].options, ["Use the chat model"]);
   await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
 });
 
-test("RPC V2 toggle saves the switch and preserves the fallback selection", async () => {
+test("RPC V2 toggle saves the switch and preserves the summary model", async () => {
   await writeSettings();
   const current = await fixture([firstChoice]);
   await current.run();
   assert.equal(current.dialogs.length, 1);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: false },
-    fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+    version: 2, remoteCompaction: { enabled: false },
+    summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "low" },
   });
 
   const enabled = await fixture([firstChoice]);
   await enabled.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: true },
-    fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+    version: 2, remoteCompaction: { enabled: true },
+    summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "low" },
   });
 });
 
@@ -337,32 +338,32 @@ test("TUI V2 Enter toggles twice on the same row without opening a secondary scr
 
   assert.equal(current.dialogs.length, 0);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: true }, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+    version: 2, remoteCompaction: { enabled: true }, summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "low" },
   });
 });
 
-test("changing the fallback model preserves the V2 off switch", async () => {
-  await writeSettings(JSON.stringify({ version: 1, remoteCompaction: { enabled: false }, fallback: { enabled: true } }));
-  const current = await fixture([modelChoice, firstChoice, "high"]);
+test("changing the summary model preserves the V2 off switch", async () => {
+  await writeSettings(JSON.stringify({ version: 2, remoteCompaction: { enabled: false } }));
+  const current = await fixture([modelChoice, availableModelChoice, "high"]);
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: false },
-    fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "high" },
+    version: 2, remoteCompaction: { enabled: false },
+    summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "high" },
   });
 });
 
-test("changing the fallback switch preserves the V2 off switch", async () => {
-  await writeSettings(JSON.stringify({ version: 1, remoteCompaction: { enabled: false } }));
-  const current = await fixture([switchChoice]);
+test("choosing the chat model preserves the V2 off switch", async () => {
+  await writeSettings(JSON.stringify({ version: 2, remoteCompaction: { enabled: false }, summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "low" } }));
+  const current = await fixture([modelChoice, firstChoice]);
   await current.run();
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 1, remoteCompaction: { enabled: false }, fallback: { enabled: true },
+    version: 2, remoteCompaction: { enabled: false },
   });
 });
 
 test("V2 switch saves reject intervening edits without replacing the new settings", async () => {
   await writeSettings();
-  const edited = JSON.stringify({ version: 1, remoteCompaction: { enabled: false }, fallback: { enabled: false } });
+  const edited = JSON.stringify({ version: 2, remoteCompaction: { enabled: false }, summaryModel: { provider: "edited", model: "new-model", thinkingLevel: "off" } });
   const current = await fixture([async (options) => {
     await writeFile(settingsPath, edited);
     return options[0];
@@ -375,9 +376,9 @@ test("V2 switch saves reject intervening edits without replacing the new setting
 });
 
 test("an invalid V2 switch prevents menu edits without exposing file contents", async () => {
-  const invalid = JSON.stringify({ version: 1, remoteCompaction: { enabled: "private-file-value" } });
+  const invalid = JSON.stringify({ version: 2, remoteCompaction: { enabled: "private-file-value" } });
   await writeSettings(invalid);
-  const current = await fixture([switchChoice]);
+  const current = await fixture([modelChoice]);
   await current.run();
   assert.equal(await readFile(settingsPath, "utf8"), invalid);
   assert.equal(current.dialogs.length, 0);
@@ -385,72 +386,76 @@ test("an invalid V2 switch prevents menu edits without exposing file contents", 
   assert.doesNotMatch(current.notices[0].message, /private-file-value/);
 });
 
-const invalidFallback = { enabled: true, provider: "x" };
-const invalidFallbackSettings = `\uFEFF{\r\n  "version": 1,\r\n  "fallback": ${JSON.stringify(invalidFallback)}\r\n}\r\n`;
-test("RPC opens an invalid fallback menu and leaves cancellation unchanged", async () => {
-  await writeSettings(invalidFallbackSettings);
+const invalidSummary = { provider: "x" };
+const invalidSummarySettings = `\uFEFF{\r\n  "version": 2,\r\n  "summaryModel": ${JSON.stringify(invalidSummary)}\r\n}\r\n`;
+test("RPC opens an invalid summary-model menu and leaves cancellation unchanged", async () => {
+  await writeSettings(invalidSummarySettings);
   const current = await fixture([undefined]);
   await current.run();
   assert.equal(current.dialogs.length, 1);
+  assert.equal(current.dialogs[0].options.length, 2);
+  assert.match(current.dialogs[0].options[1], /Summary model.*Invalid/);
   assert.deepEqual(current.notices, []);
-  assert.equal(await readFile(settingsPath, "utf8"), invalidFallbackSettings);
+  assert.equal(await readFile(settingsPath, "utf8"), invalidSummarySettings);
 });
 
-test("TUI opens an invalid fallback menu and leaves cancellation unchanged", async () => {
-  await writeSettings(invalidFallbackSettings);
+test("TUI opens an invalid summary-model menu and leaves cancellation unchanged", async () => {
+  await writeSettings(invalidSummarySettings);
   const current = await fixture([]);
   driveTui(current, [["\u001b[B", "\u001b"]]);
   await current.run();
   assert.deepEqual(current.notices, []);
-  assert.equal(await readFile(settingsPath, "utf8"), invalidFallbackSettings);
+  assert.equal(await readFile(settingsPath, "utf8"), invalidSummarySettings);
 });
 
 for (const mode of ["rpc", "tui"] as const) {
   for (const enabled of [true, false]) {
-    test(`${mode} toggles V2 from ${enabled} while preserving the invalid fallback`, async () => {
-      await writeSettings(JSON.stringify({ version: 1, remoteCompaction: { enabled }, fallback: invalidFallback }));
+    test(`${mode} toggles V2 from ${enabled} while preserving the invalid summary model`, async () => {
+      await writeSettings(JSON.stringify({ version: 2, remoteCompaction: { enabled }, summaryModel: invalidSummary }));
       const current = await fixture(mode === "rpc" ? [firstChoice] : []);
       if (mode === "tui") driveTui(current, [["\r"], ["\u001b[B", "\u001b"]]);
       await current.run();
       assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-        version: 1, remoteCompaction: { enabled: !enabled }, fallback: invalidFallback,
+        version: 2, remoteCompaction: { enabled: !enabled }, summaryModel: invalidSummary,
       });
       assert.equal(current.notices.length, 1);
       assert.equal(current.notices[0].level, "info");
     });
   }
 
-  test(`${mode} rejects an invalid fallback switch without writing settings${mode === "tui" ? " and keeps the selected row open" : ""}`, async () => {
-    await writeSettings(invalidFallbackSettings);
-    const current = await fixture(mode === "rpc" ? [switchChoice] : []);
-    if (mode === "tui") driveTui(current, [["\u001b[B", "\r"], ["\r"], ["\u001b"]]);
-    await current.run();
-    assert.equal(await readFile(settingsPath, "utf8"), invalidFallbackSettings);
-    assert.deepEqual(await readdir(settingsDirectory), ["config.json"]);
-    assert.deepEqual(current.notices.map((notice) => notice.level), Array(mode === "tui" ? 2 : 1).fill("error"));
-  });
-
-  test(`${mode} replaces an invalid fallback with a disabled selected model`, async () => {
-    await writeSettings(JSON.stringify({ version: 1, remoteCompaction: { enabled: false }, fallback: invalidFallback }));
-    const current = await fixture(mode === "rpc" ? [modelChoice, firstChoice, "high"] : ["high"]);
-    if (mode === "tui") driveTui(current, [["\u001b[B", "\u001b[B", "\r"], ["CheapModel", "\r"], ["\u001b"]]);
+  test(`${mode} clears an invalid summary model and keeps the selected row open in TUI`, async () => {
+    await writeSettings(invalidSummarySettings);
+    const current = await fixture(mode === "rpc" ? [modelChoice, firstChoice] : []);
+    if (mode === "tui") driveTui(current, [["\u001b[B", "\r"], ["\r"], ["\r"], ["\u001b"], ["\u001b"]]);
     await current.run();
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-      version: 1, remoteCompaction: { enabled: false },
-      fallback: { enabled: false, provider: model.provider, model: model.id, thinkingLevel: "high" },
+      version: 2, remoteCompaction: { enabled: true },
+    });
+    assert.deepEqual(await readdir(settingsDirectory), ["config.json"]);
+    assert.deepEqual(current.notices.map((notice) => notice.level), ["info"]);
+  });
+
+  test(`${mode} replaces an invalid summary model while preserving V2 Off`, async () => {
+    await writeSettings(JSON.stringify({ version: 2, remoteCompaction: { enabled: false }, summaryModel: invalidSummary }));
+    const current = await fixture(mode === "rpc" ? [modelChoice, availableModelChoice, "high"] : ["high"]);
+    if (mode === "tui") driveTui(current, [["\u001b[B", "\r"], ["CheapModel", "\u001b[B", "\r"], ["\u001b"]]);
+    await current.run();
+    assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+      version: 2, remoteCompaction: { enabled: false },
+      summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "high" },
     });
     assert.equal(current.notices.length, 1);
     assert.equal(current.notices[0].level, "info");
   });
 
-  test(`${mode} toggling V2 writes a normalized valid legacy fallback with explicit enabled`, async () => {
-    await writeSettings();
+  test(`${mode} toggling V2 migrates a valid legacy fallback to the summary model`, async () => {
+    await writeSettings(JSON.stringify({ version: 1, fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" } }));
     const current = await fixture(mode === "rpc" ? [firstChoice] : []);
     if (mode === "tui") driveTui(current, [["\r"], ["\u001b"]]);
     await current.run();
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-      version: 1, remoteCompaction: { enabled: false },
-      fallback: { enabled: true, provider: model.provider, model: model.id, thinkingLevel: "low" },
+      version: 2, remoteCompaction: { enabled: false },
+      summaryModel: { provider: model.provider, model: model.id, thinkingLevel: "low" },
     });
     assert.equal(current.notices[0].level, "info");
   });
