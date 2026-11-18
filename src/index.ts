@@ -30,7 +30,6 @@ import {
   projectCheckpointRequest,
   projectCheckpointTranscript,
 } from "./checkpoint.js";
-import { applyCodexEffortUpdates } from "./effort-updates.js";
 import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker, withoutInputImages } from "./protocol.js";
 import { requestRemoteCompaction } from "./remote.js";
 import { requestFallbackCompaction } from "./fallback.js";
@@ -368,9 +367,7 @@ export function createCodexCompactionExtension(
         // Keep the wire marker in the snapshot; ordinary requests and V2 each replay it exactly once.
         () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx) }),
       );
-      // Replay first: the rewrite recognizes a compacted window by the replayed compaction item.
-      const rewritten = applyCodexEffortUpdates(payload ?? event.payload);
-      return rewritten === event.payload ? undefined : rewritten;
+      return payload;
     });
 
     pi.on("agent_settled", (_event, ctx) => {

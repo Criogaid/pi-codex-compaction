@@ -89,7 +89,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   }
 }
 
-test("Pi 1.3 effort simulation keeps dense checkpoint input and sends sparse identical V2 attempts", async () => {
+test("V2 preserves Pi effort updates in checkpoint input and across retries", async () => {
   const provider = openaiProvider();
   const compat = { supportsLongCacheRetention: true, supportsMidConvoEffort: true };
   const model: Model<"openai-responses"> = {
@@ -164,11 +164,10 @@ test("Pi 1.3 effort simulation keeps dense checkpoint input and sends sparse ide
   assert.ok(Array.isArray(sent.input) && sent.input.every(isObject));
   assert.deepEqual(sent.input.at(-1), { type: "compaction_trigger" });
   const wireInput = sent.input.slice(0, -1);
-  const denseInput = JSON.parse(JSON.stringify(result.promptInput));
-  assert.deepEqual(denseInput, [...wireInput, update]);
-  assert.equal(result.contextual.length, denseInput.length);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.promptInput)), wireInput);
+  assert.equal(result.contextual.length, wireInput.length);
   assert.deepEqual(wireInput.slice(0, observed.input.length - 1), observed.input.slice(0, -1));
-  assert.equal(wireInput.filter((item) => item.type === "configuration_update").length, 1);
+  assert.equal(wireInput.filter((item) => item.type === "configuration_update").length, 2);
   assert.ok(wireInput.some((item) => item.role === "assistant"));
   for (let index = 1; index < wireInput.length; index++) {
     assert.ok(wireInput[index - 1].type !== "configuration_update" || wireInput[index].type !== "configuration_update");
