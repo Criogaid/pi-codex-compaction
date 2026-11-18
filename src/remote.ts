@@ -14,6 +14,14 @@ const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 const REQUEST_TIMEOUT_MS = 300_000;
 const MISSING_PAYLOAD_MESSAGE = "Provider did not expose a request payload";
 
+/** Only an exhausted, explicitly transient request is eligible for layered recovery. */
+export class RemoteCompactionTransientError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "RemoteCompactionTransientError";
+  }
+}
+
 export interface RemoteCompactionRequest {
   modelRegistry: Pick<ModelRegistry, "streamSimple">;
   model: Model<Api>;
@@ -29,7 +37,13 @@ export interface RemoteCompactionRequest {
   signal: AbortSignal;
   /** Pi origins of the context's user messages, used to align provider user items with Pi roles. */
   userItemOrigins?: readonly UserItemOrigin[];
-  priorCheckpoint?: { identity: ProviderIdentity; marker: string; replacementHistory: readonly JsonObject[] };
+  priorCheckpoint?: {
+    identity: ProviderIdentity;
+    marker: string;
+    replacementHistory: readonly JsonObject[];
+    /** Injected text layers at and after this offset are absorbed by the new opaque item. */
+    contextualFrom?: number;
+  };
   providerRequest?: ProviderRequestSnapshot;
   onPrepared?: () => void;
   fetch?: typeof globalThis.fetch;
@@ -162,7 +176,17 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
             const payloadItems = objectItems(adapted.input);
             const contextItems = new Set(payloadItems.filter((_, index) => applied.contextual[index]));
             const estimates = await estimateImages([...payloadItems, ...checkpoint?.replacementHistory ?? []], request.signal);
-            const prepared = prepareRemoteCompactionPayload(adapted, checkpoint, (history) => ({
+            const trackedCheckpoint = checkpoint && {
+              ...checkpoint,
+              onReplay: (items: readonly unknown[]) => {
+                // Track injected object identities, never user-visible text equality.
+                if (checkpoint.contextualFrom === undefined) return;
+                for (const item of items.slice(checkpoint.contextualFrom)) {
+                  if (isObject(item)) contextItems.add(item);
+                }
+              },
+            };
+            const prepared = prepareRemoteCompactionPayload(adapted, trackedCheckpoint, (history) => ({
               ...history,
               input: trimToolOutputsToContextWindow(objectItems(history.input), history.instructions, preparedModel.contextWindow, estimates),
             }));
@@ -209,7 +233,8 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       request.signal.throwIfAborted();
       if (attempt.fatal) throw attempt.fatal.error;
       const evidence = attempt.retryEvidence();
-      if (!evidence || retry >= retries) throw error;
+      if (!evidence) throw error;
+      if (retry >= retries) throw new RemoteCompactionTransientError(error);
       await waitForCompactionRetry(evidence, retry, request.maxRetryDelayMs, request.signal);
     }
   }

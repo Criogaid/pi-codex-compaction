@@ -32,7 +32,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       test(`${api} falls back with an active checkpoint on ${reason}, separate fallback=${separateFallback}`, { timeout: 20_000 }, async () => {
         let failRemote = false;
         const fixture = await sessionFixture({
-          api, extensions: [createCodexCompactionExtension()],
+          api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
           respond: ({ payload }) => failRemote && hasItem(payload, "compaction_trigger")
             ? new Response("Temporary service outage", { status: 503 }) : undefined,
         });
@@ -45,6 +45,10 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
             ...(separateFallback ? { fallback: { enabled: true, provider: fixture.model.provider,
               model: fixture.model.id, thinkingLevel: "low" } } : {}),
           }));
+          if (reason === "remote failure") {
+            await fixture.session.prompt("New work to summarize after A. ".repeat(80));
+            await fixture.session.prompt("Keep this new tail after A. ".repeat(80));
+          }
           const requestCount = fixture.requests.length;
           failRemote = reason === "remote failure";
           await fixture.session.compact();
@@ -52,13 +56,17 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
           const summaries = attempted.filter(({ payload }) => !hasItem(payload, "compaction_trigger"));
           assert.ok(summaries.length > 0, "Native summaries remain available after an opaque checkpoint");
           assert.ok(summaries.every(({ payload }) => !hasItem(payload, "compaction")));
-          assert.equal(latestCheckpoint(fixture.session.sessionManager.getBranch()), undefined);
+          if (reason === "remote failure") {
+            assert.ok(latestCheckpoint(fixture.session.sessionManager.getBranch()), "Transient V2 failure preserves the opaque base");
+          } else {
+            assert.equal(latestCheckpoint(fixture.session.sessionManager.getBranch()), undefined);
+          }
           assert.equal(fixture.session.sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, 2);
           assert.deepEqual(checkpoint.entry.details, saved, "The persisted V2 entry remains unchanged");
 
           failRemote = false;
           await fixture.session.prompt("Continue after the text summary.");
-          assert.ok(!hasItem(fixture.requests.at(-1)!.payload, "compaction"));
+          assert.equal(hasItem(fixture.requests.at(-1)!.payload, "compaction"), reason === "remote failure");
           assert.deepEqual(fixture.errors, []);
         } finally {
           await fixture.close();

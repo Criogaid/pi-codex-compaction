@@ -12,6 +12,8 @@ interface FallbackModel {
 
 export interface FallbackCompactionRequest {
   readonly summaryModel: SummaryModel | undefined;
+  /** Used only when layered recovery must own the native chat-model fallback. */
+  readonly defaultModel?: FallbackModel;
   readonly modelRegistry: ModelRegistry;
   readonly preparation: Parameters<typeof compact>[0];
   readonly settings: ReturnType<ExtensionAPI["getSettings"]>;
@@ -34,10 +36,10 @@ function selectFallback(summary: SummaryModel | undefined, registry: ModelRegist
   return { model, thinkingLevel };
 }
 
-/** Return undefined when no summary model is configured. Failures must stop native compaction on the chat model. */
+/** Return undefined without a configured or default model. Failures must stop native compaction. */
 export async function requestFallbackCompaction(request: FallbackCompactionRequest) {
   request.signal.throwIfAborted();
-  const selection = selectFallback(request.summaryModel, request.modelRegistry);
+  const selection = selectFallback(request.summaryModel, request.modelRegistry) ?? request.defaultModel;
   request.signal.throwIfAborted();
   if (!selection) return undefined;
   request.onPrepared(selection);

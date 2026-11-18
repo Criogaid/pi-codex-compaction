@@ -21,17 +21,22 @@ import {
 } from "./capability.js";
 import {
   type CodexCheckpointDetails,
+  CHECKPOINT_KIND,
   checkpointMarker,
+  checkpointHistory,
   createCheckpointDetails,
+  createLayeredCheckpointDetails,
   fallbackSummary,
+  fingerprintMessage,
   keptMessages,
   latestCheckpoint,
   parseCheckpointDetails,
   projectCheckpointRequest,
   projectCheckpointTranscript,
+  prepareCheckpointLayer,
 } from "./checkpoint.js";
-import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker, withoutInputImages } from "./protocol.js";
-import { requestRemoteCompaction } from "./remote.js";
+import { hasCheckpointMarker, isObject, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker, withoutInputImages } from "./protocol.js";
+import { requestRemoteCompaction, RemoteCompactionTransientError } from "./remote.js";
 import { requestFallbackCompaction } from "./fallback.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH, loadCompactionSettings, type CompactionConfiguration } from "./fallback-settings.js";
 import { registerCompactionCommand } from "./fallback-command.js";
@@ -113,7 +118,7 @@ async function replayCheckpoint(payload: unknown, ctx: ExtensionContext, blockIm
   if (!await compatibleIdentity(checkpoint.details, ctx)) {
     throw new Error("The active opaque checkpoint no longer matches the resolved provider endpoint");
   }
-  const history = checkpoint.details.replacementHistory;
+  const history = checkpointHistory(checkpoint.details);
   return rewriteCheckpointMarker(payload, marker, blockImages ? withoutInputImages(history) : history);
 }
 
@@ -138,14 +143,30 @@ async function compactFallback(
   sessionId: string,
   configuration: CompactionConfiguration,
   remoteError: unknown,
+  layer?: {
+    prior: CodexCheckpointDetails;
+    selection: NonNullable<Parameters<typeof requestFallbackCompaction>[0]["defaultModel"]>;
+  },
 ) {
   let announced = false;
   try {
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+    const boundary = layer ? prepareCheckpointLayer(event.branchEntries, event.preparation.firstKeptEntryId, layer.prior) : undefined;
+    if (boundary && boundary.messages.length === 0) return { cancel: true };
+    const preparation = boundary ? {
+      ...event.preparation,
+      messagesToSummarize: boundary.messages,
+      turnPrefixMessages: [],
+      isSplitTurn: false,
+      previousSummary: layer?.prior.textSummary,
+      // Do not leak old file operations through Pi's appended file list.
+      fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+    } : event.preparation;
     const result = await requestFallbackCompaction({
       summaryModel: configuration.summaryModel,
+      defaultModel: layer?.selection,
       modelRegistry: ctx.modelRegistry,
-      preparation: event.preparation,
+      preparation,
       settings: pi.getSettings(),
       customInstructions: event.customInstructions,
       signal: event.signal,
@@ -164,6 +185,23 @@ async function compactFallback(
       },
     });
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+    if (layer && boundary) {
+      if (!result) throw new Error("Layered compaction did not produce a summary");
+      if (!await compatibleIdentity(layer.prior, ctx, layer.selection.model)) {
+        throw new Error("The opaque checkpoint backend changed during layered compaction");
+      }
+      if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+      // Revalidate the source and cut after the asynchronous summary request.
+      const current = prepareCheckpointLayer(ctx.sessionManager.getBranch(), preparation.firstKeptEntryId, layer.prior);
+      if (current.messages.length !== boundary.messages.length ||
+          current.messages.some((message, index) => fingerprintMessage(message) !== fingerprintMessage(boundary.messages[index])) ||
+          current.retained.length !== boundary.retained.length ||
+          current.retained.some((message, index) => fingerprintMessage(message) !== fingerprintMessage(boundary.retained[index]))) {
+        throw new Error("The layered compaction source changed");
+      }
+      const details = createLayeredCheckpointDetails(layer.prior, boundary, result.compaction.summary);
+      return { compaction: { ...result.compaction, summary: fallbackSummary(details.checkpointId), details } };
+    }
     if (!result && remoteError !== undefined) notifyFailure(ctx, remoteError);
     return result;
   } catch (error) {
@@ -202,14 +240,22 @@ async function compactRemotely(
   if (!configuration.remoteCompactionEnabled || !supported) return compactFallback(pi, event, ctx, sessionId, configuration, undefined);
   const reasoning = pi.getThinkingLevel();
   const settings = pi.getSettings();
+  const previousCompaction = [...event.branchEntries].reverse().find((entry) => entry.type === "compaction");
+  const hasPriorCheckpoint = previousCompaction?.type === "compaction" &&
+    isObject(previousCompaction.details) && previousCompaction.details.kind === CHECKPOINT_KIND;
+  let prior: CodexCheckpointDetails | undefined;
   let announced = false;
   ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction...");
   try {
     if (!owned()) return { cancel: true };
+    if (hasPriorCheckpoint && !latestCheckpoint(event.branchEntries)) {
+      throw new Error("The previous checkpoint format is invalid or unsupported");
+    }
     if (event.customInstructions?.trim() && ctx.hasUI) {
       ctx.ui.notify("Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", "warning");
     }
     const current = projectedCurrentMessages(event, supported.identity);
+    prior = current.prior;
     const inputs = providerRequestInputs(pi, ctx);
     const providerRequest = providerRequestFor(snapshots, sessionId, supported, current.messages, inputs);
     const request = compactionRequest(snapshots, sessionId, supported, current.messages, {
@@ -244,7 +290,8 @@ async function compactRemotely(
         ? {
             identity: current.prior,
             marker: checkpointMarker(current.prior.checkpointId),
-            replacementHistory: current.prior.replacementHistory,
+            replacementHistory: checkpointHistory(current.prior),
+            contextualFrom: current.prior.replacementHistory.length,
           }
         : undefined,
       fetch,
@@ -273,6 +320,20 @@ async function compactRemotely(
   } catch (error) {
     if (!owned()) {
       return { cancel: true };
+    }
+    if (hasPriorCheckpoint) {
+      try {
+        if (!prior || !(error instanceof RemoteCompactionTransientError) ||
+            !await compatibleIdentity(prior, ctx, supported.model)) {
+          throw new Error("The failed remote request is not eligible for safe layered recovery", { cause: error });
+        }
+        return await compactFallback(pi, event, ctx, sessionId, configuration, error, {
+          prior, selection: { model: supported.model, thinkingLevel: reasoning },
+        });
+      } catch (failure) {
+        if (owned() && ctx.hasUI) ctx.ui.notify(`Compaction stopped; previous history was preserved. ${errorMessage(failure)}`, "error");
+        return { cancel: true };
+      }
     }
     return await compactFallback(pi, event, ctx, sessionId, configuration, error);
   } finally {
@@ -321,7 +382,9 @@ export function createCodexCompactionExtension(
       const details = parseCheckpointDetails(event.compactionEntry.details);
       if (!details) return;
       pi.appendEntry<CompletionEntryData>(COMPLETION_ENTRY_TYPE, {
-        message: `Codex Remote Compaction V2 completed for ${details.provider}/${details.modelId}.`,
+        message: details.version === 2
+          ? `Layered text fallback completed for ${details.provider}/${details.modelId}.`
+          : `Codex Remote Compaction V2 completed for ${details.provider}/${details.modelId}.`,
         protocol: REMOTE_COMPACTION_PROTOCOL,
         checkpointId: details.checkpointId,
       });

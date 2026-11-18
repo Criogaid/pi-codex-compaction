@@ -115,7 +115,7 @@ function markerCount(item: unknown, marker: string): number {
 }
 
 // Later request hooks may tag or join user text around the private marker; replace only the marker itself.
-function replaceMarker(item: JsonObject, marker: string, replacementHistory: readonly unknown[]): unknown[] {
+function replaceMarker(item: JsonObject, marker: string, replacementHistory: readonly unknown[], onReplay?: (items: readonly unknown[]) => void): unknown[] {
   const content = item.content as unknown[];
   const index = content.findIndex((part) => isObject(part) && part.type === "input_text" &&
     typeof part.text === "string" && part.text.includes(marker));
@@ -124,9 +124,11 @@ function replaceMarker(item: JsonObject, marker: string, replacementHistory: rea
   const text = (value: string) => value.trim() ? [{ ...part, text: value }] : [];
   const before = [...content.slice(0, index), ...text(part.text.slice(0, at))];
   const after = [...text(part.text.slice(at + marker.length)), ...content.slice(index + 1)];
+  const replayed = structuredClone(replacementHistory);
+  onReplay?.(replayed);
   return [
     ...(before.length > 0 ? [{ ...item, content: before }] : []),
-    ...structuredClone(replacementHistory),
+    ...replayed,
     ...(after.length > 0 ? [{ ...item, content: after }] : []),
   ];
 }
@@ -135,6 +137,7 @@ export function rewriteCheckpointMarker(
   payload: unknown,
   marker: string,
   replacementHistory: readonly unknown[],
+  onReplay?: (items: readonly unknown[]) => void,
 ): JsonObject {
   if (!isObject(payload) || !Array.isArray(payload.input)) {
     throw new CodexCompactionProtocolError("Codex payload is missing an input array");
@@ -151,7 +154,7 @@ export function rewriteCheckpointMarker(
     ...payload,
     input: [
       ...payload.input.slice(0, index),
-      ...replaceMarker(payload.input[index] as JsonObject, marker, replacementHistory),
+      ...replaceMarker(payload.input[index] as JsonObject, marker, replacementHistory, onReplay),
       ...payload.input.slice(index + 1),
     ],
   };
@@ -170,11 +173,11 @@ export function appendCompactionTrigger(payload: unknown): JsonObject {
 /** Replay the checkpoint, let the caller adapt the history, then append the V2 trigger. */
 export function prepareRemoteCompactionPayload(
   payload: unknown,
-  checkpoint?: { marker: string; replacementHistory: readonly unknown[] },
+  checkpoint?: { marker: string; replacementHistory: readonly unknown[]; onReplay?: (items: readonly unknown[]) => void },
   adaptHistory?: (history: JsonObject) => JsonObject,
 ): JsonObject {
   const history = checkpoint
-    ? rewriteCheckpointMarker(payload, checkpoint.marker, checkpoint.replacementHistory)
+    ? rewriteCheckpointMarker(payload, checkpoint.marker, checkpoint.replacementHistory, checkpoint.onReplay)
     : payload;
   return appendCompactionTrigger(adaptHistory && isObject(history) ? adaptHistory(history) : history);
 }

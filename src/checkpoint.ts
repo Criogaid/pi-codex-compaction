@@ -5,6 +5,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, type Message } from "@earendil-works/pi-ai";
 import {
   buildSessionProjection,
+  buildSessionContext,
   sessionEntryToContextMessages,
   type CompactionEntry,
   type ProjectedSessionEntry,
@@ -20,15 +21,19 @@ export const CHECKPOINT_KIND = "pi-codex-compaction";
 export const CHECKPOINT_VERSION = 1;
 const EXTENSION_PACKAGE = "@criogaid/pi-codex-compaction";
 
-export interface CodexCheckpointDetails extends ProviderIdentity {
+interface CheckpointBase extends ProviderIdentity {
   kind: typeof CHECKPOINT_KIND;
-  version: typeof CHECKPOINT_VERSION;
   checkpointId: string;
   protocol: typeof REMOTE_COMPACTION_PROTOCOL;
   replacementHistory: JsonObject[];
   keptMessageFingerprints: string[];
   createdAt: string;
 }
+
+export type CodexCheckpointDetails = CheckpointBase & (
+  | { version: typeof CHECKPOINT_VERSION; textSummary?: never }
+  | { version: 2; textSummary: string }
+);
 
 function orderedValue(value: unknown, compareKeys: (left: string, right: string) => number): unknown {
   if (Array.isArray(value)) return value.map((item) => orderedValue(item, compareKeys));
@@ -95,7 +100,7 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
   if (!isObject(value)) return undefined;
   if (
     value.kind !== CHECKPOINT_KIND ||
-    value.version !== CHECKPOINT_VERSION ||
+    (value.version !== CHECKPOINT_VERSION && value.version !== 2) ||
     typeof value.checkpointId !== "string" ||
     value.checkpointId.length < 8 ||
     typeof value.provider !== "string" ||
@@ -113,6 +118,9 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
   ) {
     return undefined;
   }
+  if (value.version === 2) {
+    if (typeof value.textSummary !== "string" || !value.textSummary.trim()) return undefined;
+  } else if (value.textSummary !== undefined) return undefined;
   try {
     if (
       normalizeUrl(value.baseUrl) !== value.baseUrl ||
@@ -174,6 +182,7 @@ function normalizeLegacyFingerprints(
   entry: CompactionEntry,
   details: CodexCheckpointDetails,
 ): CodexCheckpointDetails {
+  if (details.version === 2) return details;
   // Validate at the checkpoint's parent, never against later context edits.
   const retained = retainedEntries(entries, entry.parentId, entry.firstKeptEntryId);
   if (!retained) return details;
@@ -224,7 +233,45 @@ function checkpointRange(
       return undefined;
     }
   }
-  return { start, end };
+  // A text layer summarizes only the dropped suffix; its retained tail still travels as Pi messages.
+  return { start, end: details.version === 2 ? start + 1 : end };
+}
+
+/** Expand the opaque base and each text layer exactly once at the private marker. */
+export function checkpointHistory(details: CodexCheckpointDetails): JsonObject[] {
+  return details.version === 2 ? [...details.replacementHistory, {
+    type: "message", role: "user", content: [{ type: "input_text", text: details.textSummary }],
+  }] : details.replacementHistory;
+}
+
+/** Validate the old coverage and the new cut against the same canonical projection. */
+export function prepareCheckpointLayer(entries: readonly SessionEntry[], firstKeptEntryId: string, details: CodexCheckpointDetails) {
+  const messages = withoutSystemMessages(buildSessionContext([...entries], entries.at(-1)?.id ?? null).messages);
+  const range = checkpointRange(messages, details);
+  if (!range) throw new Error("The previous opaque checkpoint could not be projected safely");
+  const retained = keptMessages(entries, firstKeptEntryId);
+  const cut = messages.length - retained.length;
+  if (cut <= range.start || !retained.every((message, index) =>
+    fingerprintMessage(message) === fingerprintMessage(messages[cut + index]))) {
+    throw new Error("The text layer cut is not an exact canonical suffix");
+  }
+  return {
+    messages: messages.slice(range.end, cut),
+    retained,
+  };
+}
+
+export function createLayeredCheckpointDetails(prior: CodexCheckpointDetails, layer: ReturnType<typeof prepareCheckpointLayer>, summary: string): CodexCheckpointDetails {
+  const details = parseCheckpointDetails({
+    ...prior,
+    version: 2,
+    checkpointId: randomUUID(),
+    createdAt: new Date().toISOString(),
+    textSummary: summary,
+    keptMessageFingerprints: layer.retained.map(fingerprintMessage),
+  });
+  if (!details) throw new Error("Created an invalid layered checkpoint");
+  return details;
 }
 
 export function projectCheckpointContext(
