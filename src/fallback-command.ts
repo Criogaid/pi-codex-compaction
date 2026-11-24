@@ -23,7 +23,7 @@ const SWITCHES = {
   effort: {
     field: "reasoningEffortUpdatesEnabled",
     on: "Codex reasoning effort updates are On for chat requests and V2.",
-    off: "Codex reasoning effort updates are Off. Requests keep Pi's reasoning effort updates.",
+    off: "Codex reasoning effort updates are Off in this extension.",
   },
 } as const satisfies Record<Exclude<SettingsAction, "model">, {
   readonly field: Exclude<keyof CompactionConfiguration, "summaryModel">;
