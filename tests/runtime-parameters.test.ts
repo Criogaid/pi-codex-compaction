@@ -2,17 +2,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { zstdDecompressSync } from "node:zlib";
-import type { Context, Model, Provider } from "@earendil-works/pi-ai";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage, Context, Model, Provider } from "@earendil-works/pi-ai";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { closeOpenAICodexWebSocketSessions } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { capableModel } from "../src/capability.js";
-import { isObject, type JsonObject } from "../src/protocol.js";
+import { isObject, isObjectArray, type CompactionPayload, type JsonObject } from "../src/protocol.js";
 import { compactionRequest, RequestSnapshotTracker, type ProviderRequestInputs } from "../src/request-snapshot.js";
 import { requestRemoteCompaction } from "../src/remote.js";
-import { testRegistry } from "./helpers.js";
+import { assertTrimmedOutput, testRegistry } from "./helpers.js";
 
 const apiKey = `fixture.${Buffer.from(JSON.stringify({
   "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
@@ -89,6 +89,21 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   }
 }
 
+function withResponsesPayloadHook(provider: Provider, simulate: (payload: CompactionPayload) => CompactionPayload): Provider {
+  return { ...provider,
+    streamSimple(model, context, options) {
+      return provider.streamSimple(model, context, { ...options,
+        onPayload: async (payload, preparedModel) => {
+          assert.ok(isObject(payload) && isObjectArray(payload.input));
+          // Pi 1.0.4 lacks the effort updates emitted by newer Responses adapters.
+          const simulated = simulate({ ...payload, input: payload.input });
+          return await options?.onPayload?.(simulated, preparedModel) ?? simulated;
+        },
+      });
+    },
+  };
+}
+
 test("V2 preserves Pi effort updates in checkpoint input and across retries", async () => {
   const provider = openaiProvider();
   const compat = { supportsLongCacheRetention: true, supportsMidConvoEffort: true };
@@ -102,22 +117,9 @@ test("V2 preserves Pi effort updates in checkpoint input and across retries", as
   const target = capableModel(model);
   assert.ok(target);
   const update = { type: "configuration_update", reasoning: { effort: "low" } };
-  const registry = await testRegistry({ ...provider,
-    streamSimple(current, context, options) {
-      assert.equal(current.id, model.id);
-      return provider.streamSimple(model, context, { ...options,
-        onPayload: async (payload, preparedModel) => {
-          assert.ok(isObject(payload) && Array.isArray(payload.input) && payload.input.every(isObject));
-          // The pinned Pi 1.0.4 adapter lacks Responses effort updates; simulate Pi 1.3 serialization here.
-          const input = compat.supportsMidConvoEffort
-            ? [...payload.input.flatMap((item) => item.role === "assistant" ? [update, item] : [item]), update]
-            : payload.input;
-          const simulated = { ...payload, input };
-          return await options?.onPayload?.(simulated, preparedModel) ?? simulated;
-        },
-      });
-    },
-  });
+  const registry = await testRegistry(withResponsesPayloadHook(provider, (payload) => ({
+    ...payload, input: [...payload.input.flatMap((item) => item.role === "assistant" ? [update, item] : [item]), update],
+  })));
   const canonical = [{ role: "system" as const, content: "Preserve settings.", timestamp: 0 },
     { role: "user" as const, content: "source", timestamp: 1 }];
   const inputs: ProviderRequestInputs = { systemPrompt: "Preserve settings.", thinkingLevel: "low", settings: {}, activeTools: [], tools: [] };
@@ -171,6 +173,109 @@ test("V2 preserves Pi effort updates in checkpoint input and across retries", as
     assert.ok(wireInput[index - 1].type !== "configuration_update" || wireInput[index].type !== "configuration_update");
   }
 });
+
+for (const path of ["matching prefix", "no snapshot", "settings mismatch", "server reference"] as const) {
+  test(`V2 trims only history with ${path}`, async () => {
+    const provider = openaiProvider();
+    const model: Model<"openai-responses"> = {
+      id: "gpt-fixture", name: "Fixture", api: "openai-responses", provider: provider.id,
+      baseUrl: "https://gateway.example/v1", reasoning: true, input: ["text"],
+      contextWindow: 72, maxTokens: 16,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    };
+    const target = capableModel(model);
+    assert.ok(target);
+    const inputs: ProviderRequestInputs = { systemPrompt: "Keep facts.", thinkingLevel: "low", settings: {}, activeTools: [], tools: [] };
+    const callId = "call_lookup|fc_lookup";
+    const toolCall: AssistantMessage = {
+      role: "assistant", content: [{ type: "toolCall", id: callId, name: "lookup", arguments: {} }],
+      api: model.api, provider: model.provider, model: model.id, stopReason: "toolUse", timestamp: 2,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    };
+    const toolOutput = "x".repeat(400);
+    const history: Context["messages"] = [
+      { role: "user", content: "Look it up.", timestamp: 1 }, toolCall,
+      { role: "toolResult", toolCallId: callId, toolName: "lookup", isError: false, timestamp: 3,
+        content: [{ type: "text", text: toolOutput }] },
+    ];
+    const reply: AssistantMessage = { ...toolCall, timestamp: 4, stopReason: "stop",
+      content: [{ type: "text", text: "Found it.", textSignature: "msg_reply" }],
+    };
+    const historyUpdate = { type: "configuration_update", reasoning: { effort: "medium" } };
+    const observedUpdate = { type: "configuration_update", reasoning: { effort: "high" } };
+    const currentUpdate = { type: "configuration_update", reasoning: { effort: "low" } };
+    const trigger = { type: "compaction_trigger" };
+    const wirePrefix = [
+      { role: "developer", content: inputs.systemPrompt },
+      { role: "user", content: [{ type: "input_text", text: "Look it up." }] },
+      { type: "function_call", id: path === "matching prefix" ? "fc_observed" : "fc_lookup",
+        call_id: "call_lookup", name: "lookup", arguments: "{}" },
+    ];
+    const wireOutput = { type: "function_call_output", call_id: "call_lookup", output: toolOutput };
+    const wireReply = { type: "message", role: "assistant", id: "msg_reply", status: "completed",
+      content: [{ type: "output_text", text: "Found it.", annotations: [] }],
+    };
+
+    const send = async (messages: AgentMessage[], requestTail: readonly JsonObject[] = []) => {
+      const registry = await testRegistry(withResponsesPayloadHook(provider, (payload) => ({
+        ...payload, input: [...payload.input.flatMap((item) => item.role === "assistant" ? [historyUpdate, item] : [item]), ...requestTail],
+      })));
+      const tracker = new RequestSnapshotTracker();
+      if (path !== "no snapshot") {
+        tracker.recordContext(sessionId, target, () => history);
+        tracker.recordProjectedRequest(sessionId, target, () => history, () => undefined, history);
+        const ordinary = await registry.streamSimple(model, { systemPrompt: inputs.systemPrompt, messages: history }, {
+          reasoning: "low", transport: "sse", sessionId,
+          onPayload: (payload) => {
+            assert.ok(isObject(payload) && isObjectArray(payload.input));
+            // A distinct wire ID shows whether compaction reused the observed prefix.
+            const observedInput = payload.input.slice(0, payload.input.length - requestTail.length)
+              .map((item) => item.type === "function_call" ? { ...item, id: "fc_observed" } : item);
+            if (requestTail.length) observedInput.push(observedUpdate);
+            const observed = { ...payload, input: observedInput, service_tier: "priority",
+              ...(path === "server reference" ? { previous_response_id: "resp-observed" } : {}),
+            };
+            tracker.recordProviderRequest(sessionId, target, () => history, () => inputs.systemPrompt, () => ({ payload: observed, inputs }));
+            return observed;
+          },
+          fetch: async () => response(),
+        }).result();
+        assert.notEqual(ordinary.stopReason, "error", ordinary.errorMessage ?? "ordinary request failed");
+        assert.ok(tracker.current().providerRequest);
+      }
+      const currentInputs = path === "settings mismatch" ? { ...inputs, settings: { transport: "websocket" as const } } : inputs;
+      const request = compactionRequest(tracker.current(), sessionId, target, messages, currentInputs, { blockImages: false, tools: () => [] });
+      assert.equal(Boolean(request.providerRequest), path === "matching prefix" || path === "server reference");
+      assert.equal(Boolean(request.providerRequest?.prefix), path === "matching prefix");
+
+      let sent: unknown;
+      await requestRemoteCompaction({
+        modelRegistry: registry, model, context: request.context, providerRequest: request.providerRequest,
+        reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 0,
+        fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
+      });
+      assert.ok(isObject(sent) && isObjectArray(sent.input));
+      assert.equal(sent.service_tier, request.providerRequest ? "priority" : undefined);
+      assert.equal(sent.previous_response_id, undefined);
+      return sent.input;
+    };
+
+    const noTail = await send(history);
+    const trimmed = assertTrimmedOutput(noTail[wirePrefix.length], wireOutput);
+    assert.equal(Buffer.byteLength(String(trimmed.output)), 61, "Tool output bytes without a request tail");
+    assert.deepEqual(noTail, [...wirePrefix, trimmed, trigger]);
+
+    // A non-empty assistant reply keeps the earlier tool result outside the trimmable suffix.
+    const historyOnly = await send([...history, reply]);
+    assert.deepEqual(historyOnly, [...wirePrefix, wireOutput, historyUpdate, wireReply, trigger]);
+
+    const withTail = await send(history, [currentUpdate]);
+    const actualOutput = withTail[wirePrefix.length]?.output;
+    assert.ok(typeof actualOutput === "string");
+    assert.equal(Buffer.byteLength(actualOutput), 61, "Tool output bytes with a request tail");
+    assert.deepEqual(withTail, [...wirePrefix, trimmed, currentUpdate, trigger]);
+  });
+}
 
 test("V2 uses a fresh HTTP request with its feature header after an ordinary WebSocket request", async () => {
   const provider = openaiCodexProvider();
