@@ -28,6 +28,7 @@ const TRANSIENT_NETWORK = new Set([
 const NS_PER_MS = 1_000_000n;
 const NS_PER_SECOND = 1_000n * NS_PER_MS;
 const MAX_U64 = (1n << 64n) - 1n;
+const I64_LIMIT = 2 ** 63;
 // Codex's Rust Instant uses unsigned Duration on Windows and signed seconds on Unix.
 const MAX_INSTANT_NS = ((process.platform === "win32" ? MAX_U64 : MAX_U64 >> 1n) + 1n) * NS_PER_SECOND - 1n;
 
@@ -275,8 +276,15 @@ export class CompactionAttempt {
     if (this.terminal || this.blocked) return;
     this.terminal = true;
     if (!isObject(value)) return;
-    const { code, message, headers } = value;
+    const { code, message, headers, type, plan_type: planType, resets_at: resetsAt } = value;
     if (typeof code !== "string" || (message != null && typeof message !== "string")) return;
+    // Codex decodes these optional fields before classifying response.failed.
+    if (!standaloneHeaders && (
+      (type != null && typeof type !== "string") ||
+      (planType != null && typeof planType !== "string") ||
+      (resetsAt != null && (typeof resetsAt !== "number" || !Number.isInteger(resetsAt) ||
+        resetsAt < -I64_LIMIT || resetsAt >= I64_LIMIT))
+    )) return;
     const capacity = CAPACITY_CODES.has(code);
     const rateLimited = RATE_LIMIT_CODES.has(code);
     if (!capacity && (standaloneHeaders || (!rateLimited && code !== "server_error"))) return;
