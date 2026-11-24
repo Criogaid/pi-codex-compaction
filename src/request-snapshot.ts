@@ -5,7 +5,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { getCurrentSystemMessage, getSystemMessageText, type Context, type Message, type Tool } from "@earendil-works/pi-ai";
 import { convertToLlm, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { RESPONSES_APIS, sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
-import { type CodexCheckpointDetails, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
+import { type CodexCheckpointDetails, checkpointMarker, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
 import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, type CompactionPayload, isObject, isObjectArray, type JsonObject } from "./protocol.js";
 import { contextUserItems, userItemOrigins } from "./retention-input.js";
 
@@ -300,7 +300,7 @@ export interface RequestSnapshots {
 interface TrackedSnapshots {
   promptOverride?: PromptOverride;
   pendingSource?: SourceSnapshot;
-  pendingContext?: { readonly source: SourceSnapshot; readonly context: ContextSnapshot };
+  pendingContext?: { readonly source: SourceSnapshot; readonly context: ContextSnapshot; readonly checkpointId?: string };
   context?: ContextSnapshot;
   providerRequest?: ProviderRequestSnapshot;
 }
@@ -347,7 +347,9 @@ export class RequestSnapshotTracker {
     if (!matched || matched.length !== pending.sourceFingerprints.length) return;
     const prior = checkpoint();
     const source = prior ? projectCheckpointRequest(messages, prior) : messages;
-    if (source) this.state.pendingContext = { source: pending, context: captureContextSnapshot(sessionId, target, source, projected) };
+    if (source) this.state.pendingContext = {
+      source: pending, context: captureContextSnapshot(sessionId, target, source, projected), checkpointId: prior?.checkpointId,
+    };
   }
 
   /** `before_provider_request`: record the effective prompt and publish the pending context. */
@@ -356,7 +358,7 @@ export class RequestSnapshotTracker {
     target: CapableModel | undefined,
     canonical: () => AgentMessage[],
     systemPrompt: () => string,
-    observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs },
+    observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs; readonly replayedCheckpoint?: boolean },
   ): void {
     const messages = target ? canonical() : undefined;
     this.state.promptOverride = target && messages && capturePromptOverride(messages, sessionId, target, systemPrompt());
@@ -365,13 +367,17 @@ export class RequestSnapshotTracker {
     const pending = this.state.pendingContext;
     const source = target && messages && pending && snapshotFor(pending.source, sessionId, target) && matchingSource(messages, pending.source);
     if (!source || source.length !== pending?.source.sourceFingerprints.length) this.state.pendingContext = undefined;
-    const context = this.state.pendingContext?.context;
-    this.state.context = context;
+    const matched = this.state.pendingContext;
+    this.state.context = matched?.context;
     this.state.providerRequest = undefined;
-    if (context && target) {
-      const { payload, inputs } = observation();
-      this.state.providerRequest = captureProviderRequest(context, target, payload, inputs);
+    if (!matched || !target) return;
+    const { payload, inputs, replayedCheckpoint } = observation();
+    if (!replayedCheckpoint && matched.checkpointId) {
+      const marker = checkpointMarker(matched.checkpointId);
+      if (matched.context.messages.some((message) => message.role === "user" && Array.isArray(message.content) &&
+        message.content.some((part) => part.type === "text" && part.text === marker))) return;
     }
+    this.state.providerRequest = captureProviderRequest(matched.context, target, payload, inputs);
   }
 
   /**
