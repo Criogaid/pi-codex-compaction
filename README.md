@@ -56,6 +56,8 @@ V2 采用 Codex 0.172.0 的 `Retry-After` 秒数和 HTTP 日期格式，也接�
 
 V2 只凭明确的暂时故障证据重发。HTTP 状态白名单优先服从永久 `error.code` 的否决，包括 `usage_limit_reached` 和 `usage_not_included`。HTTP 429 另外检查 `error.type` 中的用量或额度限制。`response.failed` 错误字段类型无效时按协议错误处理，保留旧检查点。未知错误码和限流字样本身不构成暂时故障证据。Pi 的适配器会在独立 `error` 帧提前结束读取，Codex 可跳过未识别的独立错误。无效压缩结果、重复输出、取消操作和会话变化也会阻止重发。HTTP 重定向沿用 provider 和 fetch 的处理方式。
 
+Codex Responses 跳过空 `data:` 帧，V2 根据后续记录判断是否重试。标准 Responses 遇到空 `data:` 帧仍会报错。
+
 建议等待超过上限、容量故障缺少建议或次数用尽时，已确认的暂时故障仍可使用上表中的分层恢复。
 
 压缩插件不改写普通请求或 V2 请求的思考等级基线和 `configuration_update` 记录。不安装独立的思考等级插件时，这些字段沿用 Pi 的原生行为。

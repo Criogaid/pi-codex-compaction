@@ -167,7 +167,7 @@ class SseEvidenceObserver {
   private event = "";
   private skipLf = false;
   private oversized = false;
-  constructor(private readonly attempt: CompactionAttempt) {}
+  constructor(private readonly attempt: CompactionAttempt, private readonly api: Api) {}
 
   recordEnd(bytes: Uint8Array, offset: number): number {
     let start = offset;
@@ -239,7 +239,10 @@ class SseEvidenceObserver {
   private observeRecord(framed: boolean): void {
     if (!this.data.length) return;
     const data = this.data.join("\n");
-    if (data.trim() === "[DONE]") {
+    const trimmed = data.trim();
+    // Codex skips empty payloads. The OpenAI SDK tries to parse them as JSON.
+    if (!trimmed && this.api === CODEX_API) return;
+    if (trimmed === "[DONE]") {
       this.attempt.blockRetry();
       return;
     }
@@ -335,7 +338,7 @@ export class CompactionAttempt {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     // Pi requests a stream explicitly, so successful bodies are SSE regardless of response headers.
-    const sse = response.ok ? new SseEvidenceObserver(this) : undefined;
+    const sse = response.ok ? new SseEvidenceObserver(this, this.api) : undefined;
     let errorBody = "";
     let errorBodyTooLarge = false;
     let chunk: Uint8Array | undefined;
