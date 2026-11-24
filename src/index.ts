@@ -325,7 +325,7 @@ export function createCodexCompactionExtension(
     const warnings = new Set<string>();
     const snapshots = new RequestSnapshotTracker();
     let latestRun = 0;
-    let shutdownGeneration = 0;
+    let live = true;
     const warnOnce = (ctx: ExtensionContext, key: string, message: string) => {
       const scoped = `${ctx.sessionManager.getSessionId()}:${key}`;
       if (warnings.has(scoped)) return;
@@ -349,11 +349,11 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("session_before_compact", async (event, ctx) => {
-      const generation = shutdownGeneration;
+      if (!live) return { cancel: true };
       const runNumber = ++latestRun;
       const sessionId = ctx.sessionManager.getSessionId();
       const { signal } = event;
-      const sameSession = () => generation === shutdownGeneration && ctx.sessionManager.getSessionId() === sessionId;
+      const sameSession = () => live && ctx.sessionManager.getSessionId() === sessionId;
       const ownsStatus = () => runNumber === latestRun && sameSession();
       // A model switch leaves the run on its starting model, as in Pi's compaction.
       const owned = () => !signal.aborted && sameSession();
@@ -481,7 +481,7 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("session_shutdown", (_event, ctx) => {
-      ++shutdownGeneration;
+      live = false;
       warnings.clear();
       snapshots.reset();
       ctx.ui.setStatus(STATUS_KEY, undefined);
