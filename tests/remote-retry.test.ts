@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { once } from "node:events";
+import { mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { dirname, join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import type { Api, AuthResult, Context, Model, Provider, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
+import { getLatestCompactionEntry } from "@earendil-works/pi-coding-agent";
+import { parseCheckpointDetails } from "../src/checkpoint.js";
+import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
+import { createCodexCompactionExtension } from "../src/index.js";
 import { requestRemoteCompaction, type RemoteCompactionRequest } from "../src/remote.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
-import { testRegistry } from "./helpers.js";
+import { isolateAgentConfig, sessionFixture, testRegistry } from "./helpers.js";
 
 type ResponsesApi = "openai-responses" | "openai-codex-responses";
 const token = `fixture.${Buffer.from(JSON.stringify({
@@ -19,8 +25,8 @@ const created = { type: "response.created", response: { id: "resp-retry" } };
 const partialItem = { type: "compaction", encrypted_content: "discard-this-partial-attempt" };
 const partialDone = { type: "response.output_item.done", output_index: 0, item: partialItem };
 
-function frames(events: readonly unknown[]): string {
-  return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+function frames(events: readonly unknown[], newline = "\n"): string {
+  return events.map((event) => `data: ${JSON.stringify(event)}${newline}${newline}`).join("");
 }
 
 function sse(events: readonly unknown[]): Response {
@@ -102,8 +108,63 @@ async function fixture(api: ResponsesApi, resolve?: () => Promise<AuthResult | u
   return { request, context, payloads, urls, options, fetchReplies, assertAttempts };
 }
 
+const compactionConfig = join(isolateAgentConfig(), COMPACTION_SETTINGS_RELATIVE_PATH);
+const summaryModelId = "fixture-text-summary";
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
+  const layouts = api === "openai-responses"
+    ? [["LF", "\n", "same chunk"], ["LF", "\n", "separate chunks"],
+      ["CRLF", "\r\n", "same chunk"], ["CRLF", "\r\n", "separate chunks"]] as const
+    : [["LF", "\n", "same chunk"]] as const;
+  for (const [lineEnding, newline, layout] of layouts) {
+    for (const tail of ["response.completed", "response.failed"] as const) {
+      test(`${api}: first SSE completion wins over ${tail} (${lineEnding}, ${layout})`, { timeout: 20_000 }, async (t) => {
+        const firstItem = { type: "compaction", encrypted_content: "first-checkpoint" };
+        const laterItem = { type: "compaction", encrypted_content: "later-checkpoint" };
+        const first = frames([created, { type: "response.output_item.done", output_index: 0, item: firstItem },
+          { type: "response.completed", response: { id: "resp-first", status: "completed", output: [firstItem],
+            usage: { input_tokens: 11, output_tokens: 1, total_tokens: 12 } } }], newline);
+        const later = frames([tail === "response.completed"
+          ? { type: tail, response: { id: "resp-later", status: "completed", output: [laterItem],
+            usage: { input_tokens: 99, output_tokens: 1, total_tokens: 100 } } }
+          : { type: tail, response: { status: "failed", error: { code: "server_error", message: "Late failure" } } }], newline);
+        const hasTrigger = (payload: JsonObject) => Array.isArray(payload.input) &&
+          payload.input.some((item) => isObject(item) && item.type === "compaction_trigger");
+        const fixture = await sessionFixture({
+          api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+          models: (base) => [base, { ...base, id: summaryModelId, name: "Fixture text summary" }],
+          settings: { retry: { enabled: false, provider: { maxRetries: 1 } } },
+          respond: ({ payload }) => {
+            if (!hasTrigger(payload)) return;
+            const chunks = layout === "same chunk" ? [first + later] : [first, later];
+            const encoder = new TextEncoder();
+            return new Response(new ReadableStream<Uint8Array>({
+              start(controller) {
+                for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+                controller.close();
+              },
+            }), { headers: streamHeaders });
+          },
+        });
+        t.after(() => fixture.close());
+        await mkdir(dirname(compactionConfig), { recursive: true });
+        await writeFile(compactionConfig, JSON.stringify({ version: 2,
+          summaryModel: { provider: fixture.model.provider, model: summaryModelId, thinkingLevel: "low" } }));
+        for (let turn = 1; turn <= 3; turn++) {
+          await fixture.session.prompt(`Task ${turn}: ${"Preserve the agreed implementation constraints. ".repeat(60)}`);
+        }
+        const start = fixture.requests.length;
+        await fixture.session.compact();
+        const entry = getLatestCompactionEntry(fixture.session.sessionManager.getBranch());
+        assert.deepEqual({
+          requests: fixture.requests.slice(start).map(({ payload }) => ({ model: payload.model, v2: hasTrigger(payload) })),
+          item: entry && parseCheckpointDetails(entry.details)?.replacementHistory.at(-1),
+          inputTokens: entry?.usage?.input,
+        }, { requests: [{ model: fixture.model.id, v2: true }], item: firstItem, inputTokens: 11 });
+      });
+    }
+  }
+
   test(`${api}: trims tool output to the actual prepared model's physical window`, async () => {
     const f = await fixture(api, undefined, false, (model) => ({ ...model, contextWindow: 512 }));
     const output = "x".repeat(16_000);
