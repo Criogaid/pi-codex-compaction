@@ -276,6 +276,19 @@ export class CompactionAttempt {
         this.blockRetry();
       } else errorBody += text;
     };
+    const finishErrorBody = () => {
+      inspectErrorBody(decoder.decode());
+      if (errorBodyTooLarge) return;
+      let value: unknown;
+      try { value = JSON.parse(errorBody); }
+      catch (error) {
+        // Gateways can return non-JSON diagnostics, including a partial body before a reset.
+        if (!(error instanceof SyntaxError)) throw error;
+        return;
+      }
+      const error = classifyError(value);
+      if (error.permanent || error.invalid || (error.code && !TRANSIENT_CODES.has(error.code))) this.blockRetry();
+    };
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         abort = () => {
@@ -298,15 +311,7 @@ export class CompactionAttempt {
             if (closed) return;
             if (result.done) {
               if (sse) sse.finish();
-              else {
-                inspectErrorBody(decoder.decode());
-                if (!errorBodyTooLarge) {
-                  try {
-                    const error = classifyError(JSON.parse(errorBody));
-                    if (error.permanent || error.invalid || (error.code && !TRANSIENT_CODES.has(error.code))) this.blockRetry();
-                  } catch { /* A transient HTTP status can legitimately carry a non-JSON gateway error. */ }
-                }
-              }
+              else finishErrorBody();
               this.eof = Boolean(sse);
               cleanup();
               reader.releaseLock();
@@ -325,7 +330,8 @@ export class CompactionAttempt {
           } else offset = end;
         } catch (error) {
           if (closed) return;
-          this.fetchFailed(error);
+          if (sse) this.fetchFailed(error);
+          else finishErrorBody();
           cleanup();
           reader.releaseLock();
           controller.error(error);
