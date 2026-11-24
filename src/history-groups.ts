@@ -34,12 +34,15 @@ function isResizeNotice(item: JsonObject): boolean {
   return text !== undefined && matchesMarkedText(text, RESIZE_NOTICE_MARKERS);
 }
 
-/** Group each item with an immediately following resize notice, as Codex's history_item_groups does. */
+/** Attach a resize notice only to the preceding user message or function/custom tool output. */
 export function historyGroups(input: readonly JsonObject[]): HistoryGroup[] {
   const groups: HistoryGroup[] = [];
   for (let index = 0; index < input.length; index++) {
+    const source = input[index];
     const next = input[index + 1];
-    groups.push({ source: input[index], notice: next && isResizeNotice(next) ? input[++index] : undefined });
+    const canHaveResizeNotice = source.type === "function_call_output" || source.type === "custom_tool_call_output" ||
+      ((source.type === undefined || source.type === "message") && source.role === "user");
+    groups.push({ source, notice: canHaveResizeNotice && next && isResizeNotice(next) ? input[++index] : undefined });
   }
   return groups;
 }
