@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CodexCompactionProtocolError, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker, withoutInputImages } from "../src/protocol.js";
+import { CODEX_API, CodexCompactionProtocolError, createCompactionCollector, isObject, normalizeCompactionEvent, prepareRemoteCompactionPayload, rewriteCheckpointMarker, withoutInputImages } from "../src/protocol.js";
 
 const item = { type: "compaction", encrypted_content: "opaque" };
 const done = { type: "response.output_item.done", item };
@@ -28,10 +28,23 @@ test("rejects a compaction output item that arrives after response.completed", (
   }, CodexCompactionProtocolError);
 });
 
-test("accepts the raw successful Codex response.done alias", () => {
+test("normalizes a successful Codex response.done alias before collection", () => {
   const collector = createCompactionCollector();
   collector.observe(done);
-  collector.observe({ type: "response.done", response: { status: "completed", output: [item] } });
+  collector.observe(normalizeCompactionEvent(CODEX_API, {
+    type: "response.done", response: { status: "completed", output: [item] },
+  }));
+  assert.deepEqual(collector.finish(), item);
+});
+
+test("standard Responses keeps collecting after response.done", () => {
+  const collector = createCompactionCollector();
+  collector.observe(done);
+  collector.observe(normalizeCompactionEvent("openai-responses", {
+    type: "response.done", response: { status: "completed", output: [item] },
+  }));
+  assert.equal(collector.completed, false);
+  collector.observe(completed);
   assert.deepEqual(collector.finish(), item);
 });
 
@@ -40,7 +53,8 @@ for (const type of ["response.done", "response.completed"] as const) {
     test(`rejects ${type} with unsuccessful status ${status}`, () => {
       const collector = createCompactionCollector();
       collector.observe(done);
-      assert.throws(() => collector.observe({ type, response: { status } }), CodexCompactionProtocolError);
+      assert.throws(() => collector.observe(normalizeCompactionEvent(CODEX_API, { type, response: { status } })),
+        CodexCompactionProtocolError);
     });
   }
 }
@@ -49,7 +63,7 @@ test("does not infer success from a bare response.done or incomplete terminal ev
   for (const type of ["response.done", "response.failed", "response.incomplete"]) {
     const collector = createCompactionCollector();
     collector.observe(done);
-    assert.throws(() => collector.observe({ type }), CodexCompactionProtocolError);
+    assert.throws(() => collector.observe(normalizeCompactionEvent(CODEX_API, { type })), CodexCompactionProtocolError);
   }
 });
 
