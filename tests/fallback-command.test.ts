@@ -478,14 +478,14 @@ test("TUI effort switch toggles on the same row, preserves other settings, and r
   });
 });
 
-test("RPC V2 switch preserves enabled effort updates without firing the effort callback", async () => {
+test("RPC V2 switch preserves enabled effort updates and reports the saved effort value", async () => {
   await writeSettings(JSON.stringify({ version: 2, reasoningEffortUpdates: { enabled: true } }));
   const current = await fixture([firstChoice]);
   await current.run();
   assert.deepEqual(current.dialogs[0]?.options, [
     "Remote Compaction V2: On", "Codex reasoning effort updates: On", "Summary model: Chat model",
   ]);
-  assert.deepEqual(current.effortChanges, []);
+  assert.deepEqual(current.effortChanges, [true]);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
     version: 2, remoteCompaction: { enabled: false }, reasoningEffortUpdates: { enabled: true },
   });
