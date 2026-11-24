@@ -95,7 +95,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   const baseFetch = request.fetch ?? globalThis.fetch;
   for (let retry = 0; ; retry++) {
     request.signal.throwIfAborted();
-    const attempt = new CompactionAttempt();
+    const attempt = new CompactionAttempt(model.api);
     const collector = createCompactionCollector();
     let usage: Usage | undefined;
     let fetched = false;
@@ -123,7 +123,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
           : input instanceof Request
             ? await baseFetch(new Request(identity!.endpoint, new Request(input, init)))
             : await baseFetch(identity!.endpoint, init);
-        return attempt.observeResponse(response, request.signal, model.api, () => collector.completed);
+        return attempt.observeResponse(response, request.signal, () => collector.completed);
       } catch (error) {
         attempt.fetchFailed(error);
         throw error;

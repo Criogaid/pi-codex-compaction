@@ -1,7 +1,7 @@
 // Own bounded V2 retry evidence before Pi adapters reduce errors to message strings.
 import { setTimeout as delay } from "node:timers/promises";
 import type { Api } from "@earendil-works/pi-ai";
-import { isObject, normalizeCompactionEvent } from "./protocol.js";
+import { CODEX_API, isObject } from "./protocol.js";
 
 const MAX_RETRIES = 2;
 const MAX_RETRY_DELAY_MS = 60_000;
@@ -110,7 +110,7 @@ class SseEvidenceObserver {
   private event = "";
   private skipLf = false;
   private oversized = false;
-  constructor(private readonly attempt: CompactionAttempt, private readonly api: Api) {}
+  constructor(private readonly attempt: CompactionAttempt) {}
 
   recordEnd(bytes: Uint8Array, offset: number): number {
     let start = offset;
@@ -194,7 +194,7 @@ class SseEvidenceObserver {
       if (framed) this.attempt.blockRetry();
       return;
     }
-    this.attempt.observeEvent(normalizeCompactionEvent(this.api, value), this.event);
+    this.attempt.observeSdkError(value, this.event);
   }
 }
 
@@ -206,40 +206,52 @@ export class CompactionAttempt {
   private eof = false;
   fatal?: { error: unknown };
 
+  constructor(private readonly api: Api) {}
+
   blockRetry(error?: unknown): void {
     this.blocked = true;
     if (error !== undefined && !this.fatal) this.fatal = { error };
   }
   fetchFailed(error: unknown): void {
-    if (networkFailure(error)) this.evidence = { reason: "transient network failure" };
+    if (!this.terminal && networkFailure(error)) this.evidence = { reason: "transient network failure" };
   }
-  observeEvent(value: unknown, eventName?: string): Error | undefined {
-    if (!isObject(value)) { this.blockRetry(); return; }
-    const response = isObject(value.response) ? value.response : undefined;
-    if (eventName === "error" || value.type === "error" || isObject(value.error) || value.type === "response.failed") {
-      const error = classifyError(value.type === "response.failed" ? response?.error : value);
-      const code = error.code;
-      if (!error.invalid && !error.permanent && code && TRANSIENT_CODES.has(code)) {
-        this.evidence = { reason: `server error ${code}`, retryAt: rateLimitDeadline(code, error.message) };
-        return new Error(`Remote compaction failed temporarily (${code})`);
-      }
+  observeSdkError(value: unknown, name: string): void {
+    // OpenAI’s SDK intercepts named errors and truthy data.error before calling Pi’s hook.
+    if (this.api !== "openai-responses" || name.startsWith("thread.") ||
+        (name !== "error" && !(isObject(value) && value.error))) return;
+    this.observeFailure(value);
+  }
+
+  private observeFailure(value: unknown): Error | undefined {
+    if (this.terminal || this.blocked) return;
+    this.terminal = true;
+    const error = classifyError(value);
+    const { code } = error;
+    if (error.invalid || error.permanent || !code || !TRANSIENT_CODES.has(code)) {
       this.blockRetry();
+      return;
     }
-    if (typeof value.type !== "string") this.blockRetry();
-    if (value.type === "response.completed" ||
-        value.type === "response.incomplete" || value.type === "response.failed" || value.type === "response.cancelled") {
+    this.evidence = { reason: `server error ${code}`, retryAt: rateLimitDeadline(code, error.message) };
+    return new Error(`Remote compaction failed temporarily (${code})`);
+  }
+
+  observeEvent(value: unknown): Error | undefined {
+    if (!isObject(value) || typeof value.type !== "string") { this.blockRetry(); return; }
+    if (value.type === "error") return this.observeFailure(value);
+    if (value.type === "response.failed") return this.observeFailure(isObject(value.response) ? value.response.error : undefined);
+    if (value.type === "response.completed" || value.type === "response.incomplete" ||
+        value.type === "response.cancelled" || (this.api === CODEX_API && value.type === "response.done")) {
       this.terminal = true;
     }
     if (value.type === "response.created" || value.type === "response.in_progress" ||
         value.type === "response.output_item.added" || value.type === "response.output_item.done") this.progress = true;
-    return undefined;
   }
   retryEvidence(): RetryEvidence | undefined {
-    if (this.blocked || this.terminal) return undefined;
-    return this.evidence ?? (this.eof && this.progress ? { reason: "Responses stream ended before its terminal event" } : undefined);
+    if (this.blocked) return undefined;
+    return this.evidence ?? (!this.terminal && this.eof && this.progress ? { reason: "Responses stream ended before its terminal event" } : undefined);
   }
 
-  observeResponse(response: Response, signal: AbortSignal, api: Api, completed: () => boolean): Response {
+  observeResponse(response: Response, signal: AbortSignal, completed: () => boolean): Response {
     if (!response.ok) {
       if (TRANSIENT_HTTP.has(response.status) && response.headers.get("x-should-retry") !== "false") {
         this.evidence = { reason: `HTTP ${response.status}`, retryAt: retryDeadline(response.headers) };
@@ -249,7 +261,7 @@ export class CompactionAttempt {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     // Pi requests a stream explicitly, so successful bodies are SSE regardless of response headers.
-    const sse = response.ok ? new SseEvidenceObserver(this, api) : undefined;
+    const sse = response.ok ? new SseEvidenceObserver(this) : undefined;
     let errorBody = "";
     let errorBodyTooLarge = false;
     let chunk: Uint8Array | undefined;
