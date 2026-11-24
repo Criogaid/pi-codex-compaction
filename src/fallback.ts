@@ -48,8 +48,8 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
   // pi-virtual limits are display hints. Zero lets native compact use its reserve budget;
   // streamSimple routes the original model and caps each request to the physical model's limit.
   const budgetModel = selection.model.api === "pi-virtual" ? { ...selection.model, maxTokens: 0 } : selection.model;
-  // Pi 0.99.1 can append file lists to empty or provider-aborted summaries; inspect the actual completions.
-  const responses: Promise<AssistantMessage>[] = [];
+  // Pi can append file lists to empty summaries; inspect the actual completions.
+  const responses: AssistantMessage[] = [];
   const result = await compact(
     request.preparation,
     budgetModel,
@@ -58,7 +58,8 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
     request.customInstructions,
     request.signal,
     selection.thinkingLevel,
-    (_model, context, options) => {
+    async (_model, context, options) => {
+      request.signal.throwIfAborted();
       const stream = request.modelRegistry.streamSimple(selection.model, context, {
         ...options,
         transport: settings.getTransport(),
@@ -72,7 +73,13 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
           return payload;
         },
       });
-      responses.push(stream.result());
+      const message = await stream.result();
+      // Pi treats an aborted response as terminal for retries but can still start the next segment.
+      if (message.stopReason === "aborted") {
+        request.signal.throwIfAborted();
+        throw new Error("Fallback compaction was aborted by the provider");
+      }
+      responses.push(message);
       return stream;
     },
     undefined,
@@ -82,9 +89,7 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
   );
   request.signal.throwIfAborted();
   request.onPrepared(selection);
-  for (const response of responses) {
-    const message = await response;
-    if (message.stopReason === "aborted") throw new Error("Fallback compaction was aborted by the provider");
+  for (const message of responses) {
     // Pi owns retrying error responses; validate only completions it accepted.
     if (message.stopReason !== "error" && !message.content.some((block) => block.type === "text" && block.text.trim())) {
       throw new Error("Fallback compaction returned an empty summary");
