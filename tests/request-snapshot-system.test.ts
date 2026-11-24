@@ -364,3 +364,157 @@ for (const thinkingChanged of [false, true]) {
     assert.deepEqual(fixture.errors, []);
   });
 }
+
+for (const { api, serverReference, systemSuffix } of [
+  { api: "openai-responses", serverReference: false, systemSuffix: true },
+  { api: "openai-codex-responses", serverReference: false, systemSuffix: true },
+  { api: "openai-codex-responses", serverReference: true, systemSuffix: true },
+  { api: "openai-codex-responses", serverReference: true, systemSuffix: false },
+] as const) {
+  test(`${api} V2 ${systemSuffix ? "uses fresh declarations after a system suffix" : "reuses declarations without a system suffix"}${serverReference ? " with a server reference" : ""}`, async (t) => {
+    const independentFields = {
+      prompt_cache_key: "fixture-suffix-fields", service_tier: "priority", reasoning: { effort: "high", summary: "detailed" },
+    };
+    const observedDeclarations = {
+      instructions: "Only in the observed request.",
+      tools: [{ type: "function", name: "stale_tool", parameters: { type: "object", properties: {} } }],
+    };
+    const newTool = { name: "suffix_tool", description: "Tool declared by the system suffix.", parameters: { type: "object", properties: {} } };
+    let serialized: JsonObject | undefined;
+    const fixture = await sessionFixture({
+      api,
+      models: (base) => [{ ...base, compat: { ...base.compat, supportsAdditionalTools: false, supportsToolSearch: false } }],
+      serializePayload(payload) {
+        serialized = structuredClone(payload);
+        return payload;
+      },
+      extensions: [
+        (pi) => pi.on("before_provider_request", ({ payload }) => {
+          assert.ok(isObject(payload));
+          return { ...payload, ...independentFields, ...observedDeclarations,
+            ...(serverReference ? { previous_response_id: "fixture-response-anchor" } : {}) };
+        }),
+        codexCompaction,
+      ],
+    });
+    t.after(() => fixture.close());
+    await fixture.session.prompt(warmup);
+    await fixture.session.prompt(warmup);
+    const ordinary = lastPayload(fixture);
+    assert.deepEqual({ instructions: ordinary.instructions, tools: ordinary.tools }, observedDeclarations);
+    assert.equal(ordinary.previous_response_id, serverReference ? "fixture-response-anchor" : undefined);
+
+    if (systemSuffix) {
+      fixture.session.sessionManager.appendMessage({
+        role: "system", content: "Use the new tool for the next task.", toolsAdded: [newTool], timestamp: Date.now(),
+      });
+      fixture.session.refreshContext();
+    }
+    const items = await compactInput(fixture);
+    const v2 = lastPayload(fixture);
+    assert.equal(v2.previous_response_id, undefined);
+    assert.deepEqual({ prompt_cache_key: v2.prompt_cache_key, service_tier: v2.service_tier, reasoning: v2.reasoning }, independentFields);
+    if (systemSuffix) {
+      assert.ok(serialized && isObjectArray(serialized.tools));
+      assert.deepEqual(serialized.tools.map((tool) => tool.name), [newTool.name]);
+      assert.deepEqual({ instructions: v2.instructions, tools: v2.tools },
+        { instructions: serialized.instructions, tools: serialized.tools });
+      assert.equal(JSON.stringify(items.slice(0, -1)), JSON.stringify(inputItems(serialized)));
+    } else {
+      assert.deepEqual({ instructions: v2.instructions, tools: v2.tools }, observedDeclarations);
+    }
+    assert.deepEqual(fixture.errors, []);
+  });
+}
+
+for (const api of ["openai-responses", "openai-codex-responses"] as const) {
+  for (const forcedPrompt of ["", "FORCE"]) {
+    test(`${api} V2 keeps forced prompt ${JSON.stringify(forcedPrompt)} before a delta from an aborted turn`, async (t) => {
+      const abortedTurn = "Apply the temporary system section to this task. ".repeat(60);
+      const section = "Temporary instructions for the aborted turn.";
+      const fixture = await sessionFixture({
+        api,
+        models: (base) => [{ ...base, compat: { ...base.compat, supportsMidConvoSystemMessages: true } }],
+        extensions: [codexCompaction, (pi) => {
+          pi.on("before_agent_start", (event) => {
+            if (event.prompt === warmup) return { systemPrompt: forcedPrompt };
+            if (event.prompt === abortedTurn) event.systemPromptOptions.sections.fixture = section;
+          });
+          pi.on("message_end", ({ message }, ctx) => {
+            if (message.role === "user" && Array.isArray(message.content) &&
+              message.content.some((part) => part.type === "text" && part.text === abortedTurn)) ctx.abort();
+          });
+        }],
+      });
+      t.after(() => fixture.close());
+      await fixture.session.prompt(warmup);
+      const ordinary = lastPayload(fixture);
+      await fixture.session.prompt(abortedTurn);
+      assert.equal(fixture.requests.length, 1);
+
+      const { messages } = fixture.session.sessionManager.buildSessionContext();
+      const userIndex = messages.findLastIndex((message) => message.role === "user");
+      const user = messages[userIndex];
+      assert.ok(user?.role === "user", "Pi persisted the user message before the run stopped");
+      assert.deepEqual(user.content, [{ type: "text", text: abortedTurn }]);
+      const update = messages[userIndex - 1];
+      assert.ok(update?.role === "system");
+      assert.equal(update.sections?.fixture, `<fixture>\n${section}\n</fixture>`);
+
+      const items = await compactInput(fixture);
+      const delta = { role: "developer", content: renderSystemMessageUpdate(update) };
+      const forcedHead = api === "openai-responses" && forcedPrompt ? [{ role: "developer", content: forcedPrompt }] : [];
+      assert.deepEqual(inputItems(ordinary).filter(isInstruction), forcedHead);
+      if (api === "openai-codex-responses") {
+        assert.equal(ordinary.instructions, forcedPrompt || "You are a helpful assistant.");
+        assert.equal(lastPayload(fixture).instructions, ordinary.instructions);
+      }
+      assert.deepEqual(items.filter(isInstruction), [...forcedHead, delta]);
+      const firstTurn = items.findIndex((item) => hasUserText(item, warmup));
+      assert.ok(firstTurn >= 0);
+      assert.equal(items[firstTurn + 1]?.role, "assistant");
+      assert.deepEqual(items.slice(firstTurn + 2, -1), [delta, userItem(abortedTurn)]);
+      assert.deepEqual(fixture.errors, []);
+    });
+  }
+}
+
+for (const sameText of [true, false]) {
+  test(`V2 rejects a ${sameText ? "same-text" : "different-text"} forced prompt after a history edit`, async (t) => {
+    const forcedTurn = "Check the chosen instructions against the task. ".repeat(60);
+    const editedWarmup = "Follow the corrected background decisions.";
+    const fixture = await sessionFixture({ extensions: [codexCompaction, (pi) => {
+      pi.on("before_agent_start", (event) => {
+        if (event.prompt === warmup) event.systemPromptOptions.sections.fixture = "Warmup instructions.";
+        if (event.prompt === forcedTurn) return { systemPrompt: sameText ? event.systemPrompt : "FORCE" };
+      });
+    }] });
+    t.after(() => fixture.close());
+    await fixture.session.prompt(warmup);
+    const ordinaryHead = inputItems(lastPayload(fixture)).find(isInstruction);
+    assert.ok(ordinaryHead);
+    await fixture.session.prompt(forcedTurn);
+    const forcedInstructions = inputItems(lastPayload(fixture)).filter(isInstruction);
+    const { sessionManager } = fixture.session;
+    const { messages } = sessionManager.buildSessionContext();
+    const persisted = getCurrentSystemMessage(messages);
+    assert.ok(persisted);
+    const sourcePrompt = getSystemMessageText(persisted);
+    assert.deepEqual(forcedInstructions, [{ role: "developer", content: sameText ? sourcePrompt : "FORCE" }]);
+    const updates = messages.filter((message) => message.role === "system").slice(1);
+    assert.equal(updates.length, 1);
+
+    assert.equal(fixture.session.systemPrompt, sourcePrompt);
+    const entry = sessionManager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user");
+    assert.ok(entry);
+    sessionManager.appendContextEdit(entry.id, { content: editedWarmup });
+    fixture.session.refreshContext();
+
+    const items = await compactInput(fixture);
+    const relevant = items.filter((item) => isInstruction(item) ||
+      hasUserText(item, warmup) || hasUserText(item, editedWarmup) || hasUserText(item, forcedTurn));
+    assert.deepEqual(relevant, [ordinaryHead, userItem(editedWarmup),
+      { role: "developer", content: renderSystemMessageUpdate(updates[0]) }, userItem(forcedTurn)]);
+    assert.deepEqual(fixture.errors, []);
+  });
+}
