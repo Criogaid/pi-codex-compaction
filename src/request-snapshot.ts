@@ -461,15 +461,16 @@ export function compactionRequest(
   // Private user items mark the join and the transcript end; applyProviderRequest removes both,
   // replaces everything before the join, and keeps the request-level items Pi serializes after the end.
   const prefix = providerRequest?.prefix;
-  const join = forced !== undefined && suffix
-    ? reused.length - suffix.length
-    : prefix?.contextLength;
-  const messages: AgentMessage[] = prefix && join !== undefined ? [
-    ...reused.slice(0, join),
-    { role: "user", content: prefix.boundary, timestamp: 0 },
-    ...reused.slice(join),
-    { role: "user", content: transcriptEndBoundary(prefix.boundary), timestamp: 0 },
-  ] : reused;
+  let messages = reused;
+  if (prefix) {
+    const join = forced !== undefined && suffix ? reused.length - suffix.length : prefix.contextLength;
+    messages = [
+      ...reused.slice(0, join),
+      { role: "user", content: prefix.boundary, timestamp: 0 },
+      ...reused.slice(join),
+      { role: "user", content: transcriptEndBoundary(prefix.boundary), timestamp: 0 },
+    ];
+  }
   const converted = convertToLlm(messages);
   const llmMessages = declarations.blockImages ? withoutImages(converted) : converted;
   if (llmMessages.some((message) => message.role === "system")) return { context: { messages: llmMessages }, messages, providerRequest };
