@@ -52,7 +52,7 @@ pi install git:github.com/Criogaid/pi-codex-compaction
 
 V2 对一次完整的 SSE 请求及其响应收集进行有限重试，覆盖可确认的暂时 HTTP 错误、网络错误和有响应进展后提前结束的流。额外重试次数取 Pi 的 provider 重试设置与 2 的较小值；未设置时最多额外重试 2 次，总共最多 3 次请求，设置为 0 时不重试。每次重试使用同一份已准备的请求内容和同一后端，并重新通过 Pi 认证。
 
-V2 采用 Codex 0.172.0 的 `Retry-After` 秒数和 HTTP 日期格式，也接受优先级更高的 Pi `retry-after-ms`。普通 HTTP 429 和明确的容量故障需要有效建议才会重发。流内已知限流码先读建议头，再读限流文案中的等待时间。真正由 `content_filter` 导致的 `response.incomplete` 可退避重试。
+V2 采用 Codex 0.172.0 的 `Retry-After` 秒数和 HTTP 日期格式，也接受优先级更高的 Pi `retry-after-ms`。建议头仅接受可见 ASCII、空格和制表符。普通 HTTP 429 和明确的容量故障需要有效建议才会重发。流内已知限流码先读建议头，再读仅以 ASCII 空白为分隔的限流文案。HTTP 日期的等待不会因时钟采样间的暂停而缩短。真正由 `content_filter` 导致的 `response.incomplete` 可退避重试。
 
 V2 只凭明确的暂时故障证据重发。HTTP 状态白名单优先服从永久 `error.code` 的否决，包括 `usage_limit_reached` 和 `usage_not_included`。HTTP 429 另外检查 `error.type` 中的用量或额度限制。`response.failed` 错误字段类型无效时按协议错误处理，保留旧检查点。未知错误码和限流字样本身不构成暂时故障证据。Pi 的适配器会在独立 `error` 帧提前结束读取，Codex 可跳过未识别的独立错误。无效压缩结果、重复输出、取消操作和会话变化也会阻止重发。HTTP 重定向沿用 provider 和 fetch 的处理方式。
 

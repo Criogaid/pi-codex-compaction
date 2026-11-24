@@ -58,22 +58,33 @@ function httpDateMs(value: string): number | undefined {
   return year >= 1970 && year <= 9999 && date.toUTCString() === imf ? date.getTime() : undefined;
 }
 
-function retryDeadline(headers: unknown, receivedAt: bigint, wallTime: number): number | undefined {
+function sampleRetryClock() {
+  // A pause between samples must not shorten an HTTP-date wait.
+  const wallTime = Date.now();
+  return { wallTime, receivedAt: process.hrtime.bigint() };
+}
+
+function retryHeaderText(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return;
+  const text = String(value);
+  // Match Rust HeaderValue::to_str before trimming HTTP whitespace.
+  return /[^\t\x20-\x7e]/.test(text) ? undefined : text.replace(/^[\t ]+|[\t ]+$/g, "");
+}
+
+function retryDeadline(headers: unknown, { receivedAt, wallTime }: ReturnType<typeof sampleRetryClock>): number | undefined {
   let milliseconds: string | undefined;
   let seconds: string | undefined;
   if (headers instanceof Headers) {
-    milliseconds = headers.get("retry-after-ms")?.trim();
-    seconds = headers.get("retry-after")?.trim();
+    milliseconds = retryHeaderText(headers.get("retry-after-ms"));
+    seconds = retryHeaderText(headers.get("retry-after"));
   } else if (isObject(headers)) {
     for (const name of Object.keys(headers).sort()) {
       const value = headers[name];
-      if (typeof value !== "string" && typeof value !== "number") continue;
-      const text = String(value);
-      // Rust rejects illegal field bytes before interpreting SSE headers as retry advice.
-      if (/[^\t\x20-\x7e\x80-\xff]/.test(text)) continue;
+      const text = retryHeaderText(value);
+      if (text === undefined) continue;
       switch (name.toLowerCase()) {
-        case "retry-after-ms": milliseconds = text.trim(); break;
-        case "retry-after": seconds = text.trim(); break;
+        case "retry-after-ms": milliseconds = text; break;
+        case "retry-after": seconds = text; break;
       }
     }
   }
@@ -116,7 +127,7 @@ function networkFailure(error: unknown): boolean {
 }
 
 function rateLimitDeadline(message: string | null | undefined, receivedAt: bigint): number | undefined {
-  const match = message?.match(/try again in\s*(\d+(?:\.\d+)?)\s*(s|ms|seconds?)/i);
+  const match = message?.match(/try again in[\t\n\v\f\r ]*(\d+(?:\.\d+)?)[\t\n\v\f\r ]*(s|ms|seconds?)/i);
   if (!match) return undefined;
   const value = Number(match[1]);
   if (match[2].toLowerCase() === "ms") {
@@ -284,11 +295,10 @@ export class CompactionAttempt {
     const capacity = CAPACITY_CODES.has(code);
     const rateLimited = RATE_LIMIT_CODES.has(code);
     if (!capacity && (standaloneHeaders || (!rateLimited && code !== "server_error"))) return;
-    const receivedAt = process.hrtime.bigint();
-    const wallTime = Date.now();
-    const retryAt = retryDeadline(headers, receivedAt, wallTime) ??
-      (standaloneHeaders ? retryDeadline(standaloneHeaders.headers, receivedAt, wallTime)
-        : rateLimited ? rateLimitDeadline(message, receivedAt) : undefined);
+    const clock = sampleRetryClock();
+    const retryAt = retryDeadline(headers, clock) ??
+      (standaloneHeaders ? retryDeadline(standaloneHeaders.headers, clock)
+        : rateLimited ? rateLimitDeadline(message, clock.receivedAt) : undefined);
     this.failure = { retry: capacity ? retryAt : retryAt ?? "backoff" };
     return new Error(message ?? "Remote compaction failed temporarily (" + code + ")");
   }
@@ -317,7 +327,7 @@ export class CompactionAttempt {
   }
 
   observeResponse(response: Response, signal: AbortSignal, completed: () => boolean): Response {
-    const retryAt = response.ok ? undefined : retryDeadline(response.headers, process.hrtime.bigint(), Date.now());
+    const retryAt = response.ok ? undefined : retryDeadline(response.headers, sampleRetryClock());
     if (!response.body) {
       if (!response.ok) this.failure = httpFailure(response, retryAt, undefined);
       return response;
