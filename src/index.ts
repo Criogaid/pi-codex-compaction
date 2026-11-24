@@ -385,6 +385,7 @@ export function createCodexCompactionExtension(
     registerCompactionCommand(pi, compactionSettingsPath);
     const warnings = new Set<string>();
     const snapshots = new RequestSnapshotTracker();
+    let latestStatusToken: symbol | undefined;
     const warnOnce = (ctx: ExtensionContext, key: string, message: string) => {
       const scoped = `${ctx.sessionManager.getSessionId()}:${key}`;
       if (warnings.has(scoped)) return;
@@ -410,15 +411,21 @@ export function createCodexCompactionExtension(
     pi.on("session_before_compact", (event, ctx) => {
       const sessionId = ctx.sessionManager.getSessionId();
       const { signal } = event;
+      const statusToken = Symbol();
       const sameSession = () => ctx.sessionManager.getSessionId() === sessionId;
       const run: CompactionRun = {
         sessionId,
         signal,
         // A model switch leaves the run on its starting model, as in Pi's compaction.
         owned: () => !signal.aborted && sameSession(),
-        setStatus: (message) => ctx.ui.setStatus(STATUS_KEY, message),
+        setStatus: (message) => {
+          latestStatusToken = statusToken;
+          ctx.ui.setStatus(STATUS_KEY, message);
+        },
         clearStatus: () => {
-          if (sameSession()) ctx.ui.setStatus(STATUS_KEY, undefined);
+          if (latestStatusToken !== statusToken || !sameSession()) return;
+          latestStatusToken = undefined;
+          ctx.ui.setStatus(STATUS_KEY, undefined);
         },
       };
       return compactSession(pi, event, ctx, run, compactionSettingsPath, options.fetch, snapshots.current());
