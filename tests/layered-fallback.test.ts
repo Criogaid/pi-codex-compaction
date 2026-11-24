@@ -55,7 +55,15 @@ const dataFrame = (event: unknown) => `data: ${JSON.stringify(event)}\n\n`;
 const failedFrame = (code: string, fields: JsonObject = {}) => dataFrame({
   type: "response.failed", response: { status: "failed", error: { code, ...fields } },
 });
-const sseFailure = (frames: string) => new Response(frames, { headers: { "content-type": "text/event-stream" } });
+function sseFailure(...chunks: string[]) {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  }), { headers: { "content-type": "text/event-stream" } });
+}
 
 async function checkpointRetryOutcome(api: ResponsesApi, reply: () => Response) {
   let failRemote = false;
@@ -105,6 +113,10 @@ async function checkpointRetryOutcome(api: ResponsesApi, reply: () => Response) 
     assert.deepEqual(checkpointItems(replay), checkpoint);
     assert.equal(occurrences(replay.input, retained), 1);
     for (const marker of dropped) assert.equal(occurrences(replay.input, marker), cancelled ? 1 : 0);
+    for (const summary of summaries) {
+      const replyText = `Fixture reply ${fixture.requests.indexOf(summary) + 1}.`;
+      assert.equal(occurrences(replay.input, replyText), 1, "Replay the supplemental summary once");
+    }
     assert.deepEqual(fixture.errors, []);
     return { attempts: attempts.length, summaries: summaries.length };
   } finally {
@@ -121,28 +133,49 @@ async function checkCheckpointRetryCases(api: ResponsesApi, cases: readonly (rea
   assert.deepEqual(actual, cases.map(([name, , attempts, summaries]) => ({ name, attempts, summaries })));
 }
 
-test("real Responses adapters follow different terminal records after a named error containing progress",
-  { timeout: 30_000 }, async () => {
-    const reply = () => sseFailure(
-      `event: error\n${dataFrame({ type: "response.in_progress" })}${failedFrame("server_error")}`,
-    );
-    for (const [api, attempts, summaries] of [
-      ["openai-responses", 1, 0],
-      ["openai-codex-responses", 3, 1],
-    ] as const) {
-      await checkCheckpointRetryCases(api, [[api, reply, attempts, summaries]]);
-    }
-  });
+test("real Responses adapters distinguish terminal errors from skipped SSE records", { timeout: 30_000 }, async () => {
+  const namedError = () => sseFailure(
+    `event: error\n${dataFrame({ type: "response.in_progress" })}${failedFrame("server_error")}`,
+  );
+  const created = dataFrame({ type: "response.created", response: { id: "resp-fixture" } });
+  const emptyData = "data:\n\n";
+  const failure = failedFrame("server_error");
+  for (const [api, attempts, summaries] of [
+    ["openai-responses", 1, 0],
+    ["openai-codex-responses", 3, 1],
+  ] as const) {
+    await checkCheckpointRetryCases(api, [
+      [`${api}: named error containing progress`, namedError, attempts, summaries],
+      [`${api}: empty data in one chunk`, () => sseFailure(created + emptyData + failure), attempts, summaries],
+      [`${api}: empty data in split chunks`, () => sseFailure(created, emptyData, failure), attempts, summaries],
+      [`${api}: SSE comment`, () => sseFailure(created + ": ping\n\n" + failure), 3, 1],
+    ]);
+  }
+});
+
+const nonAsciiRetryAfter = "\u00a00\u00a0";
 
 for (const api of responsesApis) {
   test(`real ${api} keeps the checkpoint on quota and invalid V2 output`, { timeout: 30_000 }, async () => {
+    const capacityFailure = (fields: JsonObject) =>
+      sseFailure(failedFrame("server_is_overloaded", { message: "busy", ...fields }));
     await checkCheckpointRetryCases(api, [
       ["HTTP quota code overrides a transient type",
         () => httpFailure(503, { code: "insufficient_quota", type: "server_error" }, "0"), 1, 0],
       ["HTTP transient type without the quota code",
         () => httpFailure(503, { type: "server_error" }, "0"), 3, 1],
+      ["HTTP usage_not_included overrides 503", () => httpFailure(503, { code: "usage_not_included" }, "0"), 1, 0],
+      ["HTTP usage_limit_reached overrides 503", () => httpFailure(503, { code: "usage_limit_reached" }, "0"), 1, 0],
+      ["HTTP usage_not_included in code alone overrides 429 with advice",
+        () => httpFailure(429, { code: "usage_not_included" }, "0"), 1, 0],
+      ["HTTP model_not_found leaves 503 retryable", () => httpFailure(503, { code: "model_not_found" }, "0"), 3, 1],
       ["SSE capacity code with a numeric message",
         () => sseFailure(failedFrame("server_is_overloaded", { message: 42 })), 1, 0],
+      ["SSE capacity code with a numeric type", () => capacityFailure({ type: 42 }), 1, 0],
+      ["SSE capacity code with an object plan_type despite zero advice",
+        () => capacityFailure({ plan_type: {}, headers: { "retry-after": "0" } }), 1, 0],
+      ["SSE capacity code with a string resets_at", () => capacityFailure({ resets_at: "bogus" }), 1, 0],
+      ["SSE capacity code with an integer resets_at", () => capacityFailure({ resets_at: 1_700_000_000 }), 1, 1],
       ["Unknown SSE code with rate-limit prose",
         () => sseFailure(failedFrame("fixture_unknown", { message: "Rate limit. Please try again in 0.001s." })), 1, 0],
     ]);
@@ -156,6 +189,9 @@ for (const api of responsesApis) {
       ["SSE capacity with no advice", () => sseFailure(failedFrame("policy_capacity_unavailable")), 1, 1],
       ["SSE capacity with invalid header bytes",
         () => sseFailure(failedFrame("policy_capacity_unavailable", { headers: { "retry-after": "\u000b0\u000b" } })), 1, 1],
+      ["SSE capacity with NBSP around zero advice", () => sseFailure(failedFrame("policy_capacity_unavailable", {
+        headers: { "retry-after": nonAsciiRetryAfter },
+      })), 1, 1],
       ["SSE capacity with zero advice",
         () => sseFailure(failedFrame("policy_capacity_unavailable", { headers: { "retry-after": "0" } })), 3, 1],
     ]);
@@ -165,6 +201,11 @@ for (const api of responsesApis) {
     await checkCheckpointRetryCases(api, [
       ["No advice", () => httpFailure(429, { message: "Fixture rate limit" }), 1, 0],
       ["Zero advice", () => httpFailure(429, { message: "Fixture rate limit" }, "0"), 3, 1],
+      ["NBSP around zero advice", () => httpFailure(429, { message: "Fixture rate limit" }, nonAsciiRetryAfter), 1, 0],
+      ["Above-cap advice of 2^63 seconds",
+        () => httpFailure(429, { message: "Fixture rate limit" }, (2n ** 63n).toString()), 1, 1],
+      ["Above-cap advice of u64::MAX seconds",
+        () => httpFailure(429, { message: "Fixture rate limit" }, (2n ** 64n - 1n).toString()), 1, 1],
     ]);
   });
 
@@ -172,6 +213,10 @@ for (const api of responsesApis) {
     const message = "Please try again in 500ms.";
     await checkCheckpointRetryCases(api, [
       ["Above-cap message advice", () => sseFailure(failedFrame("rate_limit_exceeded", { message })), 1, 1],
+      ["NBSP in text ignores the above-cap advice and uses local backoff",
+        () => sseFailure(failedFrame("rate_limit_exceeded", { message: "try again in\u00a0500ms" })), 3, 1],
+      ["Vertical tab in text preserves the above-cap advice",
+        () => sseFailure(failedFrame("rate_limit_exceeded", { message: "try again in\u000b500ms" })), 1, 1],
       ["Zero header advice overrides the message", () => sseFailure(failedFrame("rate_limit_exceeded", {
         message, headers: { "retry-after": "0" },
       })), 3, 1],

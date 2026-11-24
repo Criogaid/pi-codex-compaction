@@ -3,8 +3,9 @@ import { test } from "node:test";
 import { once } from "node:events";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
+import { setImmediate as nextEventLoopTurn, setTimeout as delay } from "node:timers/promises";
 import { zstdDecompressSync } from "node:zlib";
 import type { Api, AuthResult, Context, Model, Provider, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
@@ -461,13 +462,24 @@ for (const api of responsesApis) {
     });
   }
 
-  test(`${api}: rejects a numeric message on a capacity failure as a protocol error`, async () => {
-    const f = await fixture(api);
-    await assert.rejects(requestRemoteCompaction({ ...f.request,
-      fetch: f.fetchReplies(() => sse([created, failedEvent("server_is_overloaded", 42, { "retry-after": "0" })])) }),
-    CodexCompactionProtocolError);
-    f.assertAttempts(1);
-  });
+  for (const [field, value, advice, error] of [
+    ["message", 42, "0", CodexCompactionProtocolError],
+    ["type", 42, undefined, CodexCompactionProtocolError],
+    ["plan_type", {}, "0", CodexCompactionProtocolError],
+    ["resets_at", "bogus", undefined, CodexCompactionProtocolError],
+    ["resets_at", 123, undefined, assertTransientWithCause],
+  ] as const) {
+    test(`${api}: classifies capacity failure with ${field}=${JSON.stringify(value)}`, async () => {
+      const f = await fixture(api);
+      const failure = { type: "response.failed", response: { status: "failed", error: {
+        code: "server_is_overloaded", message: "busy", [field]: value,
+        headers: advice === undefined ? undefined : { "retry-after": advice },
+      } } };
+      await assert.rejects(requestRemoteCompaction({ ...f.request,
+        fetch: f.fetchReplies(() => sse([created, failure])) }), error);
+      f.assertAttempts(1);
+    });
+  }
 
   test(`${api}: rate-limit wording cannot make an unknown response.failed code retryable`, async () => {
     const f = await fixture(api);
@@ -476,6 +488,22 @@ for (const api of responsesApis) {
     CodexCompactionProtocolError);
     f.assertAttempts(1);
   });
+
+  for (const [label, record, split] of [
+    ["empty data in one chunk", "data:\n\n", false],
+    ["empty data in split chunks", "data:\n\n", true],
+    ["a ping comment", ": ping\n\n", false],
+  ] as const) {
+    test(`${api}: handles ${label} before a transient SSE failure`, async () => {
+      const f = await fixture(api);
+      const chunks = [frames([created]), record, frames([failedEvent("server_error", "Fixture outage")])];
+      const sdkRejects = api === "openai-responses" && record.startsWith("data:");
+      await assert.rejects(requestRemoteCompaction({ ...f.request,
+        fetch: f.fetchReplies(() => chunkedSse(split ? chunks : [chunks.join("")])) }),
+      sdkRejects ? { constructor: Error } : assertTransientWithCause);
+      f.assertAttempts(sdkRejects ? 1 : 3);
+    });
+  }
 
   test(`${api}: applies the first terminal retry advice regardless of chunk boundaries`, async () => {
     for (const [firstAdvice, secondAdvice, attempts] of [["0", "60", 3], ["60", "0", 1]] as const) {
@@ -496,9 +524,9 @@ for (const api of responsesApis) {
   });
 
   test(`${api}: capacity failures require valid advice to resend but stay transient`, async () => {
-    for (const [advice, attempts] of [[undefined, 1], ["0", 3], ["\u000b0\u000b", 1]] as const) {
+    for (const [headers, attempts] of [[undefined, 1], [{ "retry-after-ms": "0" }, 3],
+      [{ "retry-after-ms": "\u000b0\u000b" }, 1], [{ "retry-after": "\u00a00\u00a0" }, 1]] as const) {
       const f = await fixture(api);
-      const headers = advice === undefined ? undefined : { "retry-after-ms": advice };
       await assert.rejects(requestRemoteCompaction({ ...f.request,
         fetch: f.fetchReplies(() => sse([created, failedEvent("server_is_overloaded", "Capacity failure", headers)])) }),
       assertTransientWithCause);
@@ -513,13 +541,17 @@ for (const api of responsesApis) {
     f.assertAttempts(3);
   });
 
-  test(`${api}: refuses documented rate-limit retry advice above the delay cap`, async () => {
-    const f = await fixture(api);
-    await assert.rejects(requestRemoteCompaction({ ...f.request,
-      fetch: f.fetchReplies(() => failed("rate_limit_exceeded", "Please try again in 500ms.")) }),
-    assertTransientWithCause);
-    f.assertAttempts(1);
-  });
+  for (const [label, whitespace, attempts] of [
+    ["a space", " ", 1], ["a vertical tab", "\u000b", 1], ["a non-breaking space", "\u00a0", 3],
+  ] as const) {
+    test(`${api}: rate-limit text with ${label} makes ${attempts} attempt(s) under a 1 ms wait cap`, async () => {
+      const f = await fixture(api);
+      await assert.rejects(requestRemoteCompaction({ ...f.request,
+        fetch: f.fetchReplies(() => failed("rate_limit_exceeded", `Please try again in${whitespace}500ms.`)) }),
+      assertTransientWithCause);
+      f.assertAttempts(attempts);
+    });
+  }
 
   for (const named of [false, true]) {
     test(`${api}: does not retry a standalone ${named ? "named SSE error" : "nested error"} followed by EOF`, async () => {
@@ -571,7 +603,7 @@ for (const api of responsesApis) {
   });
 
   test(`${api}: HTTP 429 needs valid advice to become retryable`, async () => {
-    for (const [advice, attempts] of [[{}, 1], [{ "retry-after": "0" }, 3],
+    for (const [advice, attempts] of [[{}, 1], [{ "retry-after": "0" }, 3], [{ "retry-after": "\u00a00\u00a0" }, 1],
       [{ "retry-after": "Thu, 01 Jan 1970 00:00:00 GMT" }, 3]] as const) {
       const f = await fixture(api);
       const reply = () => new Response("Fixture rate limit", { status: 429, headers: advice });
@@ -580,6 +612,33 @@ for (const api of responsesApis) {
       f.assertAttempts(attempts);
     }
   });
+
+  for (const [status, code, attempts] of [
+    [503, "usage_not_included", 1], [503, "usage_limit_reached", 1],
+    [429, "usage_not_included", 1], [503, "model_not_found", 3],
+  ] as const) {
+    test(`${api}: HTTP ${status} with code-only ${code} makes ${attempts} attempt(s)`, async () => {
+      const f = await fixture(api);
+      await assert.rejects(requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(() =>
+        new Response(JSON.stringify({ error: { code } }), {
+          status, headers: { "content-type": "application/json", "retry-after": "0" },
+        })) }), attempts === 1 ? { constructor: Error } : assertTransientWithCause);
+      f.assertAttempts(attempts);
+    });
+  }
+
+  for (const [label, seconds] of [["2^63", 1n << 63n], ["u64::MAX", (1n << 64n) - 1n]] as const) {
+    test(`${api}: a 429 with ${label} seconds of advice is transient even with a high monotonic clock`, async (t) => {
+      const f = await fixture(api);
+      // A high reading crosses the old Instant ceiling even on hosts with a wider range.
+      const nsPerSecond = 1_000_000_000n;
+      t.mock.method(process.hrtime, "bigint", () => ((1n << 63n) + 1n) * nsPerSecond);
+      await assert.rejects(requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(() =>
+        new Response("Fixture rate limit", { status: 429, headers: { "retry-after": String(seconds) } })) }),
+      assertTransientWithCause);
+      f.assertAttempts(1);
+    });
+  }
 
   test(`${api}: ignores a five-digit HTTP-date year and retries with backoff`, async () => {
     const f = await fixture(api);
@@ -680,6 +739,63 @@ for (const api of responsesApis) {
       f.assertAttempts(expected);
     }
   });
+
+  for (const source of ["HTTP header", "stream error"] as const) {
+    test(`${api}: ${source} HTTP-date advice survives a pause between clock samples`, { timeout: 2_000 }, async (t) => {
+      const f = await fixture(api);
+      const startMs = Date.UTC(2026, 0, 1);
+      const adviceMs = 1_000;
+      const pauseMs = 250;
+      const nsPerMs = 1_000_000n;
+      const retryAfter = new Date(startMs + adviceMs).toUTCString();
+      const reply = source === "HTTP header"
+        ? new Response("Fixture outage", { status: 503, headers: { "retry-after": retryAfter } })
+        : sse([created, failedEvent("server_is_overloaded", "Fixture outage", { "retry-after": retryAfter })]);
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      // The retry module imports the named timers/promises export.
+      syncBuiltinESMExports();
+      t.after(() => {
+        t.mock.timers.reset();
+        syncBuiltinESMExports();
+      });
+      let elapsedMs = 0;
+      let firstClock: "wall" | "monotonic" | undefined;
+      const samplingSite = source === "HTTP header" ? "observeResponse" : "observeFailure";
+      let paused = false;
+      const readClock = (clock: "wall" | "monotonic") => {
+        // The SDK also reads the wall clock after fetch resolves.
+        if (paused || !new Error().stack?.includes(samplingSite)) return;
+        if (firstClock === undefined) firstClock = clock;
+        else if (clock !== firstClock) {
+          elapsedMs += pauseMs;
+          paused = true;
+        }
+      };
+      t.mock.method(Date, "now", () => { readClock("wall"); return startMs + elapsedMs; });
+      t.mock.method(process.hrtime, "bigint", () => { readClock("monotonic"); return BigInt(elapsedMs) * nsPerMs; });
+      let resendAtMs: number | undefined;
+      const pending = requestRemoteCompaction({ ...f.request, maxRetryDelayMs: adviceMs,
+        fetch: f.fetchReplies((attempt) => {
+          if (attempt === 1) return reply;
+          resendAtMs = elapsedMs;
+          return success();
+        }),
+      });
+      await nextEventLoopTurn();
+      // Let any timer due before the server date fire before advancing past it.
+      const beforeDateMs = adviceMs - pauseMs - 1;
+      for (const stepMs of [beforeDateMs, adviceMs - beforeDateMs]) {
+        elapsedMs += stepMs;
+        t.mock.timers.tick(stepMs);
+        await nextEventLoopTurn();
+      }
+      await pending;
+      f.assertAttempts(2);
+      assert.ok(paused, "The fixture must inject a pause between retry clock samples");
+      assert.ok(resendAtMs !== undefined && resendAtMs >= adviceMs,
+        `Resent at ${resendAtMs} ms, server date is at ${adviceMs} ms`);
+    });
+  }
 
   test(`${api}: honors an allowed Retry-After header and retries HTTP 503`, async () => {
     const f = await fixture(api);
