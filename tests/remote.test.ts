@@ -27,7 +27,7 @@ function response() {
 }
 function request(modelRegistry: Awaited<ReturnType<typeof testRegistry>>) {
   return { modelRegistry, model, context: { messages: [{ role: "user" as const, content: "current", timestamp: 1 }] },
-    reasoning: "high" as const, sessionId: "session",
+    reasoning: "high" as const, reasoningEffortUpdates: false, sessionId: "session",
     signal: new AbortController().signal };
 }
 

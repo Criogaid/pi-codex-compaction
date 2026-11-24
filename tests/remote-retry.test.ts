@@ -99,7 +99,7 @@ async function fixture(api: ResponsesApi, resolve?: () => Promise<AuthResult | u
   const urls: string[] = [];
   let prepared = 0;
   const request: RemoteCompactionRequest = {
-    modelRegistry: registry, model, context, reasoning: "low", sessionId: "retry-session",
+    modelRegistry: registry, model, context, reasoning: "low", reasoningEffortUpdates: false, sessionId: "retry-session",
     signal: new AbortController().signal, maxRetryDelayMs: 1,
     onPrepared: () => { prepared += 1; },
   };

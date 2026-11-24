@@ -74,7 +74,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         return response();
       });
       await requestRemoteCompaction({
-        modelRegistry, model, context, reasoning, sessionId,
+        modelRegistry, model, context, reasoning, reasoningEffortUpdates: false, sessionId,
         signal: new AbortController().signal,
       });
       assert.ok(ordinaryPayload && typeof ordinaryPayload === "object");
@@ -127,7 +127,7 @@ test("V2 rewrites only the sent body, preserving Pi effort updates in the checkp
   const current = [...canonical, { ...assistant, content: [{ type: "text" as const, text: "reply" }], timestamp: 2 }];
   const request = compactionRequest(tracker.current(), sessionId, target, current, inputs, { blockImages: false, tools: () => [] });
   assert.ok(request.providerRequest?.prefix);
-  for (const reasoningEffortUpdates of [undefined, true]) {
+  for (const reasoningEffortUpdates of [false, true]) {
     const attempts: JsonObject[] = [];
     using _fetchScope = mockFetch(async (input, init) => {
       const request = new Request(input, init);
@@ -246,7 +246,7 @@ for (const path of ["matching prefix", "no snapshot", "settings mismatch", "serv
       using _fetchScope = mockFetch(async (input, init) => { sent = await new Request(input, init).json(); return response(); });
       await requestRemoteCompaction({
         modelRegistry: registry, model, context: request.context, providerRequest: request.providerRequest,
-        reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 0,
+        reasoning: "low", reasoningEffortUpdates: false, sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 0,
       });
       assert.ok(isObject(sent) && isObjectArray(sent.input));
       assert.equal(sent.service_tier, request.providerRequest ? "priority" : undefined);
@@ -318,7 +318,7 @@ test("V2 uses a fresh HTTP request with its feature header after an ordinary Web
       return response();
     });
     await requestRemoteCompaction({
-      modelRegistry, model, context, reasoning: "high", sessionId,
+      modelRegistry, model, context, reasoning: "high", reasoningEffortUpdates: false, sessionId,
       signal: AbortSignal.timeout(5_000),
     });
     assert.equal(httpRequests, 1);
