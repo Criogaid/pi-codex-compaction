@@ -274,22 +274,24 @@ export function createLayeredCheckpointDetails(prior: CodexCheckpointDetails, la
   return details;
 }
 
-/** Each conversation message's projection: itself, the marker at the summary, or nothing for retained messages. */
-function rangeProjection(
+// The range counts conversation messages, but system deltas keep their original slots in the request.
+function projectCheckpointRange(
   messages: readonly AgentMessage[],
-  details: CodexCheckpointDetails,
-): AgentMessage[][] | undefined {
-  const range = checkpointRange(messages, details);
-  return range && messages.map((message, index) => index === range.start
-    ? [markerMessage(details.checkpointId, message.timestamp)]
-    : index > range.start && index < range.end ? [] : [message]);
-}
-
-export function projectCheckpointContext(
-  messages: readonly AgentMessage[],
-  details: CodexCheckpointDetails,
-): AgentMessage[] | undefined {
-  return rangeProjection(messages, details)?.flat();
+  range: NonNullable<ReturnType<typeof checkpointRange>>,
+  checkpointId: string,
+): AgentMessage[] {
+  const projected: AgentMessage[] = [];
+  let index = 0;
+  for (const message of messages) {
+    if (message.role === "system") {
+      projected.push(message);
+      continue;
+    }
+    if (index === range.start) projected.push(markerMessage(checkpointId, message.timestamp));
+    else if (index < range.start || index >= range.end) projected.push(message);
+    index++;
+  }
+  return projected;
 }
 
 // Pi derives each request from the canonical transcript; request-local edits replace content, not provenance.
@@ -299,15 +301,6 @@ function provenance(message: AgentMessage): string {
     message.timestamp,
     message.role === "toolResult" ? message.toolCallId : message.role === "custom" ? message.customType : null,
   ]);
-}
-
-/**
- * Keep every system message where the request has it. Pi keeps mid-conversation prompt and tool updates in place
- * so they extend the cached prefix; folding them into the head would rewrite the prefix on each update.
- */
-function withSystemMessages(request: readonly AgentMessage[], projections: readonly (readonly AgentMessage[])[]): AgentMessage[] {
-  let index = 0;
-  return request.flatMap((message) => message.role === "system" ? [message] : projections[index++]);
 }
 
 /**
@@ -325,34 +318,42 @@ export function projectCheckpointTranscript(
   const source = withoutSystemMessages(canonical);
   const range = checkpointRange(source, details);
   if (!range) return undefined;
-  const conversation = withoutSystemMessages(request);
   // Unchanged retained messages keep the exact projection and its cached request prefix.
-  const exact = rangeProjection(conversation, details);
-  if (exact) return withSystemMessages(request, exact);
+  const exact = checkpointRange(withoutSystemMessages(request), details);
+  if (exact) return projectCheckpointRange(request, exact, details.checkpointId);
   const summary = provenance(source[range.start]);
   const available = new Map<string, boolean>();
   for (let i = range.start; i < range.end; i++) {
     const key = provenance(source[i]);
     available.set(key, !available.has(key));
   }
-  const live = new Set([...source.slice(0, range.start), ...source.slice(range.end)].map(provenance));
-  const projected: AgentMessage[][] = [];
+  const live = new Set<string>();
+  for (let index = 0; index < source.length; index++) {
+    if (index < range.start || index >= range.end) live.add(provenance(source[index]));
+  }
+  const projected: AgentMessage[] = [];
   let marked = false;
   let matchedSummary = false;
-  for (const message of conversation) {
+  for (const message of request) {
+    if (message.role === "system") {
+      projected.push(message);
+      continue;
+    }
     const key = provenance(message);
     const unique = available.get(key);
     if (unique === undefined) {
-      projected.push([message]);
+      projected.push(message);
       continue;
     }
     if (!unique || live.has(key)) return undefined;
     available.set(key, false);
     matchedSummary ||= key === summary;
-    projected.push(marked ? [] : [markerMessage(details.checkpointId, source[range.start].timestamp)]);
-    marked = true;
+    if (!marked) {
+      projected.push(markerMessage(details.checkpointId, source[range.start].timestamp));
+      marked = true;
+    }
   }
-  return matchedSummary ? withSystemMessages(request, projected) : undefined;
+  return matchedSummary ? projected : undefined;
 }
 
 /** Project a full transcript the way the `context_with_system` handler projects an unchanged request. */
@@ -360,8 +361,8 @@ export function projectCheckpointRequest(
   messages: readonly AgentMessage[],
   details: CodexCheckpointDetails,
 ): AgentMessage[] | undefined {
-  const projected = rangeProjection(withoutSystemMessages(messages), details);
-  return projected && withSystemMessages(messages, projected);
+  const range = checkpointRange(withoutSystemMessages(messages), details);
+  return range && projectCheckpointRange(messages, range, details.checkpointId);
 }
 
 export function createCheckpointDetails(input: {
