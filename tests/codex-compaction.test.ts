@@ -1068,6 +1068,8 @@ async function configureFallback(thinkingLevel = "high") {
 async function fallbackFixture(options: {
   currentModel?: Model<"openai-responses">;
   stopReason?: "stop" | "length" | "error" | "aborted";
+  firstResponse?: { stopReason: "error" | "aborted"; errorMessage?: string };
+  retry?: TestSettings["retry"];
   text?: string;
   onRequest?: () => void;
   auth?: boolean;
@@ -1089,6 +1091,9 @@ async function fallbackFixture(options: {
         try {
           await streamOptions?.onPayload?.({ model: requestModel.id, input: [] }, requestModel);
           calls.push({ model: configured, context: requestContext, options: streamOptions });
+          if (calls.length === 1 && options.firstResponse) {
+            ({ stopReason, errorMessage } = options.firstResponse);
+          }
           options.onRequest?.();
         } catch (error) {
           stopReason = "error";
@@ -1118,7 +1123,7 @@ async function fallbackFixture(options: {
   event.branchEntries = sessionManager.getBranch();
   event.preparation.firstKeptEntryId = firstKeptEntryId;
   event.preparation.messagesToSummarize = [{ role: "user", content: "older task", timestamp: 1 }];
-  const mock = mockPi("low", { transport: "sse", retry: { enabled: false } });
+  const mock = mockPi("low", { transport: "sse", retry: options.retry ?? { enabled: false } });
   createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
   const run = () => mock.events.get("session_before_compact")?.[0]?.(event, current.ctx) as Promise<SessionBeforeCompactResult | undefined>;
   return { ...current, mock, event, sessionManager, calls, run, remoteRequests: () => remoteRequests };
@@ -1493,11 +1498,16 @@ test("fallback off disables reasoning and forwards Pi provider runtime settings"
   assert.equal(options?.maxRetryDelayMs, 2345);
 });
 
-test("split-turn fallback uses Pi's two summary requests and combines usage", async () => {
-  await configureFallback();
-  const fixture = await fallbackFixture();
+async function splitTurnFallbackFixture(options?: Parameters<typeof fallbackFixture>[0]) {
+  const fixture = await fallbackFixture(options);
   fixture.event.preparation.isSplitTurn = true;
   fixture.event.preparation.turnPrefixMessages = [{ role: "user", content: "unfinished turn", timestamp: 3 }];
+  return fixture;
+}
+
+test("split-turn fallback uses Pi's two summary requests and combines usage", async () => {
+  await configureFallback();
+  const fixture = await splitTurnFallbackFixture();
   const result = await fixture.run();
   assert.ok(result?.compaction);
   assert.equal(result.compaction.summary.split("Keep working on the cache fix.").length - 1, 2);
@@ -1505,6 +1515,48 @@ test("split-turn fallback uses Pi's two summary requests and combines usage", as
   assert.equal(result.compaction.usage?.input, usage.input * 2);
   assert.equal(result.compaction.usage?.output, usage.output * 2);
   assert.ok(fixture.calls.every((call) => call.options?.reasoning === "high"));
+});
+
+for (const cancelSignal of [false, true]) {
+  const signalState = cancelSignal ? "an aborted" : "a live";
+  test(`split-turn fallback stops after a first-segment provider abort with ${signalState} signal`, async (t) => {
+    await configureFallback();
+    const controller = new AbortController();
+    const fixture = await splitTurnFallbackFixture({
+      firstResponse: { stopReason: "aborted" },
+      onRequest: () => { if (cancelSignal) controller.abort(); },
+    });
+    fixture.event.signal = controller.signal;
+    const streamSimple = t.mock.method(fixture.ctx.modelRegistry, "streamSimple");
+
+    assert.deepEqual(await fixture.run(), { cancel: true });
+    assert.equal(controller.signal.aborted, cancelSignal);
+    assert.deepEqual(fixture.mock.appendedEntries, []);
+    assert.equal(fixture.sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, 0);
+    assert.deepEqual(fixture.notifications.filter((notice) => notice.level !== "info").map((notice) => notice.level),
+      cancelSignal ? [] : ["error"]);
+    assert.equal(fixture.calls.length, 1, "only the first summary request should reach the model");
+    assert.equal(streamSimple.mock.callCount(), 1, "only the first summary request should be dispatched through the registry");
+    assert.match(JSON.stringify(fixture.calls[0].context.messages), /older task/);
+    assert.doesNotMatch(JSON.stringify(fixture.calls[0].context.messages), /unfinished turn/);
+  });
+}
+
+test("split-turn fallback retries a transient first-segment error before requesting the turn prefix", async () => {
+  await configureFallback();
+  const fixture = await splitTurnFallbackFixture({
+    firstResponse: { stopReason: "error", errorMessage: "HTTP 503 Service unavailable" },
+    retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 },
+  });
+
+  const result = await fixture.run();
+  assert.ok(result?.compaction);
+  assert.deepEqual(fixture.calls.map(({ context }) => JSON.stringify(context.messages).match(/older task|unfinished turn/g)), [
+    ["older task"],
+    ["older task"],
+    ["unfinished turn"],
+  ]);
+  assert.equal(result.compaction.usage?.input, usage.input * 2);
 });
 
 test("a provider abort without a cancelled signal does not become a fallback summary", async () => {
