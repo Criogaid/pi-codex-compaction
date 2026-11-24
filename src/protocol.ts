@@ -68,20 +68,19 @@ export interface CompactionCollector {
 }
 
 /**
- * Count only output-item completion events, as Codex does: a second one anywhere in the
- * attempt is rejected, and the final response must carry the one item.
+ * Count only output-item completion events. A successful terminal event ends collection,
+ * and the response that completed must already have supplied the one compaction item.
  */
 export function createCompactionCollector(): CompactionCollector {
   let outputs = 0;
   let item: JsonObject | undefined;
-  let completed = false;
+  let completedItem: JsonObject | undefined;
   return {
     observe(event) {
-      if (!isObject(event)) return;
+      if (completedItem || !isObject(event)) return;
       // A provider may restart its response when falling back from WebSocket to HTTP.
       if (event.type === "response.created") {
         item = undefined;
-        completed = false;
       }
       if (event.type === "response.output_item.done" && isObject(event.item) &&
           isCompactionType(event.item.type)) {
@@ -96,24 +95,24 @@ export function createCompactionCollector(): CompactionCollector {
         if (status !== "completed" && (event.type === "response.done" || status !== undefined)) {
           throw new CodexCompactionProtocolError("Remote compaction did not complete successfully");
         }
-        completed = true;
+        if (!item) {
+          throw new CodexCompactionProtocolError(
+            "Remote compaction returned 0 compaction output events; expected exactly one",
+          );
+        }
+        completedItem = item;
       }
       if (event.type === "response.failed" || event.type === "response.incomplete") {
         throw new CodexCompactionProtocolError("Remote compaction did not complete successfully");
       }
     },
     finish() {
-      if (!completed) {
+      if (!completedItem) {
         throw new CodexCompactionProtocolError(
           "Remote compaction stream ended without response.completed",
         );
       }
-      if (!item) {
-        throw new CodexCompactionProtocolError(
-          "Remote compaction returned 0 compaction output events; expected exactly one",
-        );
-      }
-      return item;
+      return completedItem;
     },
   };
 }
