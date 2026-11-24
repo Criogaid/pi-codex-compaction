@@ -59,6 +59,32 @@ test("lazy summary-model validation does not prevent preserving the invalid fiel
   });
 });
 
+for (const { name, selection, v2Enabled, effortEnabled } of [
+  { name: "V2", selection: { remoteCompactionEnabled: true }, v2Enabled: true, effortEnabled: true },
+  { name: "effort", selection: { reasoningEffortUpdatesEnabled: false }, v2Enabled: false, effortEnabled: false },
+]) {
+  test(`partial save of the ${name} switch preserves the other switch and invalid summary model`, async () => {
+    const invalid = { provider: "x" };
+    await writeSettings({
+      version: 2, remoteCompaction: { enabled: false }, reasoningEffortUpdates: { enabled: true }, summaryModel: invalid,
+    });
+    const settings = await loadCompactionSettings(settingsPath);
+    await settings.save(selection);
+    assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+      version: 2, remoteCompaction: { enabled: v2Enabled }, reasoningEffortUpdates: { enabled: effortEnabled }, summaryModel: invalid,
+    });
+  });
+}
+
+test("partial save rejects an intervening edit without overwriting it", async () => {
+  await writeSettings({ version: 2, reasoningEffortUpdates: { enabled: true } });
+  const stale = await loadCompactionSettings(settingsPath);
+  await writeSettings({ version: 2, reasoningEffortUpdates: { enabled: false } });
+  const intervening = await readFile(settingsPath, "utf8");
+  await assert.rejects(stale.save({ remoteCompactionEnabled: false }), /changed while the menu was open/);
+  assert.equal(await readFile(settingsPath, "utf8"), intervening);
+});
+
 for (const remoteCompactionEnabled of [true, false]) {
   test(`v2 switches and summary model round-trip with V2 enabled=${remoteCompactionEnabled}`, async () => {
     const reasoningEffortUpdatesEnabled = !remoteCompactionEnabled;
