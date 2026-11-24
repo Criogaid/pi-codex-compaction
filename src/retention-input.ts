@@ -7,7 +7,7 @@ import { SaxesParser } from "saxes";
 import { historyGroups, inputText, isUserItem, matchesMarkedText, trimWhiteSpace } from "./history-groups.js";
 import type { ImageEstimates } from "./image-budget.js";
 import { isObject, type JsonObject } from "./protocol.js";
-import type { RetentionInput } from "./retention.js";
+import type { RetainedMessage, RetentionInput } from "./retention.js";
 
 const CONTEXT_MARKERS: readonly (readonly [string, string])[] = [
   ["# AGENTS.md instructions", "</INSTRUCTIONS>"],
@@ -74,7 +74,7 @@ function hookPrompt(text: string): boolean {
   parser.write(text).close();
   return finished && !invalid && trimWhiteSpace(hookRunId).length > 0 && textFields === 1;
 }
-function isUserMessage(item: JsonObject): boolean {
+function isUserMessage(item: JsonObject): item is RetainedMessage {
   if (!isUserItem(item) || !Array.isArray(item.content)) return false;
   let hasContext = false;
   let hasHook = false;
@@ -113,10 +113,9 @@ export function contextUserItems(input: readonly JsonObject[], origins: readonly
 }
 
 // Pi prepends an expanded skill to the user's text; Codex keeps the skill as a separate contextual message.
-function withoutSkillBlocks(item: JsonObject): JsonObject | undefined {
-  if (!Array.isArray(item.content)) return item;
+function withoutSkillBlocks(item: RetainedMessage): RetainedMessage | undefined {
   let changed = false;
-  const content = item.content.flatMap((part: unknown) => {
+  const content = item.content.flatMap((part) => {
     if (!isObject(part) || part.type !== "input_text" || typeof part.text !== "string") return [part];
     const skill = parseSkillBlock(part.text);
     if (!skill) return [part];

@@ -11,8 +11,9 @@ const IMAGE_CLOSE_TAG = "</image>";
 const LOCAL_IMAGE_OPEN_PREFIX = "<image name=";
 
 type TextPart = JsonObject & { type: "input_text" | "output_text"; text: string };
+export type RetainedMessage = JsonObject & { readonly content: readonly unknown[] };
 export interface RetentionInput {
-  readonly groups: readonly HistoryGroup[];
+  readonly groups: readonly (HistoryGroup & { readonly source: RetainedMessage })[];
   readonly images: ImageEstimates;
 }
 function isTextPart(part: unknown): part is TextPart {
@@ -36,8 +37,7 @@ function textTokenCount(item: JsonObject): number {
     ? item.content.reduce((tokens: number, part: unknown) => tokens + (isTextPart(part) ? approximateTokenCount(part.text) : 0), 0)
     : 0;
 }
-function truncateTextMessage(item: JsonObject, maxTokens: number): JsonObject | undefined {
-  if (!Array.isArray(item.content)) return undefined;
+function truncateTextMessage(item: RetainedMessage, maxTokens: number): RetainedMessage | undefined {
   let remaining = maxTokens;
   const content: unknown[] = [];
   for (const part of item.content) {
@@ -50,8 +50,7 @@ function truncateTextMessage(item: JsonObject, maxTokens: number): JsonObject | 
   }
   return content.length ? { ...item, content } : undefined;
 }
-function truncateImageMessage(item: JsonObject, maxTokens: number, images: ImageEstimates): JsonObject | undefined {
-  if (!Array.isArray(item.content)) return undefined;
+function truncateImageMessage(item: RetainedMessage, maxTokens: number, images: ImageEstimates): RetainedMessage | undefined {
   const pending: unknown[] = [...item.content];
   const reversed: unknown[] = [];
   let remaining = maxTokens;
@@ -86,9 +85,8 @@ export function buildReplacementHistory({ groups, images }: RetentionInput, comp
   for (let index = groups.length - 1; index >= 0 && remaining > 0; index--) {
     const { source, notice } = groups[index];
     const noticeTokens = notice ? Math.max(1, textTokenCount(notice)) : 0;
-    const sourceTokens = Math.max(1, Array.isArray(source.content)
-      ? source.content.reduce((sum: number, part: unknown) => sum + partTokenCount(part, images), 0) : 0);
-    const hasImages = Array.isArray(source.content) && source.content.some(isInputImage);
+    const sourceTokens = Math.max(1, source.content.reduce<number>((sum, part) => sum + partTokenCount(part, images), 0));
+    const hasImages = source.content.some(isInputImage);
     if (sourceTokens + noticeTokens <= remaining) {
       if (notice) reversed.push(notice);
       reversed.push(source);
