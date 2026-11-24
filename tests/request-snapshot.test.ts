@@ -48,7 +48,6 @@ test("current returns live published snapshots and provider retries preserve the
   tracker.recordContext(sessionId, target, () => canonical);
   tracker.recordProjectedRequest(sessionId, target, () => canonical, () => undefined, projected, false);
   assert.deepEqual(live.context, undefined);
-  assert.deepEqual(live.promptOverride, undefined);
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt", noPayload);
   assert.equal(tracker.current(), live);
   const snapshot = tracker.current().context;
@@ -56,12 +55,11 @@ test("current returns live published snapshots and provider retries preserve the
   assert.deepEqual(snapshot.messages, projected);
   assert.notEqual(snapshot.messages, projected);
   assert.deepEqual(snapshot.sourceFingerprints, canonical.map(fingerprintMessage));
-  assert.deepEqual(live.promptOverride, { sessionId, identity: target.identity,
-    sourceFingerprint: fingerprintMessage(canonical[0]), text: "forced prompt" });
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => "retry prompt", noPayload);
   assert.equal(live.context, snapshot);
-  assert.equal(tracker.current().promptOverride?.text, "retry prompt");
   assert.equal(tracker.current(), live);
+  const request = compactionRequest(live, sessionId, target, canonical, inputs, declarationsInTranscript);
+  assert.deepEqual(request.context.messages, [system("retry prompt"), projected[1]]);
 });
 
 test("reset clears pending and published state without changing a previously returned view", () => {

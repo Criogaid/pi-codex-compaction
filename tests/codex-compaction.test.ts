@@ -915,7 +915,8 @@ test("compaction reuses the effective ordinary prompt after Pi clears its run ov
 });
 
 for (const change of ["system", "session-start", "session-id", "model"] as const) {
-  test(`compaction discards an ordinary prompt override after ${change} changes`, async () => {
+  test(change === "system" ? "compaction keeps an ordinary prompt override before new system instructions"
+    : `compaction discards an ordinary prompt override after ${change} changes`, async () => {
     const messages: SessionMessage[] = [
       { role: "system", content: "canonical prompt", timestamp: 0 },
       { role: "user", content: "request", timestamp: 1 },
@@ -929,7 +930,7 @@ for (const change of ["system", "session-start", "session-id", "model"] as const
       },
     });
     assert.ok(Array.isArray(result.payload.input));
-    const expected = change === "system" ? "canonical prompt\n\nnew instructions" : "canonical prompt";
+    const expected = change === "system" ? "per-run override\n\nnew instructions" : "canonical prompt";
     assert.deepEqual(result.payload.input[0], { role: "developer", content: expected });
   });
 }
