@@ -106,14 +106,13 @@ test("rejects identical duplicate output events as Codex does", () => {
 
 test("requires output_item.done and response.completed", () => {
   const missingItem = createCompactionCollector();
-  missingItem.observe(completed);
-  assert.throws(() => missingItem.finish(), CodexCompactionProtocolError);
+  assert.throws(() => missingItem.observe(completed), CodexCompactionProtocolError);
   const incomplete = createCompactionCollector();
   incomplete.observe(done);
   assert.throws(() => incomplete.finish(), CodexCompactionProtocolError);
 });
 
-test("accepts the compaction_summary alias and clears the selected item and completion on restart", () => {
+test("accepts the compaction_summary alias and clears the selected item only on a restart before completion", () => {
   const collector = createCompactionCollector();
   const alias = { ...item, type: "compaction_summary" };
   collector.observe({ ...done, item: alias });
@@ -122,12 +121,13 @@ test("accepts the compaction_summary alias and clears the selected item and comp
 
   const restart = { type: "response.created" };
   collector.observe(restart);
-  assert.throws(() => collector.finish(), {
-    name: CodexCompactionProtocolError.name,
-    message: "Remote compaction stream ended without response.completed",
-  });
   collector.observe({ ...completed, response: { output: [] } });
-  assert.throws(() => collector.finish(), {
+  assert.deepEqual(collector.finish(), item);
+
+  const abandoned = createCompactionCollector();
+  abandoned.observe(done);
+  abandoned.observe(restart);
+  assert.throws(() => abandoned.observe({ ...completed, response: { output: [] } }), {
     name: CodexCompactionProtocolError.name,
     message: "Remote compaction returned 0 compaction output events; expected exactly one",
   });
