@@ -132,7 +132,6 @@ interface CompactionRun {
   readonly signal: AbortSignal;
   owned(): boolean;
   setStatus(message: string): void;
-  clearStatus(): void;
 }
 
 type SummarizeWithPi = (
@@ -367,14 +366,10 @@ async function compactSession(
     });
   };
 
-  try {
-    if (!configuration.remoteCompactionEnabled || !supported) {
-      return await compactFallback(event, ctx, run, summarize, undefined);
-    }
-    return await compactRemotely(pi, event, ctx, run, supported, summarize, fetch, snapshots);
-  } finally {
-    run.clearStatus();
+  if (!configuration.remoteCompactionEnabled || !supported) {
+    return compactFallback(event, ctx, run, summarize, undefined);
   }
+  return compactRemotely(pi, event, ctx, run, supported, summarize, fetch, snapshots);
 }
 
 export function createCodexCompactionExtension(
@@ -385,7 +380,7 @@ export function createCodexCompactionExtension(
     registerCompactionCommand(pi, compactionSettingsPath);
     const warnings = new Set<string>();
     const snapshots = new RequestSnapshotTracker();
-    let latestStatusToken: symbol | undefined;
+    let latestRun = 0;
     const warnOnce = (ctx: ExtensionContext, key: string, message: string) => {
       const scoped = `${ctx.sessionManager.getSessionId()}:${key}`;
       if (warnings.has(scoped)) return;
@@ -408,27 +403,26 @@ export function createCodexCompactionExtension(
       snapshots.reset();
     });
 
-    pi.on("session_before_compact", (event, ctx) => {
+    pi.on("session_before_compact", async (event, ctx) => {
+      const runNumber = ++latestRun;
       const sessionId = ctx.sessionManager.getSessionId();
       const { signal } = event;
-      const statusToken = Symbol();
       const sameSession = () => ctx.sessionManager.getSessionId() === sessionId;
+      const ownsStatus = () => runNumber === latestRun && sameSession();
       const run: CompactionRun = {
         sessionId,
         signal,
         // A model switch leaves the run on its starting model, as in Pi's compaction.
         owned: () => !signal.aborted && sameSession(),
         setStatus: (message) => {
-          latestStatusToken = statusToken;
-          ctx.ui.setStatus(STATUS_KEY, message);
-        },
-        clearStatus: () => {
-          if (latestStatusToken !== statusToken || !sameSession()) return;
-          latestStatusToken = undefined;
-          ctx.ui.setStatus(STATUS_KEY, undefined);
+          if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, message);
         },
       };
-      return compactSession(pi, event, ctx, run, compactionSettingsPath, options.fetch, snapshots.current());
+      try {
+        return await compactSession(pi, event, ctx, run, compactionSettingsPath, options.fetch, snapshots.current());
+      } finally {
+        if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, undefined);
+      }
     });
 
     pi.on("session_compact", async (event, ctx) => {
