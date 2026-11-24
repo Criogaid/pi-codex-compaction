@@ -53,13 +53,6 @@ export function snapshotFor<T extends SnapshotScope>(
     sameBackend(snapshot.identity, target.identity) ? snapshot : undefined;
 }
 
-// Collapse source system state only for matching; the snapshot keeps Pi's actual projected transcript for sending.
-function requestSource(messages: readonly AgentMessage[]): AgentMessage[] {
-  const head = getCurrentSystemMessage(messages);
-  const conversation = withoutSystemMessages(messages);
-  return head ? [head, ...conversation] : conversation;
-}
-
 /** Compare Pi-visible content across persistence, which can change timestamps and custom-message metadata. */
 function contentFingerprints(messages: readonly AgentMessage[]): string[] {
   return convertToLlm([...messages]).filter((message) => message.role !== "system").map((message) =>
@@ -117,33 +110,47 @@ export function captureContextSnapshot(
   return {
     sessionId,
     identity: target.identity,
-    sourceFingerprints: requestSource(source).map(fingerprintMessage),
+    sourceFingerprints: source.map(fingerprintMessage),
     projectionOnlyFingerprints: projectionOnlyFingerprints(source, projected),
     messages: structuredClone(projected),
   };
 }
 
-function matchingSource(messages: readonly AgentMessage[], snapshot: Pick<SourceSnapshot, "sourceFingerprints">): AgentMessage[] | undefined {
-  const source = requestSource(messages);
-  return source.length < snapshot.sourceFingerprints.length || snapshot.sourceFingerprints.some(
-    (fingerprint, index) => fingerprintMessage(source[index]) !== fingerprint,
-  ) ? undefined : source;
+function matchesSourcePrefix(messages: readonly AgentMessage[], snapshot: SourceSnapshot): boolean {
+  return messages.length >= snapshot.sourceFingerprints.length && snapshot.sourceFingerprints.every(
+    (fingerprint, index) => fingerprintMessage(messages[index]) === fingerprint,
+  );
 }
 
-function matchingProjectionSource(messages: readonly AgentMessage[], snapshot: ProjectedSourceSnapshot): AgentMessage[] | undefined {
-  const source = matchingSource(messages, snapshot);
-  if (!source) return undefined;
+function matchingProjectionSuffix(messages: readonly AgentMessage[], snapshot: ProjectedSourceSnapshot): AgentMessage[] | undefined {
+  if (!matchesSourcePrefix(messages, snapshot)) return undefined;
   // A transient message may have been persisted after the request. Rebuilding is safer than guessing whether
   // the new entry is that message or an intentional repetition, which could duplicate or delete user content.
-  const suffix = source.slice(snapshot.sourceFingerprints.length);
+  const suffix = messages.slice(snapshot.sourceFingerprints.length);
   return snapshot.projectionOnlyFingerprints.size > 0 && contentFingerprints(suffix).some((key) =>
-    snapshot.projectionOnlyFingerprints.has(key)) ? undefined : source;
+    snapshot.projectionOnlyFingerprints.has(key)) ? undefined : suffix;
 }
 
 /** Reuse the projected request while its source is an unchanged prefix, then append newer messages. */
 export function reuseContextSnapshot(messages: AgentMessage[], snapshot: ContextSnapshot | undefined): AgentMessage[] {
-  const source = snapshot && matchingProjectionSource(messages, snapshot);
-  return source ? [...structuredClone(snapshot.messages), ...source.slice(snapshot.sourceFingerprints.length)] : messages;
+  const suffix = snapshot && matchingProjectionSuffix(messages, snapshot);
+  if (!snapshot || !suffix) return messages;
+  if (suffix.some((message) => message.role === "system")) {
+    const source = messages.slice(0, snapshot.sourceFingerprints.length).filter((message) => message.role === "system");
+    const observed = snapshot.messages.filter((message) => message.role === "system");
+    const sameLayout = source.length === observed.length && source.every((message, index) =>
+      fingerprintMessage(message) === fingerprintMessage(observed[index]));
+    // Pi can fold the transcript when a context handler replaces conversation messages. A single
+    // unchanged head carries no evidence of a fold, so keep new deltas in order in that case.
+    if (!sameLayout) {
+      const folded = observed.length === 1 && snapshot.messages[0] === observed[0] && getCurrentSystemMessage(source);
+      if (!folded || fingerprintMessage(folded) !== fingerprintMessage(observed[0])) return messages;
+      const head = getCurrentSystemMessage(messages);
+      if (!head) return messages;
+      return [head, ...structuredClone(snapshot.messages.slice(1)), ...withoutSystemMessages(suffix)];
+    }
+  }
+  return [...structuredClone(snapshot.messages), ...suffix];
 }
 
 /** Pi 0.99 applies per-run prompt overrides after context hooks by collapsing system messages into one head. */
@@ -326,7 +333,7 @@ export class RequestSnapshotTracker {
   /** `context`: bind to canonical history independently of earlier request-local transformations. */
   recordContext(sessionId: string, target: CapableModel | undefined, canonical: () => readonly AgentMessage[]): void {
     this.state.pendingSource = target ? { sessionId, identity: target.identity,
-      sourceFingerprints: requestSource(canonical()).map(fingerprintMessage) } : undefined;
+      sourceFingerprints: canonical().map(fingerprintMessage) } : undefined;
     this.state.pendingContext = undefined;
   }
 
@@ -344,8 +351,7 @@ export class RequestSnapshotTracker {
     this.state.pendingContext = undefined;
     if (!target || !pending) return;
     const messages = canonical();
-    const matched = matchingSource(messages, pending);
-    if (!matched || matched.length !== pending.sourceFingerprints.length) return;
+    if (messages.length !== pending.sourceFingerprints.length || !matchesSourcePrefix(messages, pending)) return;
     const prior = checkpoint();
     const source = prior ? projectCheckpointRequest(messages, prior) : messages;
     if (source) this.state.pendingContext = {
@@ -367,8 +373,10 @@ export class RequestSnapshotTracker {
     // Keep a valid pending snapshot for retries that do not run context hooks again. Any source change
     // invalidates that binding before publishing, including changes made by later context handlers.
     const pending = this.state.pendingContext;
-    const source = target && messages && pending && snapshotFor(pending.source, sessionId, target) && matchingSource(messages, pending.source);
-    if (!source || source.length !== pending?.source.sourceFingerprints.length) this.state.pendingContext = undefined;
+    if (!target || !messages || !pending || !snapshotFor(pending.source, sessionId, target) ||
+        messages.length !== pending.source.sourceFingerprints.length || !matchesSourcePrefix(messages, pending.source)) {
+      this.state.pendingContext = undefined;
+    }
     const matched = this.state.pendingContext;
     this.state.context = matched?.context;
     if (!matched || !target) return;
@@ -427,7 +435,10 @@ export function compactionRequest(
   const override = promptOverrideFor(snapshots.promptOverride, sessionId, target, current, inputs.systemPrompt);
   const effectiveInputs = override ? { ...inputs, systemPrompt: override.text } : inputs;
   const key = requestInputsKey(target, effectiveInputs);
-  const providerRequest = snapshot && matchingProjectionSource(current, snapshot) &&
+  const suffix = snapshot && matchingProjectionSuffix(current, snapshot);
+  // Responses resolves prompt and tool deltas against the whole transcript. Let Pi serialize it
+  // when a new system message could change items on either side of the wire splice.
+  const providerRequest = suffix && !suffix.some((message) => message.role === "system") &&
     (snapshot.inputsKey === key || snapshot.settledInputsKey === key) ? snapshot : undefined;
 
   const reused = reuseContextSnapshot(current, snapshotFor(snapshots.context, sessionId, target));
