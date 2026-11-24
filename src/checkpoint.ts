@@ -312,13 +312,13 @@ export function projectCheckpointTranscript(
   canonical: readonly AgentMessage[],
   details: CodexCheckpointDetails,
 ): AgentMessage[] | undefined {
+  const source = withoutSystemMessages(canonical);
+  const range = checkpointRange(source, details);
+  if (!range) return undefined;
   const conversation = withoutSystemMessages(request);
   // Unchanged retained messages keep the exact projection and its cached request prefix.
   const exact = projectCheckpointContext(conversation, details);
   if (exact) return withSystemHead(request, exact);
-  const source = withoutSystemMessages(canonical);
-  const range = checkpointRange(source, details);
-  if (!range) return undefined;
   const summary = provenance(source[range.start]);
   const compacted = new Set(source.slice(range.start, range.end).map(provenance));
   const live = new Set([...source.slice(0, range.start), ...source.slice(range.end)].map(provenance));

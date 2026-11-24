@@ -4,6 +4,7 @@ import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createCodexCompactionExtension } from "../src/index.js";
+import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, sessionFixture } from "./helpers.js";
 
@@ -83,4 +84,48 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
           "Load order must not change the V2 request");
       });
   }
+
+  test(`${api} skips checkpoint replay when a context hook restores a canonically edited message`,
+    { timeout: 30_000 }, async () => {
+      const originalText = `Original retained message. ${"Keep the decisions. ".repeat(80)}`;
+      const editedText = "Saved edit to the retained message.";
+      const continuation = "Continue after the saved edit.";
+      let editedEntryId: string | undefined;
+      const restoreOriginal: ExtensionFactory = (pi) => void pi.on("context", (event, ctx) => {
+        if (editedEntryId === undefined) return;
+        const entry = ctx.sessionManager.getEntry(editedEntryId);
+        assert.ok(entry?.type === "message" && entry.message.role === "user");
+        const original = entry.message;
+        const edited = event.messages.find((message) => message.role === "user" && message.timestamp === original.timestamp);
+        assert.deepEqual(edited, { ...original, content: editedText }, "Pi supplies the saved edit to the context hook");
+        return { messages: event.messages.map((message) => message === edited ? original : message) };
+      });
+      const fixture = await sessionFixture({ api, extensions: [createCodexCompactionExtension(), restoreOriginal] });
+      try {
+        await fixture.session.prompt("Start the task.");
+        await fixture.session.prompt("Work on the first decision.");
+        await fixture.session.prompt(originalText);
+        const { firstKeptEntryId, details } = await fixture.session.compact();
+        assert.ok(parseCheckpointDetails(details), "Pi creates a valid V2 checkpoint");
+        const { sessionManager } = fixture.session;
+        const kept = sessionManager.getEntry(firstKeptEntryId);
+        assert.ok(kept?.type === "message" && kept.message.role === "user");
+        assert.deepEqual(kept.message.content, [{ type: "text", text: originalText }]);
+        sessionManager.appendContextEdit(firstKeptEntryId, { content: editedText });
+        editedEntryId = firstKeptEntryId;
+
+        await fixture.session.prompt(continuation);
+        assert.deepEqual(fixture.errors, []);
+        const payload = fixture.requests.at(-1)?.payload;
+        assert.ok(payload && Array.isArray(payload.input));
+        const input = JSON.stringify(payload.input);
+        assert.ok(!input.includes("PI_CODEX_REMOTE_CHECKPOINT"), "The private checkpoint marker stays off the wire");
+        assert.ok(input.includes(continuation), "The new user turn remains in the ordinary input");
+        assert.deepEqual(payload.input.filter((item) => isObject(item) && item.type === "compaction"), [],
+          "A request-local restoration must not replay opaque history after a saved context edit");
+        assert.ok(input.includes(originalText), "The request-local restoration remains in the ordinary input");
+      } finally {
+        await fixture.close();
+      }
+    });
 }
