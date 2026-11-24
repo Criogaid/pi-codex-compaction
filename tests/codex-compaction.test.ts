@@ -1003,6 +1003,20 @@ test("falls back to text classification when a provider inserts an extra user it
   ]);
 });
 
+test("excludes string-form provider user content from the V2 checkpoint", async () => {
+  const ordinary = { role: "user", content: [{ type: "input_text", text: "request" }] };
+  const stringForm = { role: "user", content: "provider string content" };
+  const result = await providerCompaction([{ role: "user", content: "request", timestamp: 1 }], {
+    adaptPayload(payload) {
+      assert.ok(Array.isArray(payload.input));
+      return { ...payload, input: [...payload.input, stringForm] };
+    },
+  });
+  assert.ok(Array.isArray(result.payload.input));
+  assert.deepEqual(result.payload.input.filter((item: unknown) => isObject(item) && item.role === "user"), [ordinary, stringForm]);
+  assert.deepEqual(result.details.replacementHistory, [ordinary, { type: "compaction", encrypted_content: "opaque" }]);
+});
+
 test("warns about failed projection once per session and checkpoint and resets on session start", async () => {
   const mock = mockPi();
   createCodexCompactionExtension()(mock.pi);
