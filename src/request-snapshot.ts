@@ -40,7 +40,6 @@ export interface ContextSnapshot extends ProjectedSourceSnapshot {
 
 interface PromptOverride {
   readonly text: string;
-  /** A differing prompt can expire when the current prompt matches neither text. */
   readonly sourcePrompt?: string;
 }
 
@@ -377,14 +376,12 @@ export class RequestSnapshotTracker {
       this.state.context = undefined;
       return;
     }
-    const prompt = systemPrompt();
-    const head = getCurrentSystemMessage(messages);
-    const sourcePrompt = head && getSystemMessageText(head);
     const run = this.runPrompt;
     const forced = run?.sessionId === sessionId && "forced" in run ? run.forced : undefined;
-    this.state.promptOverride = sourcePrompt !== undefined && sourcePrompt !== prompt
-      ? { text: prompt, sourcePrompt }
-      : forced === prompt && (head || forced === "") ? { text: forced } : undefined;
+    if (forced !== undefined && forced === systemPrompt()) {
+      const head = getCurrentSystemMessage(messages);
+      this.state.promptOverride = { text: forced, sourcePrompt: head && getSystemMessageText(head) };
+    }
     this.state.context = matched.context;
     const { payload, inputs, replay } = observation();
     const replayMissing = replay !== "applied" && (matched.requiresReplay || replay === "failed");
@@ -441,12 +438,12 @@ export function compactionRequest(
   const contextSnapshot = snapshotFor(snapshots.context, sessionId, target);
   const contextSuffix = contextSnapshot && matchingProjectionSuffix(current, contextSnapshot);
   const sampled = contextSuffix && snapshots.promptOverride;
-  const forced = sampled && (sampled.sourcePrompt === undefined || inputs.systemPrompt === sampled.sourcePrompt ||
-    inputs.systemPrompt === sampled.text) ? sampled.text : undefined;
+  const forced = sampled && (inputs.systemPrompt === sampled.text || inputs.systemPrompt === sampled.sourcePrompt)
+    ? sampled.text : undefined;
   const reused = reuseContextSnapshot(current, contextSnapshot, contextSuffix, forced);
 
   const snapshot = snapshotFor(snapshots.providerRequest, sessionId, target);
-  const effectiveInputs = forced !== undefined && sampled?.sourcePrompt !== undefined
+  const effectiveInputs = forced !== undefined && forced !== inputs.systemPrompt
     ? { ...inputs, systemPrompt: forced } : inputs;
   const key = requestInputsKey(target, effectiveInputs);
   const suffix = snapshot && matchingProjectionSuffix(current, snapshot);
