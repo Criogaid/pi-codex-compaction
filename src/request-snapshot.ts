@@ -1,5 +1,5 @@
 // Own ordinary-request prompt and context snapshots that let compaction reuse Pi's projected request prefix,
-// and build compaction's provider context the way Pi 0.99 builds an ordinary request.
+// and build compaction's provider context using Pi's transcript model.
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, getSystemMessageText, type Context, type Message, type SystemMessage, type Tool } from "@earendil-works/pi-ai";
@@ -10,11 +10,11 @@ import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, type CompactionPayloa
 import { contextUserItems, userItemOrigins } from "./retention-input.js";
 
 /**
- * In Pi 0.99.1 and 1.0.4 these settings affect presentation, not provider inputs. Every other setting,
- * including unknown future ones, stays in the reuse key, so changing it drops the wire snapshot.
+ * These Pi 1.5.0 settings affect presentation, so their changes preserve the wire snapshot.
+ * The reuse key includes all other settings, including unknown keys.
  */
 const INTERFACE_ONLY_SETTINGS: ReadonlySet<string> = new Set([
-  "autocompleteMaxVisible", "collapseChangelog", "doubleEscapeAction", "editorPaddingX", "externalEditor",
+  "autocompleteMaxVisible", "collapseChangelog", "doubleEscapeAction", "editorPaddingX", "extensionChangelogVersions", "externalEditor",
   "fullscreenCopyOnSelect", "fullscreenExitOutput", "fullscreenScrollbar", "fullscreenWheelScrollLines",
   "hideThinkingBlock", "lastChangelogVersion", "markdown", "outputPad", "quietStartup", "showCacheMissNotices",
   "showHardwareCursor", "terminal", "theme", "treeFilterMode", "tuiMode", "warnings",
@@ -413,7 +413,7 @@ interface RequestDeclarations {
   readonly tools: () => Tool[];
 }
 
-// Mirror Pi 0.99's request-time image blocking, including its deduplicated placeholders.
+// Match the SDK's request-time image blocking, including its deduplicated placeholders.
 function withoutImages(messages: Message[]): Message[] {
   return messages.map((message) => {
     if ((message.role !== "user" && message.role !== "toolResult") || !Array.isArray(message.content) ||
