@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import type { Api, Model, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import {
   SessionManager,
   buildSessionProjection,
@@ -9,7 +9,7 @@ import {
   type CompactionEntry,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import type { ProviderIdentity } from "../src/capability.js";
+import { capableModel, type ProviderIdentity } from "../src/capability.js";
 import {
   createCheckpointDetails,
   fallbackSummary,
@@ -74,6 +74,35 @@ test("persists and validates the complete provider endpoint identity", () => {
   assert.doesNotMatch(JSON.stringify(details), /authorization|apiKey|token/i);
 });
 
+test("rejects bare query and fragment separators in configured and persisted checkpoint endpoints", () => {
+  const details = checkpoint();
+  const model: Model<Api> = {
+    id: identity.modelId,
+    name: "Fixture",
+    api: identity.api,
+    provider: identity.provider,
+    baseUrl: identity.baseUrl,
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 100_000,
+    maxTokens: 10_000,
+  };
+  const configuredModel = (endpoint: string) => ({
+    ...model,
+    compat: { ...model.compat, supportsStore: false, remoteCompaction: { protocol: "v2", endpoint } },
+  });
+  assert.equal(capableModel(configuredModel(identity.endpoint))?.identity.endpoint, identity.endpoint);
+  assert.deepEqual(parseCheckpointDetails(details), details);
+
+  const accepted: string[] = [];
+  for (const separator of ["?", "#"]) {
+    const endpoint = `${identity.endpoint}${separator}`;
+    if (capableModel(configuredModel(endpoint)) !== undefined) accepted.push(`eligibility accepted ${endpoint}`);
+    if (parseCheckpointDetails({ ...details, endpoint }) !== undefined) accepted.push(`checkpoint parser accepted ${endpoint}`);
+  }
+  assert.deepEqual(accepted, []);
+});
 
 test("projects exact retained messages for resume and rejects corrupt state", () => {
   const kept = user("kept", 2);
@@ -126,6 +155,17 @@ test("traces request-local edits of retained messages to one marker without movi
   assert.deepEqual(projected.slice(2), [note, request[5], after[1]]);
   const pruned = projectCheckpointTranscript([summary, ...after], canonical, details);
   assert.deepEqual(pruned?.slice(1), after, "removed retained messages need no marker of their own");
+});
+
+test("skips request projection when a rewrite and insertion share one retained message's provenance", () => {
+  const kept = user("kept", 2);
+  const { details, canonical } = transcript([kept], [user("after", 6)]);
+  const rewritten = user("rewritten retained message", kept.timestamp);
+  const inserted = user("new request-local message", kept.timestamp);
+  const request = canonical.flatMap((message) => message === kept ? [rewritten, inserted] : [message]);
+
+  assert.equal(projectCheckpointTranscript(request, canonical, details), undefined,
+    "Pi must keep its request, including the inserted message, when checkpoint replay is ambiguous");
 });
 
 test("skips request projection without the summary, with ambiguous provenance, or with changed canonical history", () => {

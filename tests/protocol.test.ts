@@ -17,6 +17,17 @@ test("counts one completed output item without counting response.output twice", 
   assert.deepEqual(collector.finish(), item);
 });
 
+test("rejects a compaction output item that arrives after response.completed", () => {
+  const collector = createCompactionCollector();
+  collector.observe({ type: "response.created" });
+
+  assert.throws(() => {
+    collector.observe(completed);
+    collector.observe(done);
+    collector.finish();
+  }, CodexCompactionProtocolError);
+});
+
 test("accepts the raw successful Codex response.done alias", () => {
   const collector = createCompactionCollector();
   collector.observe(done);

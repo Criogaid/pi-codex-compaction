@@ -27,7 +27,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, parseCheckpointDetails } from "../src/checkpoint.js";
 import { createCodexCompactionExtension } from "../src/index.js";
-import { isolateAgentConfig, testRegistry } from "./helpers.js";
+import { isolateAgentConfig, sessionFixture, testRegistry } from "./helpers.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 
 const fallbackSettingsPath = join(isolateAgentConfig(), "extensions", "pi-codex-compaction", "config.json");
@@ -446,6 +446,59 @@ test("creates and resumes a checkpoint for a configured custom provider", async 
   }, replay.ctx) as { input: Array<Record<string, unknown>> };
   assert.equal(rewritten.input.at(-2)?.type, "compaction");
   assert.match(JSON.stringify(rewritten.input.at(-1)), /later/);
+});
+
+test("V2 rebuilds history when an earlier provider hook removes the checkpoint marker", { timeout: 20_000 }, async () => {
+  const wireOnlyText = "Ordinary-only replacement for the removed marker";
+  let marker: string | undefined;
+  let removedMarkers = 0;
+  const fixture = await sessionFixture({ extensions: [
+    (pi) => pi.on("before_provider_request", ({ payload }) => {
+      const activeMarker = marker;
+      if (!activeMarker || !isObject(payload) || !Array.isArray(payload.input)) return;
+      return { ...payload, input: payload.input.map((item: unknown) => {
+        if (!isObject(item) || !JSON.stringify(item).includes(activeMarker)) return item;
+        removedMarkers++;
+        return { role: "user", content: [{ type: "input_text", text: wireOnlyText }] };
+      }) };
+    }),
+    createCodexCompactionExtension(),
+  ] });
+  try {
+    for (let turn = 1; turn <= 3; turn++) {
+      await fixture.session.prompt(`Task ${turn}: ${"Preserve the agreed implementation constraints. ".repeat(60)}`);
+    }
+    const first = await fixture.session.compact();
+    const checkpoint = parseCheckpointDetails(first.details);
+    assert.ok(checkpoint);
+    marker = checkpointMarker(checkpoint.checkpointId);
+    const opaque = checkpoint.replacementHistory.filter((item) => item.type === "compaction");
+    assert.equal(opaque.length, 1);
+
+    const continuation = "Continue the task after the first compaction.";
+    await fixture.session.prompt(continuation.repeat(40));
+    assert.equal(removedMarkers, 1, "The earlier hook must remove the ordinary request's marker");
+    const ordinary = fixture.requests.at(-1)?.payload;
+    assert.ok(ordinary && Array.isArray(ordinary.input));
+    assert.ok(JSON.stringify(ordinary.input).includes(wireOnlyText));
+    assert.ok(!JSON.stringify(ordinary.input).includes(marker));
+
+    const beforeV2 = fixture.requests.length;
+    const [outcome] = await Promise.allSettled([fixture.session.compact()]);
+    const sent = fixture.requests.slice(beforeV2);
+    assert.equal(sent.length, 1, "V2 must send exactly one request");
+    if (outcome.status === "rejected") throw outcome.reason;
+    const { input } = sent[0].payload;
+    assert.ok(Array.isArray(input));
+    assert.deepEqual(input.filter((item) => isObject(item) && item.type === "compaction"), opaque);
+    assert.deepEqual(input.at(-1), { type: "compaction_trigger" });
+    const history = JSON.stringify(input);
+    assert.ok(history.includes(continuation));
+    assert.ok(!history.includes(wireOnlyText));
+    assert.doesNotMatch(history, /PI_CODEX_(?:REMOTE_CHECKPOINT|REQUEST_BOUNDARY)/);
+  } finally {
+    await fixture.close();
+  }
 });
 
 test("provider switches do not replay opaque history", async () => {
@@ -1354,6 +1407,53 @@ test("reload shutdown cancels a failed V2 request over an opaque checkpoint with
   assert.equal(calls.length, 0);
   assert.deepEqual(sessionManager.getBranch(), originalBranch);
   assert.deepEqual(await pending, { cancel: true });
+});
+
+test("reload shutdown cancels a queued compaction before reading its stale context", async () => {
+  const mock = mockPi();
+  const entered = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  mock.pi.on("session_before_compact", async () => {
+    entered.resolve();
+    await resume.promise;
+  });
+  let requests = 0;
+  createCodexCompactionExtension({ fetch: async () => {
+    requests++;
+    return sseResponse();
+  } })(mock.pi);
+
+  const { ctx } = await context();
+  let stale = false;
+  const staleReads: PropertyKey[] = [];
+  const guardedCtx = new Proxy(ctx, {
+    get(target, key, receiver) {
+      if (stale) {
+        staleReads.push(key);
+        throw new Error("This extension ctx is stale after reload");
+      }
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const handlers = mock.events.get("session_before_compact");
+  const shutdown = mock.events.get("session_shutdown")?.[0];
+  assert.ok(handlers?.length === 2 && shutdown);
+  const [earlier, compact] = handlers;
+  const event = compactEvent();
+  const pending = (async () => {
+    await earlier(event, guardedCtx);
+    return compact(event, guardedCtx);
+  })();
+  try {
+    await entered.promise;
+    await shutdown({ type: "session_shutdown", reason: "reload" }, guardedCtx);
+    stale = true;
+  } finally {
+    resume.resolve();
+  }
+  assert.deepEqual(await pending, { cancel: true });
+  assert.deepEqual(staleReads, []);
+  assert.equal(requests, 0);
 });
 
 test("successful remote compaction does not validate an unused malformed fallback section", async () => {
