@@ -67,9 +67,10 @@ export function validateCompactionItem(
 
 /** Pi exposes raw Codex events before mapping its response.done alias to a Responses terminal event. */
 export function normalizeCompactionEvent(api: Api, event: unknown): unknown {
-  if (api !== CODEX_API || !isObject(event) || event.type !== "response.done") return event;
-  const completed = isObject(event.response) && event.response.status === "completed";
-  return { ...event, type: completed ? "response.completed" : "response.incomplete" };
+  if (api !== CODEX_API || !isObject(event) || event.type !== "response.done" ||
+      !isObject(event.response) || event.response.status !== "completed") return event;
+  // An unsuccessful alias stays raw: it is not a real response.incomplete for retry classification.
+  return { ...event, type: "response.completed" };
 }
 
 export interface CompactionCollector {
