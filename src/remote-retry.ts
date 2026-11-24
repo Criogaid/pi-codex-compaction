@@ -245,16 +245,21 @@ export class CompactionAttempt {
     const sse = response.ok ? new SseEvidenceObserver(this, api) : undefined;
     let errorBody = "";
     let errorBodyTooLarge = false;
+    let chunk: Uint8Array | undefined;
+    let offset = 0;
     let closed = false;
     let abort: () => void;
-    const cleanup = () => { closed = true; signal.removeEventListener("abort", abort); };
-    const cancelSource = async (reason?: unknown) => {
+    const cleanup = () => {
+      closed = true;
+      chunk = undefined;
+      signal.removeEventListener("abort", abort);
+    };
+    const cancelSource = (reason?: unknown) => {
       cleanup();
-      try {
-        await reader.cancel(reason);
-      } finally {
-        reader.releaseLock();
-      }
+      // A tee peer can keep cancellation pending after this consumer has stopped.
+      // The wrapper already delivered its outcome, so observe and ignore a later cancellation error.
+      void reader.cancel(reason).catch(() => {});
+      reader.releaseLock();
     };
     const inspectErrorBody = (text: string) => {
       if (errorBodyTooLarge) return;
@@ -264,15 +269,12 @@ export class CompactionAttempt {
         this.blockRetry();
       } else errorBody += text;
     };
-    let chunk: Uint8Array | undefined;
-    let offset = 0;
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         abort = () => {
           if (closed) return;
           controller.error(signal.reason);
-          // Cancellation of the source cannot change the abort already delivered to the consumer.
-          void cancelSource(signal.reason).catch(() => {});
+          cancelSource(signal.reason);
         };
         signal.addEventListener("abort", abort, { once: true });
         if (signal.aborted) abort();
@@ -281,8 +283,7 @@ export class CompactionAttempt {
         try {
           if (sse && completed()) {
             controller.close();
-            // The adapter has processed completion. Source cleanup cannot change that result.
-            void cancelSource().catch(() => {});
+            cancelSource();
             return;
           }
           if (!chunk) {
@@ -325,7 +326,7 @@ export class CompactionAttempt {
       },
       cancel(reason) {
         if (closed) return;
-        return cancelSource(reason);
+        cancelSource(reason);
       },
     }, { highWaterMark: 0 });
     return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
