@@ -159,7 +159,7 @@ async function chooseSummaryModel(ctx: ExtensionCommandContext): Promise<{ reado
 async function configureCompaction(
   path: string,
   ctx: ExtensionCommandContext,
-  onReasoningEffortUpdatesChange: (enabled: boolean) => void,
+  onReasoningEffortUpdatesSaved: (enabled: boolean) => void,
 ): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify(`/${COMMAND_NAME} requires interactive or RPC mode; edit ${path} directly.`, "warning");
@@ -181,6 +181,7 @@ async function configureCompaction(
       const choice = await chooseSummaryModel(ctx);
       if (choice !== undefined) {
         await settings.save({ ...switches, summaryModel: choice.value });
+        onReasoningEffortUpdatesSaved(switches.reasoningEffortUpdatesEnabled);
         ctx.ui.notify(describeSummaryModel(choice.value), "info");
       }
     } else {
@@ -188,7 +189,7 @@ async function configureCompaction(
       const enabled = !switches[field];
       // Omitting summaryModel keeps the file's value as written, including one that fails validation.
       await settings.save({ ...switches, [field]: enabled });
-      if (action === "effort") onReasoningEffortUpdatesChange(enabled);
+      onReasoningEffortUpdatesSaved(action === "effort" ? enabled : switches.reasoningEffortUpdatesEnabled);
       ctx.ui.notify(enabled ? on : off, "info");
     }
     // TUI keeps the same row selected so repeated Enter presses toggle in place.
@@ -199,14 +200,14 @@ async function configureCompaction(
 export function registerCompactionCommand(
   pi: ExtensionAPI,
   path: string,
-  onReasoningEffortUpdatesChange: (enabled: boolean) => void,
+  onReasoningEffortUpdatesSaved: (enabled: boolean) => void,
 ): void {
   pi.registerCommand(COMMAND_NAME, {
     description: "Configure V2, reasoning effort updates, and summary model settings",
     handler: async (args, ctx) => {
       try {
         if (args.trim()) throw new Error(`Usage: /${COMMAND_NAME}`);
-        await configureCompaction(path, ctx, onReasoningEffortUpdatesChange);
+        await configureCompaction(path, ctx, onReasoningEffortUpdatesSaved);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : "Could not configure compaction settings", "error");
       }

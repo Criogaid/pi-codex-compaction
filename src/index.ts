@@ -325,9 +325,17 @@ async function compactRemotely(
 
 export default function codexCompaction(pi: ExtensionAPI): void {
   const compactionSettingsPath = resolve(getAgentDir(), COMPACTION_SETTINGS_RELATIVE_PATH);
-  // Ordinary requests read the switch from the latest settings this process loaded or saved.
-  let reasoningEffortUpdates = DEFAULT_REASONING_EFFORT_UPDATES_ENABLED;
-  registerCompactionCommand(pi, compactionSettingsPath, (enabled) => { reasoningEffortUpdates = enabled; });
+  let reasoningEffortUpdates: Promise<boolean> | undefined;
+  const readReasoningEffortUpdates = async (ctx: ExtensionContext): Promise<boolean> => {
+    try {
+      return (await loadCompactionSettings(compactionSettingsPath)).configuration.reasoningEffortUpdatesEnabled;
+    } catch (error) {
+      if (ctx.hasUI) ctx.ui.notify(`Could not read compaction settings; Codex reasoning effort updates are Off. ${errorMessage(error)}`, "warning");
+      return DEFAULT_REASONING_EFFORT_UPDATES_ENABLED;
+    }
+  };
+  // Publish reads before awaiting them so a later menu save cannot be overwritten by an older read.
+  registerCompactionCommand(pi, compactionSettingsPath, (enabled) => { reasoningEffortUpdates = Promise.resolve(enabled); });
   const warnings = new Set<string>();
   const snapshots = new RequestSnapshotTracker();
   let latestRun = 0;
@@ -352,12 +360,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     warnings.clear();
     snapshots.reset();
-    try {
-      reasoningEffortUpdates = (await loadCompactionSettings(compactionSettingsPath)).configuration.reasoningEffortUpdatesEnabled;
-    } catch (error) {
-      reasoningEffortUpdates = DEFAULT_REASONING_EFFORT_UPDATES_ENABLED;
-      if (ctx.hasUI) ctx.ui.notify(`Could not read compaction settings; Codex reasoning effort updates are Off. ${errorMessage(error)}`, "warning");
-    }
+    await (reasoningEffortUpdates = readReasoningEffortUpdates(ctx));
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
@@ -373,6 +376,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
       const requestSnapshots = snapshots.current();
       const supported = capableModel(ctx.model);
       if (!owned()) return { cancel: true };
+      const effort = reasoningEffortUpdates ??= readReasoningEffortUpdates(ctx);
       let configuration: CompactionConfiguration;
       try {
         configuration = (await loadCompactionSettings(compactionSettingsPath)).configuration;
@@ -382,13 +386,13 @@ export default function codexCompaction(pi: ExtensionAPI): void {
         }
         return { cancel: true };
       }
+      const effortEnabled = await effort;
       if (!owned()) return { cancel: true };
-      reasoningEffortUpdates = configuration.reasoningEffortUpdatesEnabled;
 
       const run: CompactionRun = {
         sessionId,
         signal,
-        reasoningEffortUpdates,
+        reasoningEffortUpdates: effortEnabled,
         owned,
         setStatus(message) {
           if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, message);
@@ -474,9 +478,10 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   pi.on("before_provider_request", async (event, ctx) => {
     let replay: "applied" | "skipped" | "failed" = "failed";
     try {
+      const effort = reasoningEffortUpdates ??= readReasoningEffortUpdates(ctx);
       const payload = await replayCheckpoint(event.payload, ctx, pi.getSettings().images?.blockImages ?? false);
       replay = payload === undefined ? "skipped" : "applied";
-      if (!reasoningEffortUpdates) return payload;
+      if (!await effort) return payload;
       // Replay first: the rewrite recognizes a compacted window by the replayed compaction item.
       const rewritten = applyCodexEffortUpdates(payload ?? event.payload);
       return rewritten === event.payload ? undefined : rewritten;
