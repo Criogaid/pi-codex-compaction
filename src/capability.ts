@@ -3,8 +3,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { isObject } from "./protocol.js";
 
 export const CODEX_API = "openai-codex-responses" as const;
-// Name-matched models need a Responses payload with an input array and a query-free request URL.
-const NAME_MATCH_APIS: readonly Api[] = ["openai-responses", CODEX_API];
+export const RESPONSES_APIS: readonly Api[] = ["openai-responses", CODEX_API];
 
 export interface ProviderIdentity {
   readonly provider: string;
@@ -53,7 +52,7 @@ export function capableModel(model: Model<Api> | undefined, effectiveBaseUrl?: s
   const compat: unknown = model.compat;
   const configured = isObject(compat) ? compat.remoteCompaction : undefined;
   if (configured === undefined &&
-      (!NAME_MATCH_APIS.includes(model.api) || !model.id.toLowerCase().includes("gpt"))) return undefined;
+      (!RESPONSES_APIS.includes(model.api) || !model.id.toLowerCase().includes("gpt"))) return undefined;
   let configuredBaseUrl: string;
   let baseUrl: string;
   try {

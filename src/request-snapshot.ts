@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getCurrentSystemMessage, getSystemMessageText, type Context, type Message, type Tool } from "@earendil-works/pi-ai";
 import { convertToLlm, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
-import { sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
+import { RESPONSES_APIS, sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
 import { type CodexCheckpointDetails, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
 import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, type CompactionPayload, isObject, isObjectArray, type JsonObject } from "./protocol.js";
 import { contextUserItems, userItemOrigins } from "./retention-input.js";
@@ -254,12 +254,19 @@ export function applyProviderRequest(
   contextItems: ReadonlySet<JsonObject>,
 ): { readonly payload: CompactionPayload; readonly contextual: readonly boolean[]; readonly requestTailLength: number } {
   const { input } = payload;
-  if (!snapshot) return { payload, contextual: input.map((item) => contextItems.has(item)), requestTailLength: 0 };
-  const compatible = sameBackend(snapshot.identity, target.identity) && sameModel(snapshot.identity, target.model) &&
-    payload.model === target.model.id;
-  const prefix = snapshot.prefix;
-  if (!prefix) return { payload: compatible ? { ...payload, ...structuredClone(snapshot.fields) } : payload,
-    contextual: input.map((item) => contextItems.has(item)), requestTailLength: 0 };
+  const compatible = snapshot !== undefined && sameBackend(snapshot.identity, target.identity) &&
+    sameModel(snapshot.identity, target.model) && payload.model === target.model.id;
+  const prefix = snapshot?.prefix;
+  if (!prefix) {
+    // Pi's native Responses serializers emit historical configuration updates only before non-empty
+    // assistant output and append the current request's update once after the transcript.
+    const requestTailLength = RESPONSES_APIS.includes(target.model.api) && input.at(-1)?.type === "configuration_update" ? 1 : 0;
+    return {
+      payload: compatible ? { ...payload, ...structuredClone(snapshot.fields) } : payload,
+      contextual: input.map((item) => contextItems.has(item)),
+      requestTailLength,
+    };
+  }
   const start = boundaryIndex(input, prefix.boundary);
   const end = boundaryIndex(input, transcriptEndBoundary(prefix.boundary));
   if (end < start) throw new CodexCompactionProtocolError("Prepared request reordered the snapshot boundaries");
