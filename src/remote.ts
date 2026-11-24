@@ -6,13 +6,14 @@ import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, typ
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
-import { CodexCompactionProtocolError, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
+import { CodexCompactionProtocolError, type CompactionPayload, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
 import { applyProviderRequest, type ProviderRequestSnapshot } from "./request-snapshot.js";
 import { CompactionAttempt, compactionRetryLimit, waitForCompactionRetry } from "./remote-retry.js";
 
 const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 const REQUEST_TIMEOUT_MS = 300_000;
 const MISSING_PAYLOAD_MESSAGE = "Provider did not expose a request payload";
+const UNEXPECTED_PAYLOAD_MODEL = "Provider payload used an unexpected model";
 
 /** Only an exhausted, explicitly transient request is eligible for layered recovery. */
 export class RemoteCompactionTransientError extends Error {
@@ -70,11 +71,16 @@ export function mergeRemoteCompactionHeader(headers: ProviderHeaders): ProviderH
   return merged;
 }
 
-function objectItems(input: unknown): JsonObject[] {
-  if (!Array.isArray(input) || !input.every(isObject)) {
-    throw new CodexCompactionProtocolError("Prepared compaction payload has invalid input items");
+function parseCompactionPayload(
+  payload: unknown, snapshot: ProviderRequestSnapshot | undefined,
+): CompactionPayload {
+  if (!isObject(payload)) throw new CodexCompactionProtocolError("Prepared compaction payload must be an object");
+  if (!Array.isArray(payload.input) || payload.input.findIndex((item: unknown) => !isObject(item)) !== -1) {
+    throw new CodexCompactionProtocolError(snapshot?.prefix
+      ? "Prepared request cannot locate the snapshot boundary" : "Prepared compaction payload has invalid input items");
   }
-  return input;
+  // TypeScript narrows the validated properties, not the original object.
+  return payload as CompactionPayload;
 }
 
 export async function requestRemoteCompaction(request: RemoteCompactionRequest): Promise<RemoteCompactionResponse> {
@@ -84,11 +90,8 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   const configured = capableModel(model);
   if (!configured) throw new CodexCompactionProtocolError("Model is not configured for remote compaction");
   const retries = compactionRetryLimit(request.maxRetries);
-  let preparedPayload: JsonObject | undefined;
-  let sentInput: JsonObject[] | undefined;
+  let prepared: (Pick<RemoteCompactionResponse, "promptInput" | "images" | "contextual"> & { readonly body: CompactionPayload }) | undefined;
   let identity: ProviderIdentity | undefined;
-  let images: ImageEstimates | undefined;
-  let contextual: boolean[] | undefined;
   const baseFetch = request.fetch ?? globalThis.fetch;
   for (let retry = 0; ; retry++) {
     request.signal.throwIfAborted();
@@ -157,47 +160,43 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
             if (prior && !sameBackend(prior, identity)) {
               throw new CodexCompactionProtocolError("The active opaque checkpoint belongs to a different resolved provider backend");
             }
-            if (preparedPayload) {
+            if (prepared) {
               if (!isObject(payload) || payload.model !== model.id) {
-                throw new CodexCompactionProtocolError("Provider payload used an unexpected model");
+                throw new CodexCompactionProtocolError(UNEXPECTED_PAYLOAD_MODEL);
               }
               // Re-authenticate each attempt, but never let a new serialization change the compacted input.
               request.onPrepared?.();
-              return structuredClone(preparedPayload);
+              return structuredClone(prepared.body);
             }
-            if (!isObject(payload)) throw new CodexCompactionProtocolError("Prepared compaction payload must be an object");
-            const applied = applyProviderRequest(payload, resolved, request.providerRequest,
-              contextUserItems(payload.input, request.userItemOrigins));
+            const parsed = parseCompactionPayload(payload, request.providerRequest);
+            const applied = applyProviderRequest(parsed, resolved, request.providerRequest,
+              contextUserItems(parsed.input, request.userItemOrigins));
             const adapted = request.blockImages
-              ? { ...applied.payload, input: withoutInputImages(objectItems(applied.payload.input)) } : applied.payload;
+              ? { ...applied.payload, input: withoutInputImages(applied.payload.input) } : applied.payload;
             const checkpoint = request.priorCheckpoint && request.blockImages
               ? { ...request.priorCheckpoint, replacementHistory: withoutInputImages(request.priorCheckpoint.replacementHistory) }
               : request.priorCheckpoint;
-            const payloadItems = objectItems(adapted.input);
-            const contextItems = new Set(payloadItems.filter((_, index) => applied.contextual[index]));
-            const estimates = await estimateImages([...payloadItems, ...checkpoint?.replacementHistory ?? []], request.signal);
+            const contextItems = new Set(adapted.input.filter((_, index) => applied.contextual[index]));
+            const estimates = await estimateImages([...adapted.input, ...checkpoint?.replacementHistory ?? []], request.signal);
             const trackedCheckpoint = checkpoint && {
               ...checkpoint,
-              onReplay: (items: readonly unknown[]) => {
+              onReplay: (items: readonly JsonObject[]) => {
                 // Track injected object identities, never user-visible text equality.
                 if (checkpoint.contextualFrom === undefined) return;
-                for (const item of items.slice(checkpoint.contextualFrom)) {
-                  if (isObject(item)) contextItems.add(item);
-                }
+                for (const item of items.slice(checkpoint.contextualFrom)) contextItems.add(item);
               },
             };
-            const prepared = prepareRemoteCompactionPayload(adapted, trackedCheckpoint, (history) => ({
+            const body = prepareRemoteCompactionPayload(adapted, trackedCheckpoint, (history) => ({
               ...history,
-              input: trimToolOutputsToContextWindow(objectItems(history.input), history.instructions, preparedModel.contextWindow, estimates),
+              input: trimToolOutputsToContextWindow(history.input, history.instructions, preparedModel.contextWindow, estimates),
             }));
-            if (prepared.model !== model.id) throw new CodexCompactionProtocolError("Provider payload used an unexpected model");
-            const sent = objectItems(prepared.input).slice(0, -1);
-            contextual = sent.map((item) => contextItems.has(item));
-            sentInput = structuredClone(sent);
-            images = estimates;
-            preparedPayload = structuredClone(prepared);
+            // Boundary, marker, and trigger errors take precedence over a payload model mismatch.
+            if (body.model !== model.id) throw new CodexCompactionProtocolError(UNEXPECTED_PAYLOAD_MODEL);
+            const sent = body.input.slice(0, -1);
+            const contextual = sent.map((item) => contextItems.has(item));
+            prepared = { promptInput: structuredClone(sent), images: estimates, contextual, body: structuredClone(body) };
             request.onPrepared?.();
-            return prepared;
+            return body;
           } catch (error) {
             attempt.blockRetry(error);
             throw error;
@@ -226,9 +225,10 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
       }
       request.signal.throwIfAborted();
       if (attempt.fatal) throw attempt.fatal.error;
-      if (!sentInput || !identity || !images || !contextual) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
+      if (!prepared || !identity) throw new CodexCompactionProtocolError(MISSING_PAYLOAD_MESSAGE);
       if (!usage) throw new CodexCompactionProtocolError("Provider stream ended without a completed message");
-      return { item: collector.finish(), promptInput: sentInput, identity, usage, images, contextual };
+      const { promptInput, images, contextual } = prepared;
+      return { item: collector.finish(), promptInput, identity, usage, images, contextual };
     } catch (error) {
       request.signal.throwIfAborted();
       if (attempt.fatal) throw attempt.fatal.error;

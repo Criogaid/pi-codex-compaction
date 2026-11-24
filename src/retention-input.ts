@@ -5,7 +5,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertToLlm, parseSkillBlock } from "@earendil-works/pi-coding-agent";
 import { SaxesParser } from "saxes";
 import { historyGroups, inputText, matchesMarkedText, trimWhiteSpace } from "./history-groups.js";
-import { estimateImages, type ImageEstimates } from "./image-budget.js";
+import type { ImageEstimates } from "./image-budget.js";
 import { isObject, type JsonObject } from "./protocol.js";
 import type { RetentionInput } from "./retention.js";
 
@@ -109,9 +109,10 @@ function isUserItem(item: JsonObject): boolean {
 }
 
 /** Match provider user items to Pi origins; a changed user sequence falls back to text classification. */
-export function contextUserItems(input: unknown, origins: readonly UserItemOrigin[] | undefined): ReadonlySet<JsonObject> {
-  const users = Array.isArray(input) ? input.filter(isObject).filter(isUserItem) : [];
-  if (!origins || users.length !== origins.length) return new Set();
+export function contextUserItems(input: readonly JsonObject[], origins: readonly UserItemOrigin[] | undefined): ReadonlySet<JsonObject> {
+  if (!origins) return new Set();
+  const users = input.filter(isUserItem);
+  if (users.length !== origins.length) return new Set();
   return new Set(users.filter((_, index) => origins[index] === "context"));
 }
 
@@ -130,17 +131,17 @@ function withoutSkillBlocks(item: JsonObject): JsonObject | undefined {
   return content.length ? { ...item, content } : undefined;
 }
 
-export async function prepareRetention(
+export function prepareRetention(
   input: readonly JsonObject[],
   signal: AbortSignal,
-  options: { images?: ImageEstimates; contextual?: readonly boolean[] } = {},
-): Promise<RetentionInput> {
-  const contextual = new Set(input.filter((_, index) => options.contextual?.[index]));
+  { images, contextual }: { images: ImageEstimates; contextual: readonly boolean[] },
+): RetentionInput {
+  const contextItems = new Set(input.filter((_, index) => contextual[index]));
   const groups = historyGroups(input).flatMap((group) => {
     signal.throwIfAborted();
-    if (contextual.has(group.source) || !isUserMessage(group.source)) return [];
+    if (contextItems.has(group.source) || !isUserMessage(group.source)) return [];
     const source = withoutSkillBlocks(group.source);
     return source ? [{ ...group, source }] : [];
   });
-  return { groups, images: options.images ?? await estimateImages(groups.map((group) => group.source), signal) };
+  return { groups, images };
 }

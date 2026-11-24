@@ -61,7 +61,7 @@ test("extracts the user request from Pi skill blocks while preserving other part
     { type: "input_text", text: "Additional request." },
   ] };
   const saved = structuredClone(input);
-  const prepared = await prepareRetention([input, notice], new AbortController().signal, { images });
+  const prepared = await prepareRetention([input, notice], new AbortController().signal, { images, contextual: [false, false] });
   assert.deepEqual(prepared.groups, [{ source: { ...input, content: [
     { ...input.content[0], text: "Explain this code." }, image, input.content[2],
   ] }, notice }]);
@@ -71,12 +71,12 @@ test("extracts the user request from Pi skill blocks while preserving other part
 test("drops skill-only parts and their notice only when no content remains", async () => {
   for (const text of [skill, `${skill}\n\n  \n`]) {
     assert.equal(parseSkillBlock(text)?.userMessage, undefined);
-    const prepared = await prepareRetention([user(text), notice], new AbortController().signal, { images });
+    const prepared = await prepareRetention([user(text), notice], new AbortController().signal, { images, contextual: [false, false] });
     assert.deepEqual(prepared.groups, []);
   }
   const image = { type: "input_image", file_id: "keep" };
   const mixed = { role: "user", content: [{ type: "input_text", text: skill }, image] };
-  const prepared = await prepareRetention([mixed, notice], new AbortController().signal, { images });
+  const prepared = await prepareRetention([mixed, notice], new AbortController().signal, { images, contextual: [false, false] });
   assert.deepEqual(prepared.groups, [{ source: { ...mixed, content: [image] }, notice }]);
 });
 
@@ -84,7 +84,7 @@ test("retains skill lookalikes that Pi does not parse", async () => {
   for (const text of [skill.replace(' location="E:/skills/fixture/SKILL.md"', ""), `prefix ${skill}`, `${skill}\nrequest`, skill.replaceAll("\n", "")]) {
     assert.equal(parseSkillBlock(text), null);
     const input = user(text);
-    const prepared = await prepareRetention([input], new AbortController().signal, { images });
+    const prepared = await prepareRetention([input], new AbortController().signal, { images, contextual: [false] });
     assert.deepEqual(prepared.groups.map(({ source }) => source), [input]);
   }
 });
@@ -109,7 +109,7 @@ test("classifies bash and hidden custom messages in the provider's user sequence
 test("aligns origins only with user message items and returns their original references", () => {
   const hidden = user("hidden");
   const visible = { ...user("visible"), type: "message" };
-  const input = [null, [], { role: "developer", content: [] }, hidden,
+  const input = [{ role: "developer", content: [] }, hidden,
     { type: "function_call", role: "user" }, visible];
   const contextual = contextUserItems(input, ["context", "user"]);
   assert.deepEqual([...contextual], [hidden]);
@@ -122,11 +122,8 @@ test("falls back to no contextual items when the provider changes user item coun
   for (const origins of [undefined, [], ["context"], ["context", "context", "context"]] as const) {
     assert.equal(contextUserItems(input, origins).size, 0);
   }
-  for (const input of [undefined, null, "not an array", {}]) {
-    assert.equal(contextUserItems(input, ["context"]).size, 0);
-  }
 });
 
-test("observes cancellation before retaining a source with supplied estimates", async () => {
-  await assert.rejects(prepareRetention([user("request")], AbortSignal.abort(), { images }), { name: "AbortError" });
+test("observes cancellation before retaining a source with supplied estimates", () => {
+  assert.throws(() => prepareRetention([user("request")], AbortSignal.abort(), { images, contextual: [false] }), { name: "AbortError" });
 });

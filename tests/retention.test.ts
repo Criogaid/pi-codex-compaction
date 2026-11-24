@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { estimateImages } from "../src/image-budget.js";
 import { buildReplacementHistory, RETAINED_MESSAGE_TOKEN_BUDGET } from "../src/retention.js";
 import type { JsonObject } from "../src/protocol.js";
 import { prepareRetention } from "../src/retention-input.js";
 import { truncateTextToTokenBudget } from "../src/text-budget.js";
 
 async function retain(input: readonly JsonObject[]) {
-  return buildReplacementHistory(await prepareRetention(input, new AbortController().signal), opaque);
+  const signal = new AbortController().signal;
+  const images = await estimateImages(input, signal);
+  return buildReplacementHistory(await prepareRetention(input, signal, { images, contextual: input.map(() => false) }), opaque);
 }
 
 const opaque = { type: "compaction", encrypted_content: "opaque" };
@@ -181,7 +184,9 @@ test("rounds image bytes upward to tokens at the retention boundary", async () =
   for (const [bytes, tokens] of [[4, 1], [5, 2], [7_373, 1_844]]) {
     for (const available of [tokens - 1, tokens]) {
       const newest = user("x".repeat((RETAINED_MESSAGE_TOKEN_BUDGET - available) * 4));
-      const prepared = await prepareRetention([boundary, newest], new AbortController().signal, { images: { bytes: () => bytes } });
+      const prepared = await prepareRetention([boundary, newest], new AbortController().signal, {
+        images: { bytes: () => bytes }, contextual: [false, false],
+      });
       assert.deepEqual(buildReplacementHistory(prepared, opaque), available === tokens ? [boundary, newest, opaque] : [newest, opaque]);
     }
   }
@@ -189,7 +194,9 @@ test("rounds image bytes upward to tokens at the retention boundary", async () =
 
 test("clones and appends compaction items without validating or normalizing them", async () => {
   const source = user("retained");
-  const prepared = await prepareRetention([source], new AbortController().signal);
+  const input = [source];
+  const signal = new AbortController().signal;
+  const prepared = await prepareRetention(input, signal, { images: await estimateImages(input, signal), contextual: [false] });
   for (const item of [
     { type: "compaction_summary", encrypted_content: "opaque", metadata: { tag: "preserve" } },
     { type: "compaction", encrypted_content: "", metadata: { tag: "validation belongs upstream" } },

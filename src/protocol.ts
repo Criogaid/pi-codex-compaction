@@ -2,6 +2,7 @@
 export const REMOTE_COMPACTION_PROTOCOL = "remote-compaction-v2" as const;
 
 export type JsonObject = Record<string, unknown>;
+export type CompactionPayload = JsonObject & { readonly input: readonly JsonObject[] };
 
 export class CodexCompactionProtocolError extends Error {
   constructor(message: string) {
@@ -108,14 +109,14 @@ export function createCompactionCollector(): CompactionCollector {
   };
 }
 
-function markerCount(item: unknown, marker: string): number {
-  if (!isObject(item) || item.role !== "user" || !Array.isArray(item.content)) return 0;
+function markerCount(item: JsonObject, marker: string): number {
+  if (item.role !== "user" || !Array.isArray(item.content)) return 0;
   return item.content.reduce<number>((count, part) => isObject(part) && part.type === "input_text" &&
     typeof part.text === "string" ? count + part.text.split(marker).length - 1 : count, 0);
 }
 
 // Later request hooks may tag or join user text around the private marker; replace only the marker itself.
-function replaceMarker(item: JsonObject, marker: string, replacementHistory: readonly unknown[], onReplay?: (items: readonly unknown[]) => void): unknown[] {
+function replaceMarker(item: JsonObject, marker: string, replacementHistory: readonly JsonObject[], onReplay?: (items: readonly JsonObject[]) => void): JsonObject[] {
   const content = item.content as unknown[];
   const index = content.findIndex((part) => isObject(part) && part.type === "input_text" &&
     typeof part.text === "string" && part.text.includes(marker));
@@ -133,38 +134,40 @@ function replaceMarker(item: JsonObject, marker: string, replacementHistory: rea
   ];
 }
 
-export function rewriteCheckpointMarker(
-  payload: unknown,
-  marker: string,
-  replacementHistory: readonly unknown[],
-  onReplay?: (items: readonly unknown[]) => void,
-): JsonObject {
+function locateCheckpointMarker(input: readonly unknown[], marker: string): { index: number; item: JsonObject } {
+  let total = 0;
+  let location: { index: number; item: JsonObject } | undefined;
+  for (const [index, item] of input.entries()) {
+    if (!isObject(item)) continue;
+    const count = markerCount(item, marker);
+    if (count === 0) continue;
+    total += count;
+    location = total === 1 ? { index, item } : undefined;
+  }
+  if (location) return location;
+  throw new CodexCompactionProtocolError(
+    `Provider payload contained ${total} checkpoint markers; expected exactly one`,
+  );
+}
+
+export function rewriteCheckpointMarker(payload: unknown, marker: string, replacementHistory: readonly JsonObject[]): JsonObject {
   if (!isObject(payload) || !Array.isArray(payload.input)) {
     throw new CodexCompactionProtocolError("Codex payload is missing an input array");
   }
-  const counts = payload.input.map((item) => markerCount(item, marker));
-  const total = counts.reduce((sum, count) => sum + count, 0);
-  if (total !== 1) {
-    throw new CodexCompactionProtocolError(
-      `Provider payload contained ${total} checkpoint markers; expected exactly one`,
-    );
-  }
-  const index = counts.indexOf(1);
+  const input: unknown[] = payload.input;
+  const { index, item } = locateCheckpointMarker(input, marker);
   return {
     ...payload,
     input: [
-      ...payload.input.slice(0, index),
-      ...replaceMarker(payload.input[index] as JsonObject, marker, replacementHistory, onReplay),
-      ...payload.input.slice(index + 1),
+      ...input.slice(0, index),
+      ...replaceMarker(item, marker, replacementHistory),
+      ...input.slice(index + 1),
     ],
   };
 }
 
-export function appendCompactionTrigger(payload: unknown): JsonObject {
-  if (!isObject(payload) || !Array.isArray(payload.input)) {
-    throw new CodexCompactionProtocolError("Codex payload is missing an input array");
-  }
-  if (payload.input.some((item) => isObject(item) && item.type === "compaction_trigger")) {
+function appendCompactionTrigger(payload: CompactionPayload): CompactionPayload {
+  if (payload.input.some((item) => item.type === "compaction_trigger")) {
     throw new CodexCompactionProtocolError("Provider payload already contains a compaction trigger");
   }
   return { ...payload, input: [...payload.input, { type: "compaction_trigger" }] };
@@ -172,20 +175,30 @@ export function appendCompactionTrigger(payload: unknown): JsonObject {
 
 /** Replay the checkpoint, let the caller adapt the history, then append the V2 trigger. */
 export function prepareRemoteCompactionPayload(
-  payload: unknown,
-  checkpoint?: { marker: string; replacementHistory: readonly unknown[]; onReplay?: (items: readonly unknown[]) => void },
-  adaptHistory?: (history: JsonObject) => JsonObject,
-): JsonObject {
-  const history = checkpoint
-    ? rewriteCheckpointMarker(payload, checkpoint.marker, checkpoint.replacementHistory, checkpoint.onReplay)
-    : payload;
-  return appendCompactionTrigger(adaptHistory && isObject(history) ? adaptHistory(history) : history);
+  payload: CompactionPayload,
+  checkpoint: { marker: string; replacementHistory: readonly JsonObject[]; onReplay?: (items: readonly JsonObject[]) => void } | undefined,
+  adaptHistory: (history: CompactionPayload) => CompactionPayload,
+): CompactionPayload {
+  let history = payload;
+  if (checkpoint) {
+    const { input } = payload;
+    const { index, item } = locateCheckpointMarker(input, checkpoint.marker);
+    history = {
+      ...payload,
+      input: [
+        ...input.slice(0, index),
+        ...replaceMarker(item, checkpoint.marker, checkpoint.replacementHistory, checkpoint.onReplay),
+        ...input.slice(index + 1),
+      ],
+    };
+  }
+  return appendCompactionTrigger(adaptHistory(history));
 }
 
 export function hasCheckpointMarker(payload: unknown, marker: string): boolean {
   return (
     isObject(payload) &&
     Array.isArray(payload.input) &&
-    payload.input.some((item) => markerCount(item, marker) > 0)
+    payload.input.some((item: unknown) => isObject(item) && markerCount(item, marker) > 0)
   );
 }

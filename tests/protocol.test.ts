@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CodexCompactionProtocolError, appendCompactionTrigger, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker, withoutInputImages } from "../src/protocol.js";
+import { CodexCompactionProtocolError, createCompactionCollector, isObject, prepareRemoteCompactionPayload, rewriteCheckpointMarker, withoutInputImages } from "../src/protocol.js";
 
 const item = { type: "compaction", encrypted_content: "opaque" };
 const done = { type: "response.output_item.done", item };
@@ -78,7 +78,7 @@ test("preparing V2 preserves tool declarations and loading history before the tr
   const payload = { model: "gpt", input: history, tools: [schema], tool_choice: { type: "function", name: "internal_read" },
     reasoning: { effort: "high" }, prompt_cache_key: "same-session" };
   const saved = structuredClone(payload);
-  const prepared = prepareRemoteCompactionPayload(payload);
+  const prepared = prepareRemoteCompactionPayload(payload, undefined, (history) => history);
   assert.deepEqual(prepared, { ...payload, input: [...history, { type: "compaction_trigger" }] });
   assert.deepEqual(payload, saved);
 });
@@ -126,11 +126,15 @@ test("replays one marker and appends one final trigger", () => {
     { role: "user", content: [{ type: "input_text", text: "later" }] },
   ] };
   const replacement = [{ type: "compaction", encrypted_content: "prior" }];
-  const prepared = prepareRemoteCompactionPayload(payload, { marker, replacementHistory: replacement });
+  const prepared = prepareRemoteCompactionPayload(payload, { marker, replacementHistory: replacement }, (history) => history);
   assert.deepEqual(prepared.input, [replacement[0], payload.input[1], { type: "compaction_trigger" }]);
   assert.equal(payload.input.length, 2);
   assert.throws(() => rewriteCheckpointMarker({ input: [] }, marker, replacement), CodexCompactionProtocolError);
-  assert.throws(() => appendCompactionTrigger({ input: [{ type: "compaction_trigger" }] }), CodexCompactionProtocolError);
+  assert.throws(() => prepareRemoteCompactionPayload({ input: [{ type: "compaction_trigger" }] }, undefined, (history) => history), (error) => {
+    assert.ok(error instanceof CodexCompactionProtocolError);
+    assert.equal(error.message, "Provider payload already contains a compaction trigger");
+    return true;
+  });
 });
 
 test("replaces only the marker when request hooks tag or join the marker item", () => {
@@ -195,12 +199,10 @@ test("adapts history without a checkpoint and validates the resulting trigger se
   }), { ...payload, instructions: "adapted", input: [{ type: "compaction_trigger" }] });
   assert.equal(adaptations, 1);
   assert.throws(() => prepareRemoteCompactionPayload(payload, undefined, () => ({ input: [{ type: "compaction_trigger" }] })), CodexCompactionProtocolError);
-  assert.throws(() => prepareRemoteCompactionPayload(payload, undefined, () => ({ input: "invalid" })), CodexCompactionProtocolError);
 });
 
-test("does not adapt malformed payloads or failed marker substitutions", () => {
-  const adapt = () => assert.fail("invalid history must not reach the adapter");
-  assert.throws(() => prepareRemoteCompactionPayload(null, undefined, adapt), CodexCompactionProtocolError);
+test("skips adaptation after failed marker substitutions and propagates adaptation errors", () => {
+  const adapt = () => assert.fail("failed marker substitution must not reach the adapter");
   assert.throws(() => prepareRemoteCompactionPayload({ input: [] }, { marker: "missing", replacementHistory: [] }, adapt), CodexCompactionProtocolError);
   const reason = new Error("adaptation failed");
   assert.throws(() => prepareRemoteCompactionPayload({ input: [] }, undefined, () => { throw reason; }), (error) => error === reason);

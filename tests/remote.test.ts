@@ -5,7 +5,7 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { mergeRemoteCompactionHeader, requestRemoteCompaction } from "../src/remote.js";
 import { assertTrimmedOutput, testRegistry } from "./helpers.js";
-import { isObject, type JsonObject } from "../src/protocol.js";
+import { CodexCompactionProtocolError, isObject, type JsonObject } from "../src/protocol.js";
 import { prepareRetention } from "../src/retention-input.js";
 import { buildReplacementHistory } from "../src/retention.js";
 
@@ -237,6 +237,52 @@ function providerInput(input: readonly JsonObject[]): Provider<"openai-responses
     } });
   } };
 }
+
+test("rejects malformed provider payloads before fetch without retry", async () => {
+  const identity = { provider: model.provider, api: model.api, modelId: model.id,
+    baseUrl: model.baseUrl, endpoint: `${model.baseUrl}/responses` };
+  const snapshot = { sessionId: "session", identity, sourceFingerprints: [], systemPrompt: "fixture", inputsKey: "fixture",
+    projectionOnlyFingerprints: new Set<string>(), fields: {},
+    prefix: { boundary: "snapshot boundary", contextLength: 0, contextual: [], input: [] },
+  };
+  const cases = [
+    { label: "null payload", payload: null },
+    { label: "missing input", payload: { model: model.id } },
+    { label: "null input", payload: { model: model.id, input: null } },
+    { label: "string input", payload: { model: model.id, input: "not an array" } },
+    { label: "object input", payload: { model: model.id, input: {} } },
+    { label: "null input item", payload: { model: model.id, input: [null] } },
+    { label: "array input item", payload: { model: model.id, input: [[]] } },
+  ];
+  for (const { label, payload } of cases) {
+    let attempts = 0;
+    let fetches = 0;
+    const faultyProvider: Provider<"openai-responses"> = { ...provider, streamSimple(preparedModel, transcript, options) {
+      attempts++;
+      return provider.streamSimple(preparedModel, transcript, { ...options,
+        onPayload: (_payload, currentModel) => options?.onPayload?.(payload, currentModel),
+      });
+    } };
+    const registry = await testRegistry(faultyProvider);
+    for (const providerRequest of [undefined, snapshot]) {
+      const scenario = providerRequest ? `${label} with snapshot prefix` : label;
+      const previousAttempts = attempts;
+      const message = payload === null ? "Prepared compaction payload must be an object"
+        : providerRequest ? "Prepared request cannot locate the snapshot boundary"
+          : "Prepared compaction payload has invalid input items";
+      await assert.rejects(requestRemoteCompaction({ ...request(registry), providerRequest,
+        maxRetries: 2, maxRetryDelayMs: 1,
+        fetch: async () => { fetches++; return response(); },
+      }), (error) => {
+        assert.ok(error instanceof CodexCompactionProtocolError, scenario);
+        assert.equal(error.message, message, scenario);
+        return true;
+      });
+      assert.equal(attempts - previousAttempts, 1, scenario);
+      assert.equal(fetches, 0, scenario);
+    }
+  }
+});
 
 test("the final V2 payload preserves declarations through snapshot reuse and checkpoint replay", async () => {
   const schema = { type: "function", name: "internal_read", description: "private-schema", parameters: { type: "object" } };

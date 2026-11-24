@@ -275,7 +275,7 @@ test("observed declarations and cache fields survive newer messages without copy
     { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] }, { role: "user", content: "new turn" },
     { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] }],
     tools: [], text: { verbosity: "high" }, max_output_tokens: 4_096, store: false, stream: true };
-  const { payload: result } = applyProviderRequest(fresh, target, snapshot);
+  const { payload: result } = applyProviderRequest(fresh, target, snapshot, new Set());
   const original = wirePayload();
   assert.deepEqual(result.tools, original.tools);
   assert.deepEqual(result.reasoning, original.reasoning);
@@ -414,10 +414,10 @@ test("wire snapshots reject session, backend, source, prompt, tool, thinking and
   const start = { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] };
   const end = { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] };
   const marked = { ...fresh, input: [...fresh.input, start, end] };
-  assert.deepEqual(applyProviderRequest(marked, otherBackend, snapshot).payload, fresh);
-  assert.throws(() => applyProviderRequest(fresh, target, snapshot), /boundary/);
+  assert.deepEqual(applyProviderRequest(marked, otherBackend, snapshot, new Set()).payload, fresh);
+  assert.throws(() => applyProviderRequest(fresh, target, snapshot, new Set()), /boundary/);
   for (const boundaries of [[start], [end], [start, start, end], [start, end, end], [end, start]]) {
-    assert.throws(() => applyProviderRequest({ ...fresh, input: [...fresh.input, ...boundaries] }, target, snapshot), /boundar/);
+    assert.throws(() => applyProviderRequest({ ...fresh, input: [...fresh.input, ...boundaries] }, target, snapshot, new Set()), /boundar/);
   }
 });
 
@@ -430,7 +430,7 @@ test("missing wire fields remove obsolete defaults and malformed observations di
   const fresh = wirePayload();
   const actual = applyProviderRequest({ ...fresh, input: [...fresh.input,
     { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] },
-    { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] }] }, target, snapshot).payload;
+    { role: "user", content: [{ type: "input_text", text: `${snapshot.prefix.boundary}_END` }] }] }, target, snapshot, new Set()).payload;
   assert.equal(actual.instructions, undefined);
   assert.equal(actual.tools, undefined);
   assert.equal(actual.prompt_cache_key, undefined);
@@ -519,7 +519,7 @@ for (const reference of [
     assert.ok(snapshot);
     assert.equal(snapshot.prefix, undefined);
     const fresh = { model: model.id, input: [{ role: "user", content: "full local history" }] };
-    const { payload } = applyProviderRequest(fresh, target, snapshot);
+    const { payload } = applyProviderRequest(fresh, target, snapshot, new Set());
     assert.deepEqual(payload.input, fresh.input);
     assert.equal(payload.previous_response_id, undefined);
     assert.equal(payload.conversation, undefined);
@@ -541,8 +541,10 @@ test("a non-forced run prompt reuses its wire prefix only after the matching run
   assert.ok(snapshot?.prefix);
   const request = compactionRequest(tracker.current(), sessionId, target, current,
     { ...declarationsInTranscript, systemPrompt: () => baseInputs.systemPrompt }, snapshot);
-  const fresh = { model: model.id, input: convertResponsesMessages(model, normalizeContext(request.context), new Set([model.provider])) };
-  const { payload } = applyProviderRequest(fresh, target, snapshot);
+  const input: readonly unknown[] = convertResponsesMessages(model, normalizeContext(request.context), new Set([model.provider]));
+  assert.ok(input.every(isObject));
+  const fresh = { model: model.id, input };
+  const { payload } = applyProviderRequest(fresh, target, snapshot, new Set());
   assert.ok(Array.isArray(payload.input));
   assert.deepEqual(payload.input.slice(0, observed.input.length), observed.input);
   assert.deepEqual(payload.input.slice(observed.input.length), [{ role: "user", content: [{ type: "input_text", text: "new suffix" }] }]);

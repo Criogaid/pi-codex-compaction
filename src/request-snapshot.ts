@@ -6,7 +6,7 @@ import { getCurrentSystemMessage, getSystemMessageText, type Context, type Messa
 import { convertToLlm, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
 import { type CodexCheckpointDetails, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
-import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, isObject, type JsonObject } from "./protocol.js";
+import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, type CompactionPayload, isObject, type JsonObject } from "./protocol.js";
 import { contextUserItems, userItemOrigins } from "./retention-input.js";
 
 /**
@@ -266,16 +266,16 @@ function boundaryIndex(input: readonly JsonObject[], text: string): number {
 
 /** Replace the serialized prefix up to the private boundaries; never let a boundary reach the provider. */
 export function applyProviderRequest(
-  payload: JsonObject, target: CapableModel, snapshot: ProviderRequestSnapshot | undefined,
-  contextItems: ReadonlySet<JsonObject> = new Set(),
-): { readonly payload: JsonObject; readonly contextual: readonly boolean[] } {
-  const input = Array.isArray(payload.input) && payload.input.every(isObject) ? payload.input : undefined;
-  if (!snapshot) return { payload, contextual: input?.map((item) => contextItems.has(item)) ?? [] };
-  const compatible = sameBackend(snapshot.identity, target.identity) && sameModel(snapshot.identity, target.model) && payload.model === target.model.id;
+  payload: CompactionPayload, target: CapableModel, snapshot: ProviderRequestSnapshot | undefined,
+  contextItems: ReadonlySet<JsonObject>,
+): { readonly payload: CompactionPayload; readonly contextual: readonly boolean[] } {
+  const { input } = payload;
+  if (!snapshot) return { payload, contextual: input.map((item) => contextItems.has(item)) };
+  const compatible = sameBackend(snapshot.identity, target.identity) && sameModel(snapshot.identity, target.model) &&
+    payload.model === target.model.id;
   const prefix = snapshot.prefix;
   if (!prefix) return { payload: compatible ? { ...payload, ...structuredClone(snapshot.fields) } : payload,
-    contextual: input?.map((item) => contextItems.has(item)) ?? [] };
-  if (!input) throw new CodexCompactionProtocolError("Prepared request cannot locate the snapshot boundary");
+    contextual: input.map((item) => contextItems.has(item)) };
   const start = boundaryIndex(input, prefix.boundary);
   const end = boundaryIndex(input, transcriptEndBoundary(prefix.boundary));
   if (end < start) throw new CodexCompactionProtocolError("Prepared request reordered the snapshot boundaries");

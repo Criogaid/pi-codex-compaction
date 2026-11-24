@@ -297,11 +297,10 @@ async function compactRemotely(
       fetch,
     });
     if (!owned()) return { cancel: true };
-    const retention = await prepareRetention(response.promptInput, event.signal, {
+    const retention = prepareRetention(response.promptInput, event.signal, {
       images: response.images,
       contextual: response.contextual,
     });
-    if (!owned()) return { cancel: true };
     const replacementHistory = buildReplacementHistory(retention, response.item);
     const details = createCheckpointDetails({
       identity: response.identity,
