@@ -110,6 +110,46 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       await fixture.close();
     }
   });
+
+  test(`real ${api} V2 compaction succeeds after an ordinary request has sparse history`, { timeout: 20_000 }, async () => {
+    let removeHistory = false;
+    const removeHistoryItem: ExtensionFactory = (pi) => {
+      pi.on("before_provider_request", ({ payload }) => {
+        if (!removeHistory) return;
+        assert.ok(isObject(payload) && Array.isArray(payload.input));
+        const input = payload.input.slice();
+        const firstUser = input.findIndex((item) => isObject(item) && item.role === "user");
+        assert.ok(firstUser >= 0);
+        delete input[firstUser];
+        return { ...payload, input };
+      });
+    };
+    const fixture = await sessionFixture({ api, extensions: (fetch) => [
+      removeHistoryItem, createCodexCompactionExtension({ fetch }),
+    ] });
+    try {
+      for (let turn = 1; turn <= 3; turn++) {
+        removeHistory = turn === 3;
+        await fixture.session.prompt(`Task ${turn}. ${"Preserve the implementation constraints. ".repeat(60)}`);
+      }
+      removeHistory = false;
+      const ordinary = fixture.requests.at(-1)?.payload;
+      assert.ok(ordinary && Array.isArray(ordinary.input));
+      assert.ok(ordinary.input.includes(null), "The deleted history slot reaches ordinary request serialization");
+
+      await fixture.session.compact();
+      const compacting = fixture.requests.at(-1)?.payload;
+      assert.ok(compacting && Array.isArray(compacting.input));
+      assert.ok(compacting.input.some((item) => isObject(item) && item.type === "compaction_trigger"),
+        "Expected a V2 compaction request after the sparse ordinary input");
+      assert.ok(compacting.input.every(isObject), "The sent V2 input must contain only objects");
+      const saved = fixture.session.sessionManager.getBranch().findLast((entry) => entry.type === "compaction");
+      assert.ok(saved && parseCheckpointDetails(saved.details), "Expected a saved V2 checkpoint");
+      assert.deepEqual(fixture.errors, []);
+    } finally {
+      await fixture.close();
+    }
+  });
 }
 
 test("real session drops observed request fields when thinking or active tools change", { timeout: 20_000 }, async () => {

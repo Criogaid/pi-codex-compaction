@@ -6,7 +6,7 @@ import { getCurrentSystemMessage, getSystemMessageText, type Context, type Messa
 import { convertToLlm, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
 import { type CodexCheckpointDetails, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
-import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, type CompactionPayload, isObject, type JsonObject } from "./protocol.js";
+import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, type CompactionPayload, isObject, isObjectArray, type JsonObject } from "./protocol.js";
 import { contextUserItems, userItemOrigins } from "./retention-input.js";
 
 /**
@@ -204,7 +204,7 @@ function captureProviderRequest(
   context: ContextSnapshot, target: CapableModel, payload: unknown, inputs: ProviderRequestInputs,
 ): ProviderRequestSnapshot | undefined {
   if (!isObject(payload) || payload.model !== target.model.id ||
-    !Array.isArray(payload.input) || !payload.input.every(isObject)) return undefined;
+    !isObjectArray(payload.input)) return undefined;
   const { instructions, tools, reasoning, parallel_tool_calls, prompt_cache_key, prompt_cache_retention, prompt_cache_options, service_tier, text } = payload;
   const verbosity = isObject(text) ? text.verbosity : undefined;
   const format = isObject(text) ? text.format : undefined;

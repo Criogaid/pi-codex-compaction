@@ -15,6 +15,11 @@ export function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function isObjectArray(value: unknown): value is JsonObject[] {
+  // findIndex visits holes, which would become undefined when the array is spread.
+  return Array.isArray(value) && value.findIndex((item: unknown) => !isObject(item)) === -1;
+}
+
 export function isInputImage(value: unknown): value is JsonObject {
   return isObject(value) && value.type === "input_image";
 }

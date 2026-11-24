@@ -12,7 +12,7 @@ import {
   type ProjectedSessionEntry,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { isObject, type JsonObject, REMOTE_COMPACTION_PROTOCOL, validateCompactionItem } from "./protocol.js";
+import { isObject, isObjectArray, type JsonObject, REMOTE_COMPACTION_PROTOCOL, validateCompactionItem } from "./protocol.js";
 import {
   normalizeUrl,
   type ProviderIdentity,
@@ -113,7 +113,6 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
     typeof value.baseUrl !== "string" ||
     typeof value.endpoint !== "string" ||
     value.protocol !== REMOTE_COMPACTION_PROTOCOL ||
-    !Array.isArray(value.replacementHistory) ||
     !Array.isArray(value.keptMessageFingerprints) ||
     typeof value.createdAt !== "string"
   ) {
@@ -134,8 +133,8 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
     return undefined;
   }
   if (
+    !isObjectArray(value.replacementHistory) ||
     value.replacementHistory.length === 0 ||
-    !value.replacementHistory.every(isObject) ||
     !value.keptMessageFingerprints.every(
       (fingerprint) => typeof fingerprint === "string" && /^[a-f0-9]{64}$/.test(fingerprint),
     )

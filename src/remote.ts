@@ -6,7 +6,7 @@ import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, typ
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
-import { CodexCompactionProtocolError, type CompactionPayload, createCompactionCollector, isObject, type JsonObject, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
+import { CodexCompactionProtocolError, type CompactionPayload, createCompactionCollector, isObject, isObjectArray, type JsonObject, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
 import { applyProviderRequest, type ProviderRequestSnapshot } from "./request-snapshot.js";
 import { CompactionAttempt, compactionRetryLimit, waitForCompactionRetry } from "./remote-retry.js";
 
@@ -75,7 +75,7 @@ function parseCompactionPayload(
   payload: unknown, snapshot: ProviderRequestSnapshot | undefined,
 ): CompactionPayload {
   if (!isObject(payload)) throw new CodexCompactionProtocolError("Prepared compaction payload must be an object");
-  if (!Array.isArray(payload.input) || payload.input.findIndex((item: unknown) => !isObject(item)) !== -1) {
+  if (!isObjectArray(payload.input)) {
     throw new CodexCompactionProtocolError(snapshot?.prefix
       ? "Prepared request cannot locate the snapshot boundary" : "Prepared compaction payload has invalid input items");
   }
