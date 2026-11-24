@@ -670,7 +670,6 @@ async function providerCompaction(messages: SessionMessage[], options: {
   ordinaryPrompt?: string;
   ordinaryProjection?: (messages: AgentMessage[]) => AgentMessage[];
   prepareOrdinarySource?: (messages: AgentMessage[]) => AgentMessage[];
-  retryOrdinaryPayload?: boolean;
   compactionResponses?: readonly Response[];
   afterOrdinary?: (session: SessionManager, mock: ReturnType<typeof mockPi>, current: Awaited<ReturnType<typeof context>>, requestModel: Model<"openai-responses">) => void | Promise<void>;
   reloadAfterOrdinary?: boolean;
@@ -737,10 +736,7 @@ async function providerCompaction(messages: SessionMessage[], options: {
         assert.ok(isObject(input));
         ordinaryPayload = structuredClone(input);
         const event = { type: "before_provider_request", payload: input };
-        const rewritten = await mock.events.get("before_provider_request")?.[0]?.(event, current.ctx);
-        return options.retryOrdinaryPayload
-          ? await mock.events.get("before_provider_request")?.[0]?.(event, current.ctx) ?? input
-          : rewritten ?? input;
+        return await mock.events.get("before_provider_request")?.[0]?.(event, current.ctx) ?? input;
       },
     })) {
       // Drain the ordinary response before Pi clears its per-run prompt override.
@@ -787,7 +783,7 @@ function packToolHistory(messages: AgentMessage[]): AgentMessage[] {
 test("compaction preserves Pi's ordinary context projection and appends only new history", async () => {
   const messages = toolHistory();
   const saved = structuredClone(messages);
-  const result = await providerCompaction(messages, { ordinaryProjection: packToolHistory, retryOrdinaryPayload: true,
+  const result = await providerCompaction(messages, { ordinaryProjection: packToolHistory,
     afterOrdinary(session) {
       session.appendMessage({ role: "assistant", content: [{ type: "text", text: "New final answer" }],
         api: model.api, provider: model.provider, model: model.id, usage, stopReason: "stop", timestamp: 4 });

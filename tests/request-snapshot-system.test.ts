@@ -177,26 +177,47 @@ async function compactInput(fixture: Fixture): Promise<JsonObject[]> {
   return items;
 }
 
-test("V2 treats an empty forced prompt as an override of Pi's persisted sections", async (t) => {
-  const forcedTurn = "Continue with no system text.";
-  const fixture = await sessionFixture({ extensions: [codexCompaction, (pi) => {
-    pi.on("before_agent_start", (event) => {
-      if (event.messageType === "user" && event.prompt === forcedTurn) return { systemPrompt: "" };
-    });
-  }] });
-  t.after(() => fixture.close());
-  await fixture.session.prompt(warmup);
-  await fixture.session.prompt(warmup);
-  await fixture.session.prompt(forcedTurn);
-  const { sessionManager } = fixture.session;
-  const persisted = getCurrentSystemMessage(sessionManager.buildSessionContext().messages);
-  assert.ok(persisted?.sections?.preamble);
-  assert.notEqual(getSystemMessageText(persisted), "");
-  assert.deepEqual(inputItems(lastPayload(fixture)).filter(isInstruction), []);
-  fixture.session.setThinkingLevel("high");
-  assert.deepEqual((await compactInput(fixture)).filter(isInstruction), []);
-  assert.deepEqual(fixture.errors, []);
-});
+function systemLayout(payload: JsonObject) {
+  return { instructions: payload.instructions, input: inputItems(payload).filter(isInstruction) };
+}
+
+async function nextOrdinaryFrom(fixture: Fixture, leaf: string, prompt: string): Promise<JsonObject> {
+  const { session } = fixture;
+  // Serialize the same history after V2, so chat cannot replace the snapshot under test.
+  session.sessionManager.branch(leaf);
+  session.refreshContext();
+  const before = fixture.requests.length;
+  await session.prompt(prompt);
+  assert.equal(fixture.requests.length, before + 1);
+  return lastPayload(fixture);
+}
+
+for (const api of ["openai-responses", "openai-codex-responses"] as const) {
+  test(`${api} V2 matches the next ordinary request with an empty forced prompt`, async (t) => {
+    const forcedTurn = "Continue with no system text.";
+    const fixture = await sessionFixture({ api, extensions: [codexCompaction, (pi) => {
+      pi.on("before_agent_start", (event) => {
+        if (event.messageType === "user" && event.prompt === forcedTurn) return { systemPrompt: "" };
+      });
+    }] });
+    t.after(() => fixture.close());
+    await fixture.session.prompt(warmup);
+    await fixture.session.prompt(warmup);
+    await fixture.session.prompt(forcedTurn);
+    const { sessionManager } = fixture.session;
+    const leaf = sessionManager.getLeafId();
+    const persisted = getCurrentSystemMessage(sessionManager.buildSessionContext().messages);
+    assert.ok(leaf && persisted && getSystemMessageText(persisted));
+    const empty = { instructions: api === "openai-codex-responses" ? "You are a helpful assistant." : undefined, input: [] };
+    assert.deepEqual(systemLayout(lastPayload(fixture)), empty);
+    fixture.session.setThinkingLevel("high");
+    await compactInput(fixture);
+    const v2 = systemLayout(lastPayload(fixture));
+    assert.deepEqual(v2, empty);
+    assert.deepEqual(v2, systemLayout(await nextOrdinaryFrom(fixture, leaf, forcedTurn)));
+    assert.deepEqual(fixture.errors, []);
+  });
+}
 
 test("V2 scopes a same-text forced prompt sample to one Pi run", async (t) => {
   const forcedTurn = "Continue with the base prompt forced at the head.";
@@ -327,9 +348,13 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       }
 
       fixture.session.setThinkingLevel("high");
+      const leaf = fixture.session.sessionManager.getLeafId();
+      assert.ok(leaf);
       const compacted = await compactInput(fixture);
       assert.deepEqual({ instructions: lastPayload(fixture).instructions, input: compacted.filter(isInstruction) },
         { instructions: ordinary.instructions, input: ordinarySystemItems });
+      const v2 = systemLayout(lastPayload(fixture));
+      assert.deepEqual(v2, systemLayout(await nextOrdinaryFrom(fixture, leaf, forcedTurn)));
       assert.deepEqual(fixture.errors, []);
     });
   }
@@ -524,6 +549,147 @@ for (const sameText of [true, false]) {
       hasUserText(item, warmup) || hasUserText(item, editedWarmup) || hasUserText(item, forcedTurn));
     assert.deepEqual(relevant, [ordinaryHead, userItem(editedWarmup),
       { role: "developer", content: renderSystemMessageUpdate(updates[0]) }, userItem(forcedTurn)]);
+    assert.deepEqual(fixture.errors, []);
+  });
+}
+
+for (const api of ["openai-responses", "openai-codex-responses"] as const) {
+  test(`${api} V2 matches the next ordinary request with an unforced literal system message`, async (t) => {
+    const fixture = await sessionFixture({ api,
+      models: (base) => [{ ...base, compat: { ...base.compat, supportsMidConvoSystemMessages: true } }],
+      extensions: [codexCompaction],
+    });
+    t.after(() => fixture.close());
+    await fixture.session.prompt(warmup);
+    await fixture.session.prompt(warmup);
+    const { delta, user } = appendSystemSuffix(fixture);
+    const followingTurn = "Continue under the literal instruction.";
+    await fixture.session.prompt(followingTurn);
+    const relevant = (payload: JsonObject) => inputItems(payload).filter((item) =>
+      isInstruction(item) || hasUserText(item, warmup) || hasUserText(item, suffixTurn));
+    const ordinary = lastPayload(fixture);
+    const position = relevant(ordinary).findLastIndex((item) => hasUserText(item, warmup));
+    assert.ok(position >= 0);
+    assert.deepEqual(relevant(ordinary).slice(position + 1, position + 3), [delta, user]);
+    const leaf = fixture.session.sessionManager.getLeafId();
+    assert.ok(leaf);
+    fixture.session.setThinkingLevel("high");
+    await compactInput(fixture);
+    const v2 = lastPayload(fixture);
+    const next = await nextOrdinaryFrom(fixture, leaf, followingTurn);
+    assert.deepEqual(relevant(next), relevant(ordinary));
+    assert.deepEqual({ instructions: v2.instructions, input: relevant(v2) },
+      { instructions: next.instructions, input: relevant(next) });
+    assert.deepEqual(fixture.errors, []);
+  });
+
+  test(`${api} V2 keeps a differing forced head and matches the next ordinary request's system delta`, async (t) => {
+    const force = "FORCE";
+    const fixture = await sessionFixture({ api,
+      models: (base) => [{ ...base, compat: { ...base.compat, supportsMidConvoSystemMessages: true } }],
+      extensions: [codexCompaction, (pi) => pi.on("before_agent_start", () => ({ systemPrompt: force }))],
+    });
+    t.after(() => fixture.close());
+    await fixture.session.prompt(warmup);
+    await fixture.session.prompt(warmup);
+    const ordinary = lastPayload(fixture);
+    assert.equal(api === "openai-codex-responses" ? ordinary.instructions : inputItems(ordinary)[0].content, force);
+    const { delta, user } = appendSystemSuffix(fixture);
+    const leaf = fixture.session.sessionManager.getLeafId();
+    assert.ok(leaf);
+    const items = await compactInput(fixture);
+    const v2 = systemLayout(lastPayload(fixture));
+    assert.deepEqual(items.slice(-3, -1), [delta, user]);
+    assert.deepEqual(v2, { ...systemLayout(ordinary), input: [...systemLayout(ordinary).input, delta] });
+    const next = await nextOrdinaryFrom(fixture, leaf, "Continue with the final task.");
+    assert.deepEqual(fixture.errors, []);
+    assert.deepEqual(v2, systemLayout(next));
+  });
+
+  test(`${api} V2 uses model B's ordinary prompt after a provider hook switches models`, async (t) => {
+    const force = "FORCE";
+    const forcedTurn = `${warmup} Switch models after the context has been prepared.`;
+    let switchModel = false;
+    const fixture = await sessionFixture({ api,
+      models: (base) => [base, { ...base, id: "gpt-fixture-b" }],
+      extensions: [(pi) => {
+        pi.on("before_agent_start", (event) => {
+          if (event.messageType === "user" && event.prompt === forcedTurn) return { systemPrompt: force };
+        });
+        pi.on("before_provider_request", async () => {
+          if (!switchModel) return;
+          switchModel = false;
+          assert.ok(await pi.setModel(fixture.models[1]));
+        });
+      }, codexCompaction],
+    });
+    t.after(() => fixture.close());
+    const auth = await fixture.runtime.getAuth(fixture.model);
+    assert.ok(auth?.auth.apiKey);
+    await fixture.runtime.setRuntimeApiKey(fixture.model.provider, auth.auth.apiKey);
+    await fixture.session.prompt(warmup);
+    await fixture.session.prompt(warmup);
+    switchModel = true;
+    await fixture.session.prompt(forcedTurn);
+    assert.deepEqual(fixture.errors, []);
+    assert.equal(fixture.session.model?.id, fixture.models[1].id);
+    assert.equal(lastPayload(fixture).model, fixture.model.id);
+    assert.match(JSON.stringify(systemLayout(lastPayload(fixture))), /FORCE/);
+    const leaf = fixture.session.sessionManager.getLeafId();
+    assert.ok(leaf);
+    await compactInput(fixture);
+    const v2 = lastPayload(fixture);
+    const next = await nextOrdinaryFrom(fixture, leaf, "Continue with the selected model.");
+    assert.equal(v2.model, fixture.models[1].id);
+    assert.equal(next.model, fixture.models[1].id);
+    assert.doesNotMatch(JSON.stringify(systemLayout(v2)), /FORCE/);
+    assert.deepEqual(systemLayout(v2), systemLayout(next));
+    assert.deepEqual(fixture.errors, []);
+  });
+
+  test(`${api} retries a chat HTTP 503 without rerunning onPayload and keeps the snapshot for V2`, async (t) => {
+    const ordinaryKey = "fixture-503-cache";
+    let retryTurn = false;
+    let failOnce = true;
+    let preparations = 0;
+    const fixture = await sessionFixture({ api,
+      settings: { retry: { enabled: false, provider: { maxRetries: 1, maxRetryDelayMs: 1 } } },
+      serializePayload(payload) {
+        if (retryTurn) preparations++;
+        return payload;
+      },
+      respond() {
+        if (!retryTurn || !failOnce) return;
+        failOnce = false;
+        return Response.json({ error: { message: "Service unavailable" } }, {
+          status: 503, headers: { "retry-after-ms": "1" },
+        });
+      },
+      extensions: [(pi) => pi.on("before_provider_request", ({ payload }) => {
+        assert.ok(isObject(payload));
+        return { ...payload, prompt_cache_key: ordinaryKey };
+      }), codexCompaction],
+    });
+    t.after(() => fixture.close());
+    await fixture.session.prompt(warmup);
+    await fixture.session.prompt(warmup);
+    const before = fixture.requests.length;
+    retryTurn = true;
+    await fixture.session.prompt("Confirm the most recent decision.");
+    retryTurn = false;
+    const attempts = fixture.requests.slice(before);
+    assert.equal(preparations, 1);
+    assert.equal(attempts.length, 2);
+    assert.deepEqual(attempts[0].bodyBytes, attempts[1].bodyBytes);
+    const ordinary = attempts[1].payload;
+    const leaf = fixture.session.sessionManager.getLeafId();
+    assert.ok(leaf);
+    await compactInput(fixture);
+    const v2 = lastPayload(fixture);
+    const next = await nextOrdinaryFrom(fixture, leaf, "Continue after the recovery.");
+    assert.deepEqual(inputItems(v2).slice(0, inputItems(ordinary).length), inputItems(ordinary));
+    assert.equal(v2.prompt_cache_key, ordinaryKey);
+    assert.equal(v2.prompt_cache_key, next.prompt_cache_key);
     assert.deepEqual(fixture.errors, []);
   });
 }

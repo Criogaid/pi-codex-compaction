@@ -82,6 +82,7 @@ export async function sessionFixture(options: {
   readonly models?: (base: Model<Api>) => readonly Model<Api>[];
   readonly settings?: Parameters<typeof SettingsManager.inMemory>[0];
   readonly respond?: (request: SessionRequest) => Response | undefined | Promise<Response | undefined>;
+  readonly ordinaryInputTokens?: () => number | undefined;
 }) {
   const directory = await mkdtemp(join(tmpdir(), "pi-compaction-session-"));
   const requests: SessionRequest[] = [];
@@ -113,7 +114,9 @@ export async function sessionFixture(options: {
       ? { type: "compaction", encrypted_content: `fixture-checkpoint-${requests.length}` }
       : { type: "message", id: `msg_${requests.length}`, role: "assistant", status: "completed",
           content: [{ type: "output_text", text: `Fixture reply ${requests.length}.`, annotations: [] }] };
-    const usage = { input_tokens: 500, output_tokens: 20, total_tokens: 520 };
+    const inputTokens = (compacting ? undefined : options.ordinaryInputTokens?.()) ?? 500;
+    const outputTokens = 20;
+    const usage = { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens };
     const events = [
       { type: "response.created", response: { id: `resp_${requests.length}` } },
       ...(!compacting ? [

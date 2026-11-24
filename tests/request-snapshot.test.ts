@@ -444,19 +444,19 @@ test("missing wire fields remove obsolete defaults and malformed observations di
   }
 });
 
-test("retry observations replace wire fields and reset detaches a captured compaction view", () => {
+test("re-serialization replaces wire fields and reset detaches a captured compaction view", () => {
   const canonical = [system(), user()];
   const tracker = observedRequest(canonical, wirePayload());
   const view = tracker.current();
   const first = view.providerRequest;
   assert.ok(first);
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt,
-    () => ({ payload: { ...wirePayload(), prompt_cache_key: "retried-cache-key" }, inputs, replay: "skipped" }));
+    () => ({ payload: { ...wirePayload(), prompt_cache_key: "re-serialized-cache-key" }, inputs, replay: "skipped" }));
   assert.notEqual(view.providerRequest, first);
-  assert.equal(view.providerRequest?.fields.prompt_cache_key, "retried-cache-key");
+  assert.equal(view.providerRequest?.fields.prompt_cache_key, "re-serialized-cache-key");
   tracker.reset();
   assert.equal(tracker.current().providerRequest, undefined);
-  assert.equal(view.providerRequest?.fields.prompt_cache_key, "retried-cache-key");
+  assert.equal(view.providerRequest?.fields.prompt_cache_key, "re-serialized-cache-key");
 });
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
@@ -698,12 +698,12 @@ for (const settings of interfaceSettings) {
   });
 }
 
-for (const phase of ["provider preparation", "provider retry"] as const) {
+for (const phase of ["provider preparation", "provider re-serialization"] as const) {
   for (const change of ["append", "edit", "prompt", "session", "model", "backend"] as const) {
     test(`${phase} rejects ${change} after context capture and cannot resurrect that binding`, () => {
       const canonical = [system(), user()];
       const tracker = preparedTracker(canonical, [system(), user("projected source")]);
-      if (phase === "provider retry") tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt,
+      if (phase === "provider re-serialization") tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt,
         () => ({ payload: wirePayload(), inputs, replay: "skipped" }));
       const changed = change === "append" ? [...canonical, user("new source", 2)]
         : change === "edit" ? [system(), user("edited source")]
