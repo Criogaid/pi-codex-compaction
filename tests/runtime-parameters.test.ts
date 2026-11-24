@@ -223,7 +223,7 @@ for (const path of ["matching prefix", "no snapshot", "settings mismatch", "serv
       const tracker = new RequestSnapshotTracker();
       if (path !== "no snapshot") {
         tracker.recordContext(sessionId, target, () => history);
-        tracker.recordProjectedRequest(sessionId, target, () => history, () => undefined, history);
+        tracker.recordProjectedRequest(sessionId, target, () => history, () => undefined, history, false);
         const ordinary = await registry.streamSimple(model, { systemPrompt: inputs.systemPrompt, messages: history }, {
           reasoning: "low", transport: "sse", sessionId,
           onPayload: (payload) => {
@@ -235,7 +235,8 @@ for (const path of ["matching prefix", "no snapshot", "settings mismatch", "serv
             const observed = { ...payload, input: observedInput, service_tier: "priority",
               ...(path === "server reference" ? { previous_response_id: "resp-observed" } : {}),
             };
-            tracker.recordProviderRequest(sessionId, target, () => history, () => inputs.systemPrompt, () => ({ payload: observed, inputs }));
+            tracker.recordProviderRequest(sessionId, target, () => history, () => inputs.systemPrompt,
+              () => ({ payload: observed, inputs, replay: "skipped" }));
             return observed;
           },
           fetch: async () => response(),
