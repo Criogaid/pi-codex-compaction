@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { zstdDecompressSync } from "node:zlib";
 import type { Api, AuthResult, Context, Model, Provider, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
@@ -111,58 +112,133 @@ async function fixture(api: ResponsesApi, resolve?: () => Promise<AuthResult | u
 const compactionConfig = join(isolateAgentConfig(), COMPACTION_SETTINGS_RELATIVE_PATH);
 const summaryModelId = "fixture-text-summary";
 
-for (const api of ["openai-responses", "openai-codex-responses"] as const) {
-  const layouts = api === "openai-responses"
-    ? [["LF", "\n", "same chunk"], ["LF", "\n", "separate chunks"],
-      ["CRLF", "\r\n", "same chunk"], ["CRLF", "\r\n", "separate chunks"]] as const
-    : [["LF", "\n", "same chunk"]] as const;
-  for (const [lineEnding, newline, layout] of layouts) {
-    for (const tail of ["response.completed", "response.failed"] as const) {
-      test(`${api}: first SSE completion wins over ${tail} (${lineEnding}, ${layout})`, { timeout: 20_000 }, async (t) => {
-        const firstItem = { type: "compaction", encrypted_content: "first-checkpoint" };
-        const laterItem = { type: "compaction", encrypted_content: "later-checkpoint" };
-        const first = frames([created, { type: "response.output_item.done", output_index: 0, item: firstItem },
-          { type: "response.completed", response: { id: "resp-first", status: "completed", output: [firstItem],
-            usage: { input_tokens: 11, output_tokens: 1, total_tokens: 12 } } }], newline);
-        const later = frames([tail === "response.completed"
-          ? { type: tail, response: { id: "resp-later", status: "completed", output: [laterItem],
-            usage: { input_tokens: 99, output_tokens: 1, total_tokens: 100 } } }
-          : { type: tail, response: { status: "failed", error: { code: "server_error", message: "Late failure" } } }], newline);
-        const hasTrigger = (payload: JsonObject) => Array.isArray(payload.input) &&
-          payload.input.some((item) => isObject(item) && item.type === "compaction_trigger");
-        const fixture = await sessionFixture({
-          api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
-          models: (base) => [base, { ...base, id: summaryModelId, name: "Fixture text summary" }],
-          settings: { retry: { enabled: false, provider: { maxRetries: 1 } } },
-          respond: ({ payload }) => {
-            if (!hasTrigger(payload)) return;
-            const chunks = layout === "same chunk" ? [first + later] : [first, later];
-            const encoder = new TextEncoder();
-            return new Response(new ReadableStream<Uint8Array>({
-              start(controller) {
-                for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
-                controller.close();
-              },
-            }), { headers: streamHeaders });
+function hasTrigger(payload: JsonObject): boolean {
+  return Array.isArray(payload.input) && payload.input.some((item) => isObject(item) && item.type === "compaction_trigger");
+}
+
+test("uses response.done as a terminal event only on Codex Responses", async () => {
+  const events = [partialDone,
+    { type: "response.done", response: { id: "resp-alias", status: "completed", output: [partialItem],
+      usage: { input_tokens: 23, output_tokens: 1, total_tokens: 24 } } },
+    { type: "response.completed", response: { id: "resp-alias", status: "completed", output: [partialItem],
+      usage: { input_tokens: 91, output_tokens: 1, total_tokens: 92 } } },
+  ];
+  const usages = await Promise.all((["openai-responses", "openai-codex-responses"] as const).map(async (api) => {
+    const f = await fixture(api);
+    const result = await requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(() => sse(events)) });
+    assert.deepEqual(result.item, partialItem);
+    f.assertAttempts(1);
+    return result.usage.input;
+  }));
+  assert.deepEqual(usages, [91, 23]);
+});
+
+const responsesApis = ["openai-responses", "openai-codex-responses"] as const;
+const layouts = [
+  ...responsesApis.map((api) => [[api], "LF", "\n", "same chunk", "text/event-stream"] as const),
+  [["openai-responses"], "LF", "\n", "separate chunks", "text/event-stream"],
+  [["openai-responses"], "CRLF", "\r\n", "same chunk", "text/event-stream"],
+  [["openai-responses"], "CRLF", "\r\n", "separate chunks", "text/event-stream"],
+  [responsesApis, "LF", "\n", "same chunk", undefined],
+  [responsesApis, "LF", "\n", "same chunk", "text/plain"],
+] as const;
+for (const [apis, lineEnding, newline, layout, contentType] of layouts) {
+  for (const tail of ["response.completed", "response.failed"] as const) {
+    const format = contentType === "text/event-stream" ? "SSE" : `SSE with ${contentType ?? "no Content-Type"}`;
+    test(`${apis.join(" and ")}: first ${format} completion wins over ${tail} (${lineEnding}, ${layout})`,
+      { timeout: 20_000 }, async (t) => {
+        for (const api of apis) {
+          const firstItem = { type: "compaction", encrypted_content: "first-checkpoint" };
+          const laterItem = { type: "compaction", encrypted_content: "later-checkpoint" };
+          const first = frames([created, { type: "response.output_item.done", output_index: 0, item: firstItem },
+            { type: "response.completed", response: { id: "resp-first", status: "completed", output: [firstItem],
+              usage: { input_tokens: 11, output_tokens: 1, total_tokens: 12 } } }], newline);
+          const later = frames([tail === "response.completed"
+            ? { type: tail, response: { id: "resp-later", status: "completed", output: [laterItem],
+              usage: { input_tokens: 99, output_tokens: 1, total_tokens: 100 } } }
+            : { type: tail, response: { status: "failed", error: { code: "server_error", message: "Late failure" } } }], newline);
+          const fixture = await sessionFixture({
+            api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+            models: (base) => [base, { ...base, id: summaryModelId, name: "Fixture text summary" }],
+            settings: { retry: { enabled: false, provider: { maxRetries: 1 } } },
+            respond: ({ payload }) => {
+              if (!hasTrigger(payload)) return;
+              const chunks = layout === "same chunk" ? [first + later] : [first, later];
+              const encoder = new TextEncoder();
+              return new Response(new ReadableStream<Uint8Array>({
+                start(controller) {
+                  for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+                  controller.close();
+                },
+              }), { headers: contentType === undefined ? {} : { "content-type": contentType } });
+            },
+          });
+          t.after(() => fixture.close());
+          await mkdir(dirname(compactionConfig), { recursive: true });
+          await writeFile(compactionConfig, JSON.stringify({ version: 2,
+            summaryModel: { provider: fixture.model.provider, model: summaryModelId, thinkingLevel: "low" } }));
+          for (let turn = 1; turn <= 3; turn++) {
+            await fixture.session.prompt(`Task ${turn}: ${"Preserve the agreed implementation constraints. ".repeat(60)}`);
+          }
+          const start = fixture.requests.length;
+          await fixture.session.compact();
+          const entry = getLatestCompactionEntry(fixture.session.sessionManager.getBranch());
+          assert.deepEqual({
+            requests: fixture.requests.slice(start).map(({ payload }) => ({ model: payload.model, v2: hasTrigger(payload) })),
+            item: entry && parseCheckpointDetails(entry.details)?.replacementHistory.at(-1),
+            inputTokens: entry?.usage?.input,
+          }, { requests: [{ model: fixture.model.id, v2: true }], item: firstItem, inputTokens: 11 });
+        }
+      });
+  }
+}
+
+for (const api of responsesApis) {
+  for (const abort of [false, true]) {
+    test(`${api}: ${abort ? "aborts" : "finishes"} compaction while source cancellation is pending`,
+      { timeout: 20_000 }, async (t) => {
+        const cancelStarted = Promise.withResolvers<void>();
+        const sourceCancel = Promise.withResolvers<void>();
+        const bytes = Buffer.from(frames([partialDone, { type: "response.completed", response: {
+          id: "resp-cancel", status: "completed", output: [partialItem],
+          usage: { input_tokens: 11, output_tokens: 1, total_tokens: 12 },
+        } }]));
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) { controller.enqueue(bytes); },
+          cancel() {
+            cancelStarted.resolve();
+            return sourceCancel.promise;
           },
         });
-        t.after(() => fixture.close());
-        await mkdir(dirname(compactionConfig), { recursive: true });
-        await writeFile(compactionConfig, JSON.stringify({ version: 2,
-          summaryModel: { provider: fixture.model.provider, model: summaryModelId, thinkingLevel: "low" } }));
+        const f = await sessionFixture({
+          api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+          respond: ({ payload }) => hasTrigger(payload) ? new Response(body, { headers: streamHeaders }) : undefined,
+        });
+        t.after(() => f.close());
         for (let turn = 1; turn <= 3; turn++) {
-          await fixture.session.prompt(`Task ${turn}: ${"Preserve the agreed implementation constraints. ".repeat(60)}`);
+          await f.session.prompt(`Task ${turn}: ${"Preserve the agreed implementation constraints. ".repeat(60)}`);
         }
-        const start = fixture.requests.length;
-        await fixture.session.compact();
-        const entry = getLatestCompactionEntry(fixture.session.sessionManager.getBranch());
-        assert.deepEqual({
-          requests: fixture.requests.slice(start).map(({ payload }) => ({ model: payload.model, v2: hasTrigger(payload) })),
-          item: entry && parseCheckpointDetails(entry.details)?.replacementHistory.at(-1),
-          inputTokens: entry?.usage?.input,
-        }, { requests: [{ model: fixture.model.id, v2: true }], item: firstItem, inputTokens: 11 });
+        const start = f.requests.length;
+        const run = f.session.compact();
+        const outcome = abort ? assert.rejects(run, /Compaction cancelled/) : run;
+        const deadline = delay(2_000, "deadline", { ref: false });
+        try {
+          assert.equal(await Promise.race([cancelStarted.promise, outcome.then(() => "settled"), deadline]), undefined,
+            "the source receives cancel after streaming completion");
+          if (abort) f.session.abortCompaction();
+          assert.equal(await Promise.race([outcome.then(() => "settled"), deadline]), "settled",
+            "Pi compaction settles while the source cancel promise is pending");
+          assert.equal(f.session.isCompacting, false);
+          assert.equal(body.locked, false);
+          assert.equal(f.requests.length - start, 1);
+          const entry = getLatestCompactionEntry(f.session.sessionManager.getBranch());
+          if (abort) assert.equal(entry, null);
+          else assert.equal(entry?.usage?.input, 11);
+        } finally {
+          sourceCancel.resolve();
+          await Promise.allSettled([outcome]);
+        }
       });
-    }
   }
 
   test(`${api}: trims tool output to the actual prepared model's physical window`, async () => {
