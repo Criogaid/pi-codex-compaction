@@ -89,11 +89,24 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         const ordinary = declarations(ordinaryPayload);
         assert.doesNotMatch(JSON.stringify(ordinary), /internal_read/);
         if (change !== "thinking") assert.match(JSON.stringify(ordinary), /visible_read/);
-        if (additive) {
-          assert.equal(ordinary.additions.length, 1, "ordinary tool additions stay anchored in history");
-          assert.equal(ordinary.additions[0].type, change === "tool search" ? "tool_search_output" : "additional_tools");
+        if (change === "tool search") {
+          assert.deepEqual(ordinary.additions.map((item) => item.type), ["tool_search_output"]);
         }
-        if (change === "removal") assert.equal(ordinary.additions.length, 0, "Pi flattens non-additive tool changes");
+        if (change === "additions" || change === "removal") {
+          assert.deepEqual(ordinary.tools, []);
+          assert.deepEqual(ordinary.additions.map((item) => item.type), ["additional_tools", "additional_tools"]);
+          const names = ordinary.additions.map(({ tools }) => {
+            assert.ok(Array.isArray(tools));
+            return tools.map((tool: unknown) => isObject(tool) && tool.name);
+          });
+          assert.deepEqual(names, [change === "removal" ? ["router", "retired_read"] : ["router"], ["visible_read"]]);
+          if (change === "removal") {
+            const input = ordinaryPayload.input;
+            assert.ok(Array.isArray(input));
+            assert.ok(input.some((item) => isObject(item) && item.role === "developer" &&
+              typeof item.content === "string" && item.content.includes("Do not call them:\n- retired_read")));
+          }
+        }
         if (change === "thinking") {
           const history = toolHistory(ordinaryPayload);
           assert.equal(history.length, 4, "the real agent executed both provider-issued tool calls");
