@@ -67,9 +67,12 @@ export interface CompactionCollector {
   finish(): JsonObject;
 }
 
-/** Count output-item completion events, as Codex does; response.output is not another source. */
+/**
+ * Count only output-item completion events, as Codex does: a second one anywhere in the
+ * attempt is rejected, and the final response must carry the one item.
+ */
 export function createCompactionCollector(): CompactionCollector {
-  let count = 0;
+  let outputs = 0;
   let item: JsonObject | undefined;
   let completed = false;
   return {
@@ -77,13 +80,14 @@ export function createCompactionCollector(): CompactionCollector {
       if (!isObject(event)) return;
       // A provider may restart its response when falling back from WebSocket to HTTP.
       if (event.type === "response.created") {
-        count = 0;
         item = undefined;
         completed = false;
       }
       if (event.type === "response.output_item.done" && isObject(event.item) &&
           isCompactionType(event.item.type)) {
-        count += 1;
+        if (++outputs > 1) {
+          throw new CodexCompactionProtocolError("Remote compaction returned duplicate compaction output events");
+        }
         item = validateCompactionItem(event.item);
       }
       // Pi exposes raw Codex events before normalizing the successful response.done alias.
@@ -104,9 +108,9 @@ export function createCompactionCollector(): CompactionCollector {
           "Remote compaction stream ended without response.completed",
         );
       }
-      if (count !== 1 || !item) {
+      if (!item) {
         throw new CodexCompactionProtocolError(
-          `Remote compaction returned ${count} compaction output events; expected exactly one`,
+          "Remote compaction returned 0 compaction output events; expected exactly one",
         );
       }
       return item;

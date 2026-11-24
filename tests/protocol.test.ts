@@ -5,6 +5,10 @@ import { CodexCompactionProtocolError, createCompactionCollector, isObject, prep
 const item = { type: "compaction", encrypted_content: "opaque" };
 const done = { type: "response.output_item.done", item };
 const completed = { type: "response.completed", response: { output: [item] } };
+const duplicateOutputError = {
+  name: CodexCompactionProtocolError.name,
+  message: "Remote compaction returned duplicate compaction output events",
+};
 
 test("counts one completed output item without counting response.output twice", () => {
   const collector = createCompactionCollector();
@@ -86,9 +90,7 @@ test("preparing V2 preserves tool declarations and loading history before the tr
 test("rejects identical duplicate output events as Codex does", () => {
   const collector = createCompactionCollector();
   collector.observe(done);
-  collector.observe(done);
-  collector.observe(completed);
-  assert.throws(() => collector.finish(), CodexCompactionProtocolError);
+  assert.throws(() => collector.observe(done), duplicateOutputError);
 });
 
 test("requires output_item.done and response.completed", () => {
@@ -100,14 +102,32 @@ test("requires output_item.done and response.completed", () => {
   assert.throws(() => incomplete.finish(), CodexCompactionProtocolError);
 });
 
-test("accepts the upstream compaction_summary alias and resets on a retried response", () => {
+test("accepts the compaction_summary alias and clears the selected item and completion on restart", () => {
   const collector = createCompactionCollector();
-  collector.observe(done);
-  collector.observe({ type: "response.created" });
   const alias = { ...item, type: "compaction_summary" };
   collector.observe({ ...done, item: alias });
-  collector.observe(completed);
+  collector.observe({ ...completed, response: { output: [alias] } });
   assert.deepEqual(collector.finish(), item);
+
+  const restart = { type: "response.created" };
+  collector.observe(restart);
+  assert.throws(() => collector.finish(), {
+    name: CodexCompactionProtocolError.name,
+    message: "Remote compaction stream ended without response.completed",
+  });
+  collector.observe({ ...completed, response: { output: [] } });
+  assert.throws(() => collector.finish(), {
+    name: CodexCompactionProtocolError.name,
+    message: "Remote compaction returned 0 compaction output events; expected exactly one",
+  });
+
+  const duplicate = createCompactionCollector();
+  duplicate.observe(done);
+  duplicate.observe(restart);
+  assert.throws(
+    () => duplicate.observe({ ...done, item: { type: alias.type } }),
+    duplicateOutputError,
+  );
 });
 
 test("accepts opaque output and event volume above the former plugin-only byte ceilings", () => {

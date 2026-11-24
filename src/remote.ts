@@ -98,7 +98,6 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     const attempt = new CompactionAttempt();
     const collector = createCompactionCollector();
     let usage: Usage | undefined;
-    let compactionCount = 0;
     let fetched = false;
     const routedFetch: typeof globalThis.fetch = async (input, init) => {
       try {
@@ -207,10 +206,6 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
           const transient = attempt.observeEvent(event);
           if (transient) throw transient;
           try {
-            if (isObject(event) && event.type === "response.output_item.done" && isObject(event.item) &&
-                (event.item.type === "compaction" || event.item.type === "compaction_summary") && ++compactionCount > 1) {
-              throw new CodexCompactionProtocolError("Remote compaction returned duplicate compaction output events");
-            }
             collector.observe(event);
           } catch (error) {
             attempt.blockRetry(error);
