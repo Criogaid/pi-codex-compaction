@@ -609,6 +609,51 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     assert.deepEqual(fixture.errors, []);
   });
 
+  test(`${api} V2 keeps the forced prompt when a projected note is persisted`, async (t) => {
+    const force = "Keep the forced instructions for this task.";
+    const note = { customType: "projected-note", content: "Keep the recorded decision with this task.", display: false };
+    const noteItems = (payload: JsonObject) => inputItems(payload).filter((item) => hasUserText(item, note.content));
+    const fixture = await sessionFixture({ api, extensions: [codexCompaction, (pi) => {
+      pi.on("before_agent_start", () => ({ systemPrompt: force }));
+      pi.on("context", ({ messages }) => {
+        if (messages.some((message) => message.role === "custom" && message.customType === note.customType)) return;
+        return { messages: [...messages, { role: "custom", ...note, timestamp: Date.now() }] };
+      });
+    }] });
+    t.after(() => fixture.close());
+
+    const { session } = fixture;
+    await session.prompt(warmup);
+    await session.prompt(warmup);
+    const initial = lastPayload(fixture);
+    assert.deepEqual(noteItems(initial), [userItem(note.content)]);
+    assert.ok(!session.sessionManager.buildSessionContext().messages.some((message) =>
+      message.role === "custom" && message.customType === note.customType));
+
+    const requestCount = fixture.requests.length;
+    await session.sendCustomMessage(note, { triggerTurn: false });
+    assert.equal(fixture.requests.length, requestCount);
+    const leaf = session.sessionManager.getLeafId();
+    assert.ok(leaf);
+    await compactInput(fixture);
+    const v2 = lastPayload(fixture);
+    const nextPrompt = "Continue with the recorded decision.";
+    const next = await nextOrdinaryFrom(fixture, leaf, nextPrompt);
+
+    for (const payload of [next, v2]) {
+      assert.deepEqual(noteItems(payload), [userItem(note.content)]);
+      if (api === "openai-codex-responses") {
+        assert.equal(payload.instructions, force);
+      } else {
+        assert.deepEqual(inputItems(payload)[0], { role: "developer", content: force });
+      }
+    }
+    assert.deepEqual(inputItems(next).at(-1), userItem(nextPrompt));
+    assert.deepEqual(inputItems(v2).slice(0, -1), inputItems(next).slice(0, -1));
+    assert.equal(v2.instructions, next.instructions);
+    assert.deepEqual(fixture.errors, []);
+  });
+
   test(`${api} V2 uses model B's ordinary prompt after a provider hook switches models`, async (t) => {
     const force = "FORCE";
     const forcedTurn = `${warmup} Switch models after the context has been prepared.`;
