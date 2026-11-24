@@ -280,10 +280,14 @@ export interface RequestSnapshots {
   readonly providerRequest?: ProviderRequestSnapshot;
 }
 
+type PendingRequest =
+  | { readonly stage: "context"; readonly source: SourceSnapshot }
+  | { readonly stage: "projected"; readonly source: SourceSnapshot; readonly context: ContextSnapshot; readonly requiresReplay: boolean }
+  | { readonly stage: "unmatched" };
+
 interface TrackedSnapshots {
   promptOverride?: PromptOverride;
-  pendingSource?: SourceSnapshot;
-  pendingContext?: { readonly source: SourceSnapshot; readonly context: ContextSnapshot; readonly requiresReplay: boolean };
+  pending?: PendingRequest;
   context?: ContextSnapshot;
   providerRequest?: ProviderRequestSnapshot;
 }
@@ -295,8 +299,7 @@ type RunPrompt = { readonly sessionId: string } & (
 
 /**
  * Follow one ordinary request through Pi's hooks: `context`, then `context_with_system`, then
- * `before_provider_request` for each provider attempt, then `agent_settled` when its run ends.
- * State lives only as long as the Pi process.
+ * `before_provider_request` for serialization, then the assistant's `message_end`.
  */
 export class RequestSnapshotTracker {
   private state: TrackedSnapshots = {};
@@ -305,12 +308,12 @@ export class RequestSnapshotTracker {
   /** Forget every snapshot; a compaction that already started keeps the state it captured. */
   reset(): void {
     this.runPrompt = undefined;
-    this.discardSnapshots();
+    this.state = {};
   }
 
-  /** Drop invalid request state without losing the current run's prompt sample. */
+  /** Drop invalid snapshots while keeping an active request distinct from a prewarm without context. */
   discardSnapshots(): void {
-    this.state = {};
+    this.state = this.state.pending ? { pending: { stage: "unmatched" } } : {};
   }
 
   /** The live snapshots a compaction reads; later provider requests may still update them. */
@@ -329,9 +332,10 @@ export class RequestSnapshotTracker {
     if (run && "options" in run) {
       this.runPrompt = run.sessionId === sessionId ? { sessionId, forced: run.options.forceSystemPrompt } : undefined;
     }
-    this.state.pendingSource = target ? { sessionId, identity: target.identity,
-      sourceFingerprints: canonical().map(fingerprintMessage) } : undefined;
-    this.state.pendingContext = undefined;
+    this.state.pending = target ? {
+      stage: "context",
+      source: { sessionId, identity: target.identity, sourceFingerprints: canonical().map(fingerprintMessage) },
+    } : { stage: "unmatched" };
   }
 
   /** `context_with_system`: bind the projection only while its canonical source and scope remain unchanged. */
@@ -343,16 +347,16 @@ export class RequestSnapshotTracker {
     projected: readonly AgentMessage[],
     requiresReplay: boolean,
   ): void {
-    const pending = target && snapshotFor(this.state.pendingSource, sessionId, target);
-    this.state.pendingSource = undefined;
-    this.state.pendingContext = undefined;
-    if (!target || !pending) return;
+    const pending = this.state.pending;
+    if (!pending) return;
+    this.state.pending = { stage: "unmatched" };
+    if (pending.stage !== "context" || !target || !snapshotFor(pending.source, sessionId, target)) return;
     const messages = canonical();
-    if (messages.length !== pending.sourceFingerprints.length || !matchesSourcePrefix(messages, pending)) return;
+    if (messages.length !== pending.source.sourceFingerprints.length || !matchesSourcePrefix(messages, pending.source)) return;
     const prior = checkpoint();
     const source = prior ? projectCheckpointRequest(messages, prior) : messages;
-    if (source) this.state.pendingContext = {
-      source: pending, context: captureContextSnapshot(sessionId, target, source, projected), requiresReplay,
+    if (source) this.state.pending = {
+      stage: "projected", source: pending.source, context: captureContextSnapshot(sessionId, target, source, projected), requiresReplay,
     };
   }
 
@@ -364,15 +368,16 @@ export class RequestSnapshotTracker {
     systemPrompt: () => string,
     observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs; readonly replay: "applied" | "skipped" | "failed" },
   ): void {
+    const pending = this.state.pending;
+    // Pi's warmer can reuse the payload hook without starting a new context.
+    if (!pending) return;
     this.state.providerRequest = undefined;
     this.state.promptOverride = undefined;
     const messages = target ? canonical() : undefined;
-    // Keep a valid pending snapshot for retries that do not run context hooks again. Any source change
-    // invalidates that binding before publishing, including changes made by later context handlers.
-    const matched = this.state.pendingContext;
-    if (!target || !messages || !matched || !snapshotFor(matched.source, sessionId, target) ||
-        messages.length !== matched.source.sourceFingerprints.length || !matchesSourcePrefix(messages, matched.source)) {
-      this.state.pendingContext = undefined;
+    // Strict-tool fallback can re-serialize a request without running the context hooks again.
+    if (!target || !messages || pending.stage !== "projected" || !snapshotFor(pending.source, sessionId, target) ||
+        messages.length !== pending.source.sourceFingerprints.length || !matchesSourcePrefix(messages, pending.source)) {
+      this.state.pending = { stage: "unmatched" };
       this.state.context = undefined;
       return;
     }
@@ -382,10 +387,14 @@ export class RequestSnapshotTracker {
       const head = getCurrentSystemMessage(messages);
       this.state.promptOverride = { text: forced, sourcePrompt: head && getSystemMessageText(head) };
     }
-    this.state.context = matched.context;
+    this.state.context = pending.context;
     const { payload, inputs, replay } = observation();
-    const replayMissing = replay !== "applied" && (matched.requiresReplay || replay === "failed");
-    this.state.providerRequest = captureProviderRequest(matched.context, target, payload, inputs, replayMissing);
+    const replayMissing = replay !== "applied" && (pending.requiresReplay || replay === "failed");
+    this.state.providerRequest = captureProviderRequest(pending.context, target, payload, inputs, replayMissing);
+  }
+
+  endRequest(): void {
+    this.state.pending = undefined;
   }
 
   /**
@@ -395,6 +404,7 @@ export class RequestSnapshotTracker {
    */
   recordSettledRun(sessionId: string, target: CapableModel | undefined, inputs: () => ProviderRequestInputs): void {
     this.runPrompt = undefined;
+    this.endRequest();
     if (!target) return;
     const snapshot = snapshotFor(this.state.providerRequest, sessionId, target);
     if (!snapshot || snapshot.settledInputsKey !== undefined) return;

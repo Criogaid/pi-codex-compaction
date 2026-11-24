@@ -505,6 +505,10 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     }
   });
 
+  pi.on("message_end", (event) => {
+    if (event.message.role === "assistant") snapshots.endRequest();
+  });
+
   pi.on("agent_settled", (_event, ctx) => {
     snapshots.recordSettledRun(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => providerRequestInputs(pi, ctx));
   });
