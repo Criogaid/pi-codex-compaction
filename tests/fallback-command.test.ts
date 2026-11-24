@@ -470,7 +470,7 @@ test("TUI effort switch toggles on the same row, preserves other settings, and r
   assert.deepEqual(current.effortChanges, [true, false, true]);
   assert.deepEqual(current.notices, [
     { message: "Codex reasoning effort updates are On for chat requests and V2.", level: "info" },
-    { message: "Codex reasoning effort updates are Off. Requests keep Pi's reasoning effort updates.", level: "info" },
+    { message: "Codex reasoning effort updates are Off in this extension.", level: "info" },
     { message: "Codex reasoning effort updates are On for chat requests and V2.", level: "info" },
   ]);
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
