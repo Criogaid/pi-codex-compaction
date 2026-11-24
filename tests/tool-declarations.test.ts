@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { createCodexCompactionExtension } from "../src/index.js";
+import codexCompaction from "../src/index.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, sessionFixture } from "./helpers.js";
 
@@ -71,7 +71,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         : change === "removal" ? ["router", "internal_read", "retired_read"] : ["router", "internal_read", "grammar_read"];
       let calledTools = false;
       const fixture = await sessionFixture({ api, extensions: [
-        hiddenLoadout(initial, (pi) => { controls = pi; }), createCodexCompactionExtension(),
+        hiddenLoadout(initial, (pi) => { controls = pi; }), codexCompaction,
       ], respond: () => {
         if (change !== "thinking" || calledTools) return undefined;
         calledTools = true;
@@ -124,7 +124,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 
   test(`${api} changing the theme preserves the observed tools and input prefix`, { timeout: 20_000 }, async () => {
     const fixture = await sessionFixture({ api, extensions: [
-      hiddenLoadout(["router", "internal_read"], () => {}), createCodexCompactionExtension(),
+      hiddenLoadout(["router", "internal_read"], () => {}), codexCompaction,
     ] });
     try {
       for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(prompt(turn));
@@ -147,7 +147,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     test(`${api} compaction uses serialized declarations after ${change} invalidates the snapshot`, { timeout: 20_000 }, async () => {
       let controls: ExtensionAPI | undefined;
       const fixture = await sessionFixture({ api, extensions: [
-        hiddenLoadout(["router", "internal_read"], (pi) => { controls = pi; }), createCodexCompactionExtension(),
+        hiddenLoadout(["router", "internal_read"], (pi) => { controls = pi; }), codexCompaction,
       ] });
       try {
         for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(prompt(turn));
@@ -185,7 +185,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         } });
         pi.on("session_start", (_event, ctx) => { context = ctx; });
       },
-      createCodexCompactionExtension(),
+      codexCompaction,
     ] });
     try {
       for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(prompt(turn));

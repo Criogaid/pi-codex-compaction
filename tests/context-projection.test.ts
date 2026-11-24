@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { createCodexCompactionExtension } from "../src/index.js";
+import codexCompaction from "../src/index.js";
 import { isObject } from "../src/protocol.js";
 import { fixtureImage, isolateAgentConfig, sessionFixture } from "./helpers.js";
 
@@ -45,10 +45,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
                 prompt_cache_options: { ttl: "30m" }, parallel_tool_calls: false, text: { verbosity: "medium" } };
             });
             const fixture = await sessionFixture({ api,
-              extensions: (fetch) => {
-                const compactor = createCodexCompactionExtension({ fetch });
-                return [wireSettings, ...(order === "before" ? [transform, compactor] : [compactor, transform])];
-              },
+              extensions: [wireSettings, ...(order === "before" ? [transform, codexCompaction] : [codexCompaction, transform])],
               settings: { images: { blockImages }, retry: { enabled: false, provider: { maxRetries: retry ? 1 : 0, maxRetryDelayMs: 1 } } },
               respond: ({ payload }) => {
                 if (!failNext || !Array.isArray(payload.input) || !payload.input.some((item) => isObject(item) && item.type === "compaction_trigger")) return;
@@ -103,8 +100,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 
     test(`${api} does not duplicate a transient projection persisted after the request with capture ${order}`, { timeout: 20_000 }, async () => {
       const transform: ExtensionFactory = (pi) => void pi.on("context", (event) => ({ messages: [...event.messages, transientMessage()] }));
-      const compactor = createCodexCompactionExtension();
-      const fixture = await sessionFixture({ api, extensions: order === "before" ? [transform, compactor] : [compactor, transform] });
+      const fixture = await sessionFixture({ api, extensions: order === "before" ? [transform, codexCompaction] : [codexCompaction, transform] });
       try {
         for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Preserve the current task. ".repeat(80)}`);
         fixture.session.sessionManager.appendCustomMessageEntry("fixture-projection", transientText, false, { persisted: true });
@@ -130,7 +126,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         return { messages: event.messages.filter((message) => message.role !== "compactionSummary") };
       });
     };
-    const fixture = await sessionFixture({ api, extensions: [transform, createCodexCompactionExtension()] });
+    const fixture = await sessionFixture({ api, extensions: [transform, codexCompaction] });
     try {
       for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the task. ".repeat(80)}`);
       await fixture.session.compact();

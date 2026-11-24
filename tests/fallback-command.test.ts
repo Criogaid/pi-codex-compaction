@@ -6,7 +6,7 @@ import type { Model, Provider } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
-import { createCodexCompactionExtension } from "../src/index.js";
+import codexCompaction from "../src/index.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
 import { isolateAgentConfig, testRegistry } from "./helpers.js";
 
@@ -38,7 +38,7 @@ async function fixture(choices: readonly Choice[], availableModel: Model<"openai
     registerCommand(name: string, command: Command) { commands.set(name, command); },
     on() {}, registerEntryRenderer() {},
   } as unknown as ExtensionAPI;
-  createCodexCompactionExtension()(pi);
+  codexCompaction(pi);
   const rejectCompletion = () => { throw new Error("The settings command must not request a completion"); };
   const provider: Provider<"openai-responses"> = {
     id: "cheap", name: "Cheap provider", baseUrl: model.baseUrl, auth: {} as Provider["auth"],

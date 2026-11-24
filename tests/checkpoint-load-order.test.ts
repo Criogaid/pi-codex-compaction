@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { createCodexCompactionExtension } from "../src/index.js";
+import codexCompaction from "../src/index.js";
 import { checkpointMarker, parseCheckpointDetails } from "../src/checkpoint.js";
 import { hasCheckpointMarker, isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, sessionFixture } from "./helpers.js";
@@ -45,8 +45,7 @@ async function run(
   order: "before" | "after",
 ): Promise<{ readonly ordinary: JsonObject[]; readonly compact: JsonObject[] }> {
   const hook: ExtensionFactory = (pi) => void pi.on("context", (event) => ({ messages: transform(event.messages) }));
-  const compactor = createCodexCompactionExtension();
-  const fixture = await sessionFixture({ api, extensions: order === "before" ? [hook, compactor] : [compactor, hook] });
+  const fixture = await sessionFixture({ api, extensions: order === "before" ? [hook, codexCompaction] : [codexCompaction, hook] });
   try {
     for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the decisions. ".repeat(80)}`);
     await fixture.session.compact();
@@ -102,9 +101,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     });
 
     for (const order of ["after", "before"] as const) {
-      const compactor = createCodexCompactionExtension();
       const fixture = await sessionFixture({ api, extensions: [cachePolicy,
-        ...(order === "before" ? [referenceHistory, compactor] : [compactor, referenceHistory])] });
+        ...(order === "before" ? [referenceHistory, codexCompaction] : [codexCompaction, referenceHistory])] });
       try {
         incremental = false;
         for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the decisions. ".repeat(80)}`);
@@ -145,7 +143,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       assert.ok(isObject(payload));
       return { ...payload, reasoning: new Proxy({ effort: "low" }, {}) };
     });
-    const fixture = await sessionFixture({ api, extensions: [proxyField, createCodexCompactionExtension()] });
+    const fixture = await sessionFixture({ api, extensions: [proxyField, codexCompaction] });
     try {
       for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the decisions. ".repeat(80)}`);
       const { details } = await fixture.session.compact();
@@ -185,7 +183,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
           reasoning: new Proxy({ effort: "low" }, {}) };
       });
     };
-    const fixture = await sessionFixture({ api, extensions: [editRequest, createCodexCompactionExtension()] });
+    const fixture = await sessionFixture({ api, extensions: [editRequest, codexCompaction] });
     try {
       for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the decisions. ".repeat(80)}`);
       const { details } = await fixture.session.compact();
@@ -242,7 +240,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
           prompt_cache_key: "fixture-replay-error-cache", prompt_cache_options: { ttl: "30m" } };
       });
     };
-    const fixture = await sessionFixture({ api, extensions: [editRequest, createCodexCompactionExtension()] });
+    const fixture = await sessionFixture({ api, extensions: [editRequest, codexCompaction] });
     try {
       for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the decisions. ".repeat(80)}`);
       const { details } = await fixture.session.compact();
@@ -297,7 +295,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         assert.deepEqual(edited, { ...original, content: editedText }, "Pi supplies the saved edit to the context hook");
         return { messages: event.messages.map((message) => message === edited ? original : message) };
       });
-      const fixture = await sessionFixture({ api, extensions: [createCodexCompactionExtension(), restoreOriginal] });
+      const fixture = await sessionFixture({ api, extensions: [codexCompaction, restoreOriginal] });
       try {
         await fixture.session.prompt("Start the task.");
         await fixture.session.prompt("Work on the first decision.");

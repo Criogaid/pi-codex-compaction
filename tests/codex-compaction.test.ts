@@ -1,7 +1,7 @@
 import { mkdir, writeFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import {
   createAssistantMessageEventStream,
   getCurrentSystemMessage,
@@ -26,12 +26,15 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, parseCheckpointDetails } from "../src/checkpoint.js";
-import { createCodexCompactionExtension } from "../src/index.js";
-import { isolateAgentConfig, sessionFixture, testRegistry } from "./helpers.js";
+import codexCompaction from "../src/index.js";
+import { isolateAgentConfig, mockFetch, sessionFixture, testRegistry } from "./helpers.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 
 const fallbackSettingsPath = join(isolateAgentConfig(), "extensions", "pi-codex-compaction", "config.json");
 await mkdir(dirname(fallbackSettingsPath), { recursive: true });
+let defaultFetchScope: Disposable;
+beforeEach(() => { defaultFetchScope = mockFetch(async () => sseResponse()); });
+afterEach(() => defaultFetchScope[Symbol.dispose]());
 afterEach(() => rm(fallbackSettingsPath, { force: true }));
 
 const capability = {
@@ -235,7 +238,6 @@ function sseResponse() {
   );
 }
 
-const fetchSse = (async () => sseResponse()) as unknown as typeof globalThis.fetch;
 
 async function compactSession(
   mock: ReturnType<typeof mockPi>,
@@ -296,7 +298,7 @@ async function assertSessionReplay(
 for (const scenario of ["replacement", "omission", "older checkpoints", "system update"] as const) {
   test(`replays newly created checkpoints with ${scenario} in Pi's retained context`, async () => {
     const mock = mockPi();
-    createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+    codexCompaction(mock.pi);
     const sessionManager = SessionManager.inMemory();
     sessionManager.appendMessage({ role: "user", content: "older", timestamp: 0 });
     const firstKeptEntryId = sessionManager.appendMessage({ role: "user", content: "kept start", timestamp: 1 });
@@ -320,7 +322,7 @@ for (const scenario of ["replacement", "omission", "older checkpoints", "system 
 
 test("replays and recompacts legacy checkpoints through Pi lifecycle hooks", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const sessionManager = SessionManager.inMemory();
   sessionManager.appendMessage({ role: "user", content: "older", timestamp: 0 });
   const original = { role: "user" as const, content: "original retained message", timestamp: 1 };
@@ -347,7 +349,7 @@ test("replays and recompacts legacy checkpoints through Pi lifecycle hooks", asy
 
 test("does not notify when a session starts", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension()(mock.pi);
+  codexCompaction(mock.pi);
   const current = await context();
   const start = mock.events.get("session_start")?.[0];
   await start?.({ type: "session_start", reason: "startup" }, current.ctx);
@@ -356,7 +358,7 @@ test("does not notify when a session starts", async () => {
 
 test("compacts GPT models without metadata through the registered provider", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
   const current = await context({ model: { ...model, compat: undefined } });
   const result = await compact?.(compactEvent(), current.ctx) as {
@@ -370,7 +372,7 @@ test("compacts GPT models without metadata through the registered provider", asy
 
 test("creates and resumes a checkpoint for a configured custom provider", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
   const initial = branch();
   const current = await context({ entries: initial });
@@ -462,7 +464,7 @@ test("V2 rebuilds history when an earlier provider hook removes the checkpoint m
         return { role: "user", content: [{ type: "input_text", text: wireOnlyText }] };
       }) };
     }),
-    createCodexCompactionExtension(),
+    codexCompaction,
   ] });
   try {
     for (let turn = 1; turn <= 3; turn++) {
@@ -503,7 +505,7 @@ test("V2 rebuilds history when an earlier provider hook removes the checkpoint m
 
 test("provider switches do not replay opaque history", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension()(mock.pi);
+  codexCompaction(mock.pi);
   const details = parseCheckpointDetails({
     kind: "pi-codex-compaction",
     version: 1,
@@ -539,7 +541,7 @@ test("provider switches do not replay opaque history", async () => {
 
 test("configured auth failures fall back to native Pi compaction", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
   const failed = await context({
     modelRegistry: await testRegistry(fakeProvider(), async () => { throw new Error("missing auth"); }),
@@ -555,7 +557,7 @@ test("configured auth failures fall back to native Pi compaction", async () => {
 
 test("cancels a pending compaction when session ownership changes", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
   let sessionId = "session";
   let releaseAuth: (() => void) | undefined;
@@ -588,12 +590,13 @@ for (const interruption of ["abort", "session-switch"] as const) {
     const controller = new AbortController();
     const mock = mockPi("high", { transport: "sse", retry: { provider: { maxRetries: 0 } } });
     let requests = 0;
-    createCodexCompactionExtension({ fetch: async () => {
+    using _fetchScope = mockFetch(async () => {
       requests++;
       entered.resolve();
       // Simulate a server completing after the caller stopped owning the request.
       return reply.promise;
-    } })(mock.pi);
+    });
+    codexCompaction(mock.pi);
     const native = openaiProvider();
     const registry = await testRegistry({ ...native, id: model.provider });
     let sessionId = "original-session";
@@ -623,7 +626,7 @@ for (const interruption of ["abort", "session-switch"] as const) {
 
 test("non-GPT models, GPT models outside Responses APIs, and invalid metadata use Pi compaction silently", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const compact = mock.events.get("session_before_compact")?.[0];
 
   const unsupported = await context({ model: { ...model, compat: { ...{ remoteCompaction: false } } } });
@@ -649,7 +652,7 @@ test("inherits the runtime thinking level and active session for every compactio
       assert.equal(options?.sessionId, "session");
       assert.equal(options?.cacheRetention, undefined);
     });
-    createCodexCompactionExtension({ fetch: fetchSse })(pi);
+    codexCompaction(pi);
     const fixture = await context({
       modelRegistry: await testRegistry(provider),
     });
@@ -675,13 +678,13 @@ async function providerCompaction(messages: SessionMessage[], options: {
   let mock = mockPi("high", options.settings, options.tools);
   let payload: unknown;
   const requests: JsonObject[] = [];
-  const extension = createCodexCompactionExtension({ fetch: async (input, init) => {
+  using _fetchScope = mockFetch(async (input, init) => {
     payload = await new Request(input, init).json();
     assert.ok(isObject(payload));
     requests.push(structuredClone(payload));
     return options.compactionResponses?.[requests.length - 1] ?? sseResponse();
-  } });
-  extension(mock.pi);
+  });
+  codexCompaction(mock.pi);
   const sessionManager = SessionManager.inMemory();
   const entries = messages.map((message) => sessionManager.appendMessage(message));
   const firstUser = messages.findIndex((message) => message.role === "user");
@@ -754,7 +757,7 @@ async function providerCompaction(messages: SessionMessage[], options: {
     assert.equal(requests.length, 0);
     // Keep the transcript and session ID so a snapshot leak would still match.
     mock = mockPi("high", options.settings, options.tools);
-    extension(mock.pi);
+    codexCompaction(mock.pi);
     current = await context(contextOverrides);
   }
   const details = await compactSession(mock, sessionManager, entries[firstUser], current, options.customInstructions);
@@ -1014,7 +1017,7 @@ test("preserves Pi reasoning and retry delay while V2 owns retries and uses SSE"
   const observed: SimpleStreamOptions[] = [];
   const provider = fakeProvider((options) => { assert.ok(options); observed.push(options); });
   const mock = mockPi("high", settings);
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const current = await context({ modelRegistry: await testRegistry(provider) });
   const compact = mock.events.get("session_before_compact")?.[0];
   assert.ok(compact);
@@ -1045,7 +1048,7 @@ test("warns for nonempty custom instructions and leaves provider instructions un
 
 test("announces once when a provider prepares multiple retry payloads and again for the next compaction", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const current = await context({ modelRegistry: await testRegistry(fakeProvider(undefined, 3)) });
   const compact = mock.events.get("session_before_compact")?.[0];
   assert.ok(compact);
@@ -1106,7 +1109,7 @@ test("excludes string-form provider user content from the V2 checkpoint", async 
 
 test("warns about failed projection once per session and checkpoint and resets on session start", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension()(mock.pi);
+  codexCompaction(mock.pi);
   const session = SessionManager.inMemory();
   const message: AgentMessage = { role: "user", content: "kept", timestamp: 1 };
   const firstKept = session.appendMessage(message);
@@ -1148,7 +1151,7 @@ test("keeps projection failures silent without a UI or a compatible model identi
   session.appendCompaction(fallbackSummary(details.checkpointId), firstKept, 100, details);
   for (const overrides of [{ hasUI: false }, { model: { ...model, provider: "other" } }, { model: { ...model, api: "openai-completions" } }]) {
     const mock = mockPi();
-    createCodexCompactionExtension()(mock.pi);
+    codexCompaction(mock.pi);
     const current = await context({ sessionManager: session, ...overrides });
     assert.equal(await projectContext(mock, [], current.ctx), undefined);
     assert.deepEqual(current.notifications, []);
@@ -1225,7 +1228,7 @@ async function fallbackFixture(options: {
   event.preparation.firstKeptEntryId = firstKeptEntryId;
   event.preparation.messagesToSummarize = [{ role: "user", content: "older task", timestamp: 1 }];
   const mock = mockPi("low", { transport: "sse", retry: options.retry ?? { enabled: false } });
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const run = () => mock.events.get("session_before_compact")?.[0]?.(event, current.ctx) as Promise<SessionBeforeCompactResult | undefined>;
   return { ...current, mock, event, sessionManager, calls, run, remoteRequests: () => remoteRequests };
 }
@@ -1278,9 +1281,9 @@ test("uses the configured fallback after a remote failure and preserves legacy b
   await configureFallback();
   const fixture = await fallbackFixture({ currentModel: model });
   // Returning no compaction item makes the remote protocol fail after payload preparation.
-  const failedRemote = createCodexCompactionExtension({ fetch: async () => new Response("", { headers: { "content-type": "text/event-stream" } }) });
+  using _fetchScope = mockFetch(async () => new Response("", { headers: { "content-type": "text/event-stream" } }));
   fixture.mock.events.clear();
-  failedRemote(fixture.mock.pi);
+  codexCompaction(fixture.mock.pi);
   const result = await fixture.run();
   assert.ok(result?.compaction);
   assert.equal(fixture.remoteRequests(), 1);
@@ -1303,12 +1306,13 @@ test("an older compaction's Pi fallback cannot overwrite or clear the newer comp
   const requests = [firstV2, secondV2];
   let requestCount = 0;
   mock.events.clear();
-  createCodexCompactionExtension({ fetch: async () => {
+  using _fetchScope = mockFetch(async () => {
     const request = requests[requestCount++];
     assert.ok(request, "Expected exactly two V2 requests");
     request.entered.resolve();
     return request.reply.promise;
-  } })(mock.pi);
+  });
+  codexCompaction(mock.pi);
 
   const statusWrites: Array<[key: string, value: string | undefined]> = [];
   ctx.ui.setStatus = (key, value) => { statusWrites.push([key, value]); };
@@ -1358,10 +1362,11 @@ test("reload shutdown keeps the footer cleared when a pending V2 request fails",
   const entered = Promise.withResolvers<void>();
   const reply = Promise.withResolvers<Response>();
   mock.events.clear();
-  createCodexCompactionExtension({ fetch: async () => {
+  using _fetchScope = mockFetch(async () => {
     entered.resolve();
     return reply.promise;
-  } })(mock.pi);
+  });
+  codexCompaction(mock.pi);
 
   const statusKey = "codex-compaction";
   const statusWrites: Array<[key: string, value: string | undefined]> = [];
@@ -1408,13 +1413,14 @@ test("reload shutdown cancels a failed V2 request over an opaque checkpoint with
   const reply = Promise.withResolvers<Response>();
   let requests = 0;
   mock.events.clear();
-  createCodexCompactionExtension({ fetch: async (input, init) => {
+  using _fetchScope = mockFetch(async (input, init) => {
     assert.equal(++requests, 1, "Expected one V2 request after seeding the checkpoint");
     const payload: unknown = await new Request(input, init).json();
     assert.ok(isObject(payload));
     entered.resolve(payload);
     return reply.promise;
-  } })(mock.pi);
+  });
+  codexCompaction(mock.pi);
 
   const compact = mock.events.get("session_before_compact")?.[0];
   const shutdown = mock.events.get("session_shutdown")?.[0];
@@ -1452,10 +1458,11 @@ test("reload shutdown cancels a queued compaction before reading its stale conte
     await resume.promise;
   });
   let requests = 0;
-  createCodexCompactionExtension({ fetch: async () => {
+  using _fetchScope = mockFetch(async () => {
     requests++;
     return sseResponse();
-  } })(mock.pi);
+  });
+  codexCompaction(mock.pi);
 
   const { ctx } = await context();
   let stale = false;
@@ -1633,7 +1640,7 @@ test("fallback off disables reasoning and forwards Pi provider runtime settings"
     transport: "sse", thinkingBudgets: { high: 1234 }, websocketConnectTimeoutMs: 4567,
     retry: { enabled: false, provider: { timeoutMs: 7890, maxRetries: 1, maxRetryDelayMs: 2345 } },
   });
-  createCodexCompactionExtension()(mock.pi);
+  codexCompaction(mock.pi);
   const result = await mock.events.get("session_before_compact")?.[0]?.(fixture.event, fixture.ctx) as SessionBeforeCompactResult;
   assert.ok(result.compaction);
   const options = fixture.calls[0].options;
@@ -1741,7 +1748,7 @@ test("native Responses fallback authenticates and retries with the configured ef
   const registry = await testRegistry(provider, async () => ({ auth: { apiKey: "native-fixture-key" } }));
   fixture.ctx.modelRegistry = registry;
   const mock = mockPi("low", { transport: "sse", retry: { enabled: true, maxRetries: 1, baseDelayMs: 0, provider: { maxRetries: 0 } } });
-  createCodexCompactionExtension()(mock.pi);
+  codexCompaction(mock.pi);
   const result = await mock.events.get("session_before_compact")?.[0]?.(fixture.event, fixture.ctx) as SessionBeforeCompactResult;
   assert.ok(result.compaction);
   assert.equal(result.compaction.summary, "Native HTTP summary.");
@@ -1816,10 +1823,11 @@ test("a settings edit during a remote request applies to the next compaction onl
   await configureFallback();
   const fixture = await fallbackFixture({ currentModel: model });
   fixture.mock.events.clear();
-  createCodexCompactionExtension({ fetch: async () => {
+  using _fetchScope = mockFetch(async () => {
     await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, remoteCompaction: { enabled: false }, fallback: { enabled: false } }));
     return new Response("", { headers: { "content-type": "text/event-stream" } });
-  } })(fixture.mock.pi);
+  });
+  codexCompaction(fixture.mock.pi);
   assert.ok((await fixture.run())?.compaction);
   assert.equal(fixture.remoteRequests(), 1);
   assert.equal(fixture.calls.length, 1);
@@ -1830,7 +1838,7 @@ test("a settings edit during a remote request applies to the next compaction onl
 
 test("V2 off preserves replay of an existing opaque checkpoint", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const session = SessionManager.inMemory();
   session.appendMessage({ role: "user", content: "older", timestamp: 0 });
   const firstKept = session.appendMessage({ role: "user", content: "retained", timestamp: 1 });
@@ -1907,10 +1915,11 @@ for (const selection of ["unchanged", "same backend", "different backend", "no m
     const selected: Model<"openai-responses"> | undefined = selection === "no model" ? undefined
       : selection === "unchanged" ? model : { ...model, id: "gpt-peer",
         ...(selection === "different backend" ? { baseUrl: "https://other.example/v1", compat: undefined } : {}) };
-    createCodexCompactionExtension({ fetch: async () => {
+    using _fetchScope = mockFetch(async () => {
       current.ctx.model = selected;
       return sseResponse();
-    } })(mock.pi);
+    });
+    codexCompaction(mock.pi);
     const result = await mock.events.get("session_before_compact")?.[0]?.(compactEvent(), current.ctx) as SessionBeforeCompactResult;
     assert.ok(result?.compaction);
     const details = parseCheckpointDetails(result.compaction.details);
@@ -1964,11 +1973,12 @@ for (const phase of ["authentication", "preparation", "prepared request", "reque
         return { auth: { apiKey: "fixture-key" } };
       });
       let requests = 0;
-      createCodexCompactionExtension({ fetch: async () => {
+      using _fetchScope = mockFetch(async () => {
         requests++;
         if (phase === "request" || phase === "retry") interrupt();
         return phase === "retry" ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } }) : sseResponse();
-      } })(mock.pi);
+      });
+      codexCompaction(mock.pi);
       const current = await context({ modelRegistry: registry, sessionManager: { getSessionId: () => sessionId, getBranch: branch } });
       const result = await mock.events.get("session_before_compact")?.[0]?.(compactEvent(controller.signal), current.ctx);
       assert.ok(interrupted);
@@ -2013,7 +2023,7 @@ test("an aborted signal during configured fallback discards the summary", async 
 
 test("model selection warns once per checkpoint for the same incompatible model", async () => {
   const mock = mockPi();
-  createCodexCompactionExtension({ fetch: fetchSse })(mock.pi);
+  codexCompaction(mock.pi);
   const sessionManager = SessionManager.inMemory();
   sessionManager.appendMessage({ role: "user", content: "older", timestamp: 0 });
   const kept = sessionManager.appendMessage({ role: "user", content: "keep", timestamp: 1 });

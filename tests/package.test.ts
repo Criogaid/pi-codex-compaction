@@ -59,6 +59,9 @@ test("npm package includes every declared entrypoint and runtime module without 
 });
 
 test("Pi discovers and loads the source entrypoint declared by the package manifest", async () => {
+  const entrypoint = await import("../src/index.js");
+  assert.equal(typeof entrypoint.default, "function");
+  assert.equal(Object.hasOwn(entrypoint, "createCodexCompactionExtension"), false);
   const loaded = await discoverAndLoadExtensions([repositoryPath], repositoryPath, agentDir);
   assert.deepEqual(loaded.errors, []);
   assert.deepEqual(loaded.warnings, []);

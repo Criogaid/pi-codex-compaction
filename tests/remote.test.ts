@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { mergeRemoteCompactionHeader, requestRemoteCompaction } from "../src/remote.js";
-import { assertTrimmedOutput, testRegistry } from "./helpers.js";
+import { assertTrimmedOutput, mockFetch, testRegistry } from "./helpers.js";
 import { CodexCompactionProtocolError, isObject, type JsonObject } from "../src/protocol.js";
 import { prepareRetention } from "../src/retention-input.js";
 import { buildReplacementHistory } from "../src/retention.js";
@@ -42,17 +42,16 @@ test("Pi resolves model headers, auth headers, scoped env, and the actual endpoi
     env: { PI_CACHE_RETENTION: "long" },
   }));
   let sent: Record<string, unknown> | undefined;
-  const result = await requestRemoteCompaction({ ...request(registry), model: { ...model, headers: { "x-model": "fixture" }, compat: { ...model.compat, supportsLongCacheRetention: true } },
-    fetch: async (input, init) => {
-      const outgoing = new Request(input, init);
-      assert.equal(outgoing.url, "https://resolved.example/api/responses");
-      assert.equal(outgoing.headers.get("x-model"), "fixture");
-      assert.equal(outgoing.headers.get("x-auth"), "fixture");
-      assert.equal(outgoing.headers.get("x-codex-beta-features"), "existing,remote_compaction_v2");
-      sent = await outgoing.json() as Record<string, unknown>;
-      return response();
-    },
+  using _fetchScope = mockFetch(async (input, init) => {
+    const outgoing = new Request(input, init);
+    assert.equal(outgoing.url, "https://resolved.example/api/responses");
+    assert.equal(outgoing.headers.get("x-model"), "fixture");
+    assert.equal(outgoing.headers.get("x-auth"), "fixture");
+    assert.equal(outgoing.headers.get("x-codex-beta-features"), "existing,remote_compaction_v2");
+    sent = await outgoing.json() as Record<string, unknown>;
+    return response();
   });
+  const result = await requestRemoteCompaction({ ...request(registry), model: { ...model, headers: { "x-model": "fixture" }, compat: { ...model.compat, supportsLongCacheRetention: true } } });
   assert.equal(result.identity.baseUrl, "https://resolved.example/api");
   assert.equal(result.identity.endpoint, "https://resolved.example/api/responses");
   assert.equal(result.item.encrypted_content, "opaque");
@@ -64,36 +63,36 @@ test("Pi resolves model headers, auth headers, scoped env, and the actual endpoi
 test("routes an explicit same-origin HTTP endpoint without changing the provider model", async () => {
   const registry = await testRegistry(provider);
   const endpoint = "https://gateway.example/custom/responses";
+  using _fetchScope = mockFetch(async (input, init) => {
+    assert.equal(new Request(input, init).url, endpoint);
+    return response();
+  });
   await requestRemoteCompaction({ ...request(registry),
     model: { ...model, compat: { ...model.compat, ...{ remoteCompaction: { protocol: "v2", endpoint } } } },
-    fetch: async (input, init) => {
-      assert.equal(new Request(input, init).url, endpoint);
-      return response();
-    },
   });
 });
 
 test("repeated compaction expands a compatible checkpoint before the final trigger", async () => {
   const registry = await testRegistry(provider);
   const identity = { provider: model.provider, api: model.api, modelId: model.id, baseUrl: model.baseUrl, endpoint: `${model.baseUrl}/responses` };
+  using _fetchScope = mockFetch(async (input, init) => {
+    const payload = await new Request(input, init).json() as { input: Array<Record<string, unknown>> };
+    assert.equal(payload.input[0].encrypted_content, "prior");
+    assert.deepEqual(payload.input.at(-1), { type: "compaction_trigger" });
+    return response();
+  });
   await requestRemoteCompaction({ ...request(registry),
     context: { messages: [{ role: "user", content: "checkpoint marker", timestamp: 1 }] },
     priorCheckpoint: { identity, marker: "checkpoint marker", replacementHistory: [{ type: "compaction", encrypted_content: "prior" }] },
-    fetch: async (input, init) => {
-      const payload = await new Request(input, init).json() as { input: Array<Record<string, unknown>> };
-      assert.equal(payload.input[0].encrypted_content, "prior");
-      assert.deepEqual(payload.input.at(-1), { type: "compaction_trigger" });
-      return response();
-    },
   });
 });
 
 test("rejects a prior checkpoint when authentication changes the endpoint", async () => {
   const registry = await testRegistry(provider, async () => ({ auth: { apiKey: "fixture-key", baseUrl: "https://other.example/v1" } }));
   let sent = false;
+  using _fetchScope = mockFetch(async () => { sent = true; return response(); });
   await assert.rejects(requestRemoteCompaction({ ...request(registry),
     priorCheckpoint: { identity: { provider: model.provider, api: model.api, modelId: model.id, baseUrl: model.baseUrl, endpoint: `${model.baseUrl}/responses` }, marker: "checkpoint marker", replacementHistory: [{ type: "compaction", encrypted_content: "prior" }] },
-    fetch: async () => { sent = true; return response(); },
   }), Error);
   assert.equal(sent, false);
 });
@@ -130,9 +129,8 @@ test("accepts header-only auth and provider-owned event streams", async () => {
     },
   };
   const registry = await testRegistry(eventProvider, async () => ({ auth: { headers: { cookie: "fixture-cookie" } } }));
-  const result = await requestRemoteCompaction({ ...request(registry), model: codexModel,
-    fetch: async () => { assert.fail("Custom provider owns its transport"); },
-  });
+  using _fetchScope = mockFetch(async () => { assert.fail("Custom provider owns its transport"); });
+  const result = await requestRemoteCompaction({ ...request(registry), model: codexModel });
   assert.equal(result.item.encrypted_content, "provider-opaque");
 });
 
@@ -164,9 +162,8 @@ for (const fault of ["endpoint", "method", "feature-header", "model"] as const) 
     };
     const registry = await testRegistry(faultyProvider);
     let sent = false;
-    const pending = requestRemoteCompaction({ ...request(registry), maxRetries: 0,
-      fetch: async () => { sent = true; return response(); },
-    });
+    using _fetchScope = mockFetch(async () => { sent = true; return response(); });
+    const pending = requestRemoteCompaction({ ...request(registry), maxRetries: 0 });
     if (fault === "feature-header") {
       assert.equal((await pending).item.encrypted_content, "opaque");
       assert.equal(sent, true);
@@ -187,14 +184,13 @@ for (const [configured, retries] of [[undefined, 2], [0, 0], [1, 1], [2, 2], [9,
     } };
     const registry = await testRegistry(observedProvider);
     let attempts = 0;
-    await assert.rejects(requestRemoteCompaction({ ...request(registry), maxRetries: configured, maxRetryDelayMs: 1,
-      fetch: async () => {
-        attempts++;
-        return new Response(JSON.stringify({ error: { message: "fixture unavailable" } }), {
-          status: 503, headers: { "content-type": "application/json", "retry-after-ms": "1" },
-        });
-      },
-    }), Error);
+    using _fetchScope = mockFetch(async () => {
+      attempts++;
+      return new Response(JSON.stringify({ error: { message: "fixture unavailable" } }), {
+        status: 503, headers: { "content-type": "application/json", "retry-after-ms": "1" },
+      });
+    });
+    await assert.rejects(requestRemoteCompaction({ ...request(registry), maxRetries: configured, maxRetryDelayMs: 1 }), Error);
     assert.equal(observed?.maxRetries, 0, "The complete-stream retry loop owns the only retry budget");
     assert.equal(observed?.maxRetryDelayMs, 1);
     assert.equal(attempts, retries + 1);
@@ -242,9 +238,9 @@ test("rejects malformed provider payloads before fetch without retry", async () 
       const message = payload === null ? "Prepared compaction payload must be an object"
         : providerRequest ? "Prepared request cannot locate the snapshot boundary"
           : "Prepared compaction payload has invalid input items";
+      using _fetchScope = mockFetch(async () => { fetches++; return response(); });
       await assert.rejects(requestRemoteCompaction({ ...request(registry), providerRequest,
         maxRetries: 2, maxRetryDelayMs: 1,
-        fetch: async () => { fetches++; return response(); },
       }), (error) => {
         assert.ok(error instanceof CodexCompactionProtocolError, scenario);
         assert.equal(error.message, message, scenario);
@@ -277,6 +273,10 @@ test("the final V2 payload preserves declarations through snapshot reuse and che
     { role: "user", content: [{ type: "input_text", text: boundary }] }, ...input.slice(1),
     { role: "user", content: [{ type: "input_text", text: `${boundary}_END` }] }]));
   const attempts: unknown[] = [];
+  using _fetchScope = mockFetch(async (input, init) => {
+    attempts.push(await new Request(input, init).json());
+    return attempts.length === 1 ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } }) : response();
+  });
   const result = await requestRemoteCompaction({ ...request(registry),
     maxRetries: 1, maxRetryDelayMs: 1,
     context: { messages: [{ role: "user", content: marker, timestamp: 1 }],
@@ -289,10 +289,6 @@ test("the final V2 payload preserves declarations through snapshot reuse and che
         input: [{ type: "additional_tools", role: "developer", tools: [schema] }, markerItem] },
     },
     priorCheckpoint: { identity, marker, replacementHistory: prior },
-    fetch: async (input, init) => {
-      attempts.push(await new Request(input, init).json());
-      return attempts.length === 1 ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } }) : response();
-    },
   });
   assert.equal(attempts.length, 2);
   assert.deepEqual(attempts[1], attempts[0], "Retries preserve the fully spliced request body");
@@ -316,9 +312,9 @@ test("returns trimmed promptInput and contextual flags matching the actual provi
   const saved = structuredClone(input);
   const registry = await testRegistry(providerInput(input));
   let sent: unknown;
+  using _fetchScope = mockFetch(async (input, init) => { sent = await new Request(input, init).json(); return response(); });
   const result = await requestRemoteCompaction({ ...request(registry), model: { ...model, contextWindow: 80 },
     userItemOrigins: ["context", "user"],
-    fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
   });
   const expected = [hidden, notice, visible, assertTrimmedOutput(result.promptInput[3], output)];
   assert.deepEqual(result.promptInput, expected);
@@ -336,9 +332,8 @@ test("awaits original image estimates before trimming and returns lookups usable
   const output = { type: "custom_tool_call_output", call_id: "c", output: [image] };
   const registry = await testRegistry(providerInput([output]));
   let sent: unknown;
-  const result = await requestRemoteCompaction({ ...request(registry), model: { ...model, contextWindow: 10 },
-    fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
-  });
+  using _fetchScope = mockFetch(async (input, init) => { sent = await new Request(input, init).json(); return response(); });
+  const result = await requestRemoteCompaction({ ...request(registry), model: { ...model, contextWindow: 10 } });
   assert.equal(result.images.bytes(structuredClone(image)), 4);
   assert.deepEqual(result.promptInput, [output], "the original image fits when measured as one patch");
   assert.ok(isObject(sent));
@@ -353,12 +348,12 @@ test("estimates prior checkpoint images and trims expanded history before the tr
   const opaque = { type: "compaction", encrypted_content: "prior" };
   const registry = await testRegistry(provider);
   let sent: unknown;
+  using _fetchScope = mockFetch(async (input, init) => { sent = await new Request(input, init).json(); return response(); });
   const result = await requestRemoteCompaction({ ...request(registry), model: { ...model, contextWindow: 100 },
     context: { messages: [{ role: "user", content: marker, timestamp: 1 }] },
     priorCheckpoint: { identity: { provider: model.provider, api: model.api, modelId: model.id,
       baseUrl: model.baseUrl, endpoint: `${model.baseUrl}/responses` },
       marker, replacementHistory: [opaque, output] },
-    fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
   });
   assert.deepEqual(result.promptInput, [opaque, assertTrimmedOutput(result.promptInput[1], output)]);
   assert.equal(result.images.bytes(image), 4);
@@ -371,9 +366,8 @@ test("falls back to text classification when provider user counts differ from Pi
   const hidden = { role: "user", content: [{ type: "input_text", text: "hidden without a marker" }] };
   const marked = { role: "user", content: [{ type: "input_text", text: "<environment_context>injected</environment_context>" }] };
   const registry = await testRegistry(providerInput([hidden, marked]));
-  const result = await requestRemoteCompaction({ ...request(registry), userItemOrigins: ["context"],
-    fetch: async () => response(),
-  });
+  using _fetchScope = mockFetch(async () => response());
+  const result = await requestRemoteCompaction({ ...request(registry), userItemOrigins: ["context"] });
   assert.deepEqual(result.contextual, [false, false]);
   const prepared = await prepareRetention(result.promptInput, new AbortController().signal, result);
   assert.deepEqual(buildReplacementHistory(prepared, result.item), [hidden, result.item]);

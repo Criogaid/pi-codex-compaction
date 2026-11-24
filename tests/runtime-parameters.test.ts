@@ -12,7 +12,7 @@ import { capableModel } from "../src/capability.js";
 import { isObject, isObjectArray, type CompactionPayload, type JsonObject } from "../src/protocol.js";
 import { compactionRequest, RequestSnapshotTracker, type ProviderRequestInputs } from "../src/request-snapshot.js";
 import { requestRemoteCompaction } from "../src/remote.js";
-import { assertTrimmedOutput, testRegistry } from "./helpers.js";
+import { assertTrimmedOutput, mockFetch, testRegistry } from "./helpers.js";
 
 const apiKey = `fixture.${Buffer.from(JSON.stringify({
   "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
@@ -63,19 +63,19 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       for await (const event of ordinary) {
         if (event.type === "error") throw new Error(event.error.errorMessage);
       }
+      using _fetchScope = mockFetch(async (input, init) => {
+        const request = new Request(input, init);
+        const bytes = Buffer.from(await request.arrayBuffer());
+        const json = request.headers.get("content-encoding") === "zstd"
+          ? zstdDecompressSync(bytes).toString("utf8")
+          : bytes.toString("utf8");
+        compactPayload = JSON.parse(json);
+        compactHeaders = request.headers;
+        return response();
+      });
       await requestRemoteCompaction({
         modelRegistry, model, context, reasoning, sessionId,
         signal: new AbortController().signal,
-        fetch: async (input, init) => {
-          const request = new Request(input, init);
-          const bytes = Buffer.from(await request.arrayBuffer());
-          const json = request.headers.get("content-encoding") === "zstd"
-            ? zstdDecompressSync(bytes).toString("utf8")
-            : bytes.toString("utf8");
-          compactPayload = JSON.parse(json);
-          compactHeaders = request.headers;
-          return response();
-        },
       });
       assert.ok(ordinaryPayload && typeof ordinaryPayload === "object");
       const expected = ordinaryPayload as { input: unknown[] };
@@ -143,20 +143,20 @@ test("V2 preserves Pi effort updates in checkpoint input and across retries", as
   const request = compactionRequest(tracker.current(), sessionId, target, current, inputs, { blockImages: false, tools: () => [] });
   assert.ok(request.providerRequest?.prefix);
   const attempts: JsonObject[] = [];
+  using _fetchScope = mockFetch(async (input, init) => {
+    const request = new Request(input, init);
+    const bytes = Buffer.from(await request.arrayBuffer());
+    const decoded = request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
+    const payload: unknown = JSON.parse(decoded.toString("utf8"));
+    assert.ok(isObject(payload));
+    attempts.push(payload);
+    return attempts.length === 1
+      ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } })
+      : response();
+  });
   const result = await requestRemoteCompaction({
     modelRegistry: registry, model, context: request.context, providerRequest: request.providerRequest,
     reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 1, maxRetryDelayMs: 1,
-    fetch: async (input, init) => {
-      const request = new Request(input, init);
-      const bytes = Buffer.from(await request.arrayBuffer());
-      const decoded = request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
-      const payload: unknown = JSON.parse(decoded.toString("utf8"));
-      assert.ok(isObject(payload));
-      attempts.push(payload);
-      return attempts.length === 1
-        ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } })
-        : response();
-    },
   });
   assert.equal(attempts.length, 2);
   assert.deepEqual(attempts[1], attempts[0]);
@@ -250,10 +250,10 @@ for (const path of ["matching prefix", "no snapshot", "settings mismatch", "serv
       assert.equal(Boolean(request.providerRequest?.prefix), path === "matching prefix");
 
       let sent: unknown;
+      using _fetchScope = mockFetch(async (input, init) => { sent = await new Request(input, init).json(); return response(); });
       await requestRemoteCompaction({
         modelRegistry: registry, model, context: request.context, providerRequest: request.providerRequest,
         reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 0,
-        fetch: async (input, init) => { sent = await new Request(input, init).json(); return response(); },
       });
       assert.ok(isObject(sent) && isObjectArray(sent.input));
       assert.equal(sent.service_tier, request.providerRequest ? "priority" : undefined);
@@ -317,16 +317,16 @@ test("V2 uses a fresh HTTP request with its feature header after an ordinary Web
       fetch: async () => { throw new Error("Unexpected ordinary HTTP fallback"); },
     }).result();
     assert.notEqual(ordinary.stopReason, "error", ordinary.errorMessage ?? "ordinary request failed");
+    using _fetchScope = mockFetch(async (input, init) => {
+      httpRequests++;
+      const outgoing = new Request(input, init);
+      assert.equal(outgoing.headers.get("x-codex-beta-features"), "remote_compaction_v2");
+      assert.equal(outgoing.headers.get("session-id"), sessionId);
+      return response();
+    });
     await requestRemoteCompaction({
       modelRegistry, model, context, reasoning: "high", sessionId,
       signal: AbortSignal.timeout(5_000),
-      fetch: async (input, init) => {
-        httpRequests++;
-        const outgoing = new Request(input, init);
-        assert.equal(outgoing.headers.get("x-codex-beta-features"), "remote_compaction_v2");
-        assert.equal(outgoing.headers.get("session-id"), sessionId);
-        return response();
-      },
     });
     assert.equal(httpRequests, 1);
     assert.equal(socketRequests, 1, "compaction must not reuse the ordinary connection");

@@ -24,6 +24,13 @@ export async function testRegistry(provider: Provider, resolve: () => Promise<Au
   return new ModelRegistry(runtime);
 }
 
+// Overlapping overrides in one process must be disposed in reverse order.
+export function mockFetch(fetch: typeof globalThis.fetch): Disposable {
+  const original = globalThis.fetch;
+  globalThis.fetch = fetch;
+  return { [Symbol.dispose]: () => { globalThis.fetch = original; } };
+}
+
 // Node's test runner isolates each test file in its own process.
 export function isolateAgentConfig(): string {
   const directory = mkdtempSync(join(tmpdir(), "pi-codex-compaction-test-"));
@@ -46,7 +53,7 @@ export interface SessionRequest {
 /** Exercise real Pi sessions and provider serialization; replace only network I/O with bounded SSE fixtures. */
 export async function sessionFixture(options: {
   readonly api?: "openai-responses" | "openai-codex-responses";
-  readonly extensions: readonly ExtensionFactory[] | ((fetch: typeof globalThis.fetch) => readonly ExtensionFactory[]);
+  readonly extensions: readonly ExtensionFactory[];
   readonly models?: (base: Model<Api>) => readonly Model<Api>[];
   readonly settings?: Parameters<typeof SettingsManager.inMemory>[0];
   readonly respond?: (request: SessionRequest) => Response | undefined | Promise<Response | undefined>;
@@ -104,10 +111,6 @@ export async function sessionFixture(options: {
   runtime.registerNativeProvider({
     ...provider, getModels: () => [...models], getAllModels: () => [...models],
     auth: { apiKey: { name: "Fixture", resolve: async () => ({ auth: { apiKey: accessToken } }) } },
-    streamSimple(current, context, settings) {
-      return provider.streamSimple(current, context, { ...settings,
-        fetch: typeof options.extensions === "function" ? settings?.fetch ?? fetch : fetch });
-    },
   });
   const settingsManager = SettingsManager.inMemory({
     transport: "sse",
@@ -120,7 +123,7 @@ export async function sessionFixture(options: {
       cwd: directory, agentDir: directory, settingsManager,
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       systemPromptOverride: () => "You are a fixture assistant. Preserve the task's constraints.",
-      extensionFactories: [...(typeof options.extensions === "function" ? options.extensions(fetch) : options.extensions)],
+      extensionFactories: [...options.extensions],
     });
     await loader.reload();
     const { session, extensionsResult } = await createAgentSession({
@@ -132,9 +135,11 @@ export async function sessionFixture(options: {
     return session;
   }
   let session: Awaited<ReturnType<typeof start>>;
+  const fetchScope = mockFetch(fetch);
   try {
     session = await start(SessionManager.create(directory, join(directory, "sessions")));
   } catch (error) {
+    fetchScope[Symbol.dispose]();
     await rm(directory, { recursive: true, force: true });
     throw error;
   }
@@ -148,8 +153,12 @@ export async function sessionFixture(options: {
       session = await start(SessionManager.open(path));
     },
     async close() {
-      session.dispose();
-      await rm(directory, { recursive: true, force: true });
+      try {
+        session.dispose();
+        await rm(directory, { recursive: true, force: true });
+      } finally {
+        fetchScope[Symbol.dispose]();
+      }
     },
   };
 }

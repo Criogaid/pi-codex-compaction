@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { getLatestCompactionEntry } from "@earendil-works/pi-coding-agent";
 import { resolveLatestCheckpoint } from "../src/checkpoint.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
-import { createCodexCompactionExtension } from "../src/index.js";
+import codexCompaction from "../src/index.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 import { fixtureImage as image, isolateAgentConfig, sessionFixture } from "./helpers.js";
 
@@ -35,7 +35,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       test(`${api} falls back with an active checkpoint on ${reason}, separate fallback=${separateFallback}`, { timeout: 20_000 }, async () => {
         let failRemote = false;
         const fixture = await sessionFixture({
-          api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+          api, extensions: [codexCompaction],
           respond: ({ payload }) => failRemote && hasItem(payload, "compaction_trigger")
             ? new Response("Temporary service outage", { status: 503 }) : undefined,
         });
@@ -77,7 +77,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   }
 
   test(`${api} applies image blocking to ordinary and recursive checkpoint replay`, { timeout: 20_000 }, async () => {
-    const fixture = await sessionFixture({ api, extensions: [createCodexCompactionExtension()] });
+    const fixture = await sessionFixture({ api, extensions: [codexCompaction] });
     try {
       await fixture.session.prompt("Preserve the constraints in this image. ".repeat(80), { images: [image] });
       for (let turn = 0; turn < 2; turn++) await fixture.session.prompt("Continue the implementation. ".repeat(80));

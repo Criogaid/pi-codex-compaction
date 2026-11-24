@@ -43,7 +43,7 @@ if (!process.execArgv.includes(mockFlag)) {
     t.mock.module(new URL("../src/request-snapshot.js", import.meta.url).href, {
       namedExports: { ...snapshots, RequestSnapshotTracker: ObservedTracker },
     });
-    const { createCodexCompactionExtension } = await import("../src/index.js");
+    const { default: codexCompaction } = await import("../src/index.js");
     const supported: Model<"openai-responses"> = {
       id: "gpt-6.1-sol", name: "GPT-6.1 Sol", provider: "custom-codex", api: "openai-responses",
       baseUrl: "https://codex-gateway.example/v1", reasoning: true, input: ["text"],
@@ -61,7 +61,7 @@ if (!process.execArgv.includes(mockFlag)) {
         registerCommand() {}, registerEntryRenderer() {},
         getThinkingLevel: () => "low", getSettings: () => ({}), getActiveTools: () => [], getAllTools: () => [],
       } as unknown as ExtensionAPI;
-      createCodexCompactionExtension()(pi);
+      codexCompaction(pi);
       const tracker = latestTracker;
       assert.ok(tracker);
       const session = SessionManager.inMemory();

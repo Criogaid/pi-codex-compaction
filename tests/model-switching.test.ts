@@ -4,7 +4,7 @@ import { test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { getLatestCompactionEntry, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { resolveLatestCheckpoint } from "../src/checkpoint.js";
-import { createCodexCompactionExtension } from "../src/index.js";
+import codexCompaction from "../src/index.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, sessionFixture } from "./helpers.js";
 
@@ -35,7 +35,7 @@ async function seed(fixture: Awaited<ReturnType<typeof sessionFixture>>) {
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   test(`${api} continues on a different backend without replaying opaque history`, async () => {
     const fixture = await sessionFixture({ api,
-      extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+      extensions: [codexCompaction],
       models: (base) => [configuredModel(base, base.id, 32_000),
         { ...configuredModel(base, "gpt-other-backend", 32_000), baseUrl: "https://different.example/v1" }],
     });
@@ -58,7 +58,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 
   test(`${api} does not gate same-backend replay on optional model hashes`, async () => {
     const fixture = await sessionFixture({ api,
-      extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+      extensions: [codexCompaction],
       models: (base) => [configuredModel(base, base.id, 32_000, "family-a"),
         configuredModel(base, "gpt-peer", 32_000, "family-b")],
     });
@@ -74,7 +74,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 
   test(`${api} leaves smaller-model selection passive and compacts with the selected model`, async () => {
     const fixture = await sessionFixture({ api,
-      extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+      extensions: [codexCompaction],
       models: (base) => [configuredModel(base, base.id, 32_000), configuredModel(base, "gpt-small", 8_000)],
     });
     try {
@@ -100,7 +100,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   test(`${api} retries a partial V2 stream without persisting its partial checkpoint`, async () => {
     let failNext = false;
     const fixture = await sessionFixture({ api,
-      extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+      extensions: [codexCompaction],
       settings: { retry: { enabled: false, provider: { maxRetries: 2, maxRetryDelayMs: 1 } } },
       respond: ({ payload }) => {
         if (!failNext || !hasItem(payload, "compaction_trigger")) return undefined;
@@ -170,7 +170,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
           };
           let fetches = 0;
           const fixture = await sessionFixture({ api,
-            extensions: (fetch) => [observe, createCodexCompactionExtension({ fetch })],
+            extensions: [observe, codexCompaction],
             models: (base) => [configuredModel(base, base.id, 32_000),
               { ...configuredModel(base, "gpt-peer", 32_000), ...(backend === "different" ? { baseUrl: "https://different.example/v1" } : {}) }],
             settings: { retry: { enabled: false, provider: { maxRetries: 1, maxRetryDelayMs: 1 } } },
@@ -222,9 +222,9 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 
 test("opaque replay preserves the model routing already applied to the ordinary payload", async () => {
   let reroute = false;
-  const fixture = await sessionFixture({ extensions: (fetch) => [
+  const fixture = await sessionFixture({ extensions: [
     (pi) => pi.on("before_provider_request", (event) => reroute && isObject(event.payload)
-      ? { ...event.payload, model: "gpt-routed" } : undefined), createCodexCompactionExtension({ fetch }),
+      ? { ...event.payload, model: "gpt-routed" } : undefined), codexCompaction,
   ] });
   try {
     await seed(fixture);
@@ -240,10 +240,10 @@ test("opaque replay preserves the model routing already applied to the ordinary 
 
 test("a context handler that drops the checkpoint summary continues the ordinary request without opaque replay", async () => {
   let drop = false;
-  const fixture = await sessionFixture({ extensions: (fetch) => [
+  const fixture = await sessionFixture({ extensions: [
     (pi) => pi.on("context", (event) => drop ? { messages: event.messages.filter((message) =>
       message.role !== "compactionSummary") } : undefined),
-    createCodexCompactionExtension({ fetch }),
+    codexCompaction,
   ] });
   try {
     const original = await seed(fixture);

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { getCurrentSystemMessage, getSystemMessageText } from "@earendil-works/pi-ai";
 import { buildSessionContext, convertToLlm, type ExtensionAPI, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { readFile, writeFile } from "node:fs/promises";
-import { createCodexCompactionExtension } from "../src/index.js";
+import codexCompaction from "../src/index.js";
 import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { isObject } from "../src/protocol.js";
 import { isolateAgentConfig, legacyCheckpointSummary, sessionFixture } from "./helpers.js";
@@ -12,7 +12,7 @@ isolateAgentConfig();
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   test(`real ${api} session saves, restores, and recompacts V2 history`, { timeout: 20_000 }, async () => {
-    const fixture = await sessionFixture({ api, extensions: [createCodexCompactionExtension()] });
+    const fixture = await sessionFixture({ api, extensions: [codexCompaction] });
     try {
       for (let turn = 1; turn <= 3; turn++) {
         await fixture.session.prompt(`Task ${turn}: ${"Preserve the agreed implementation constraints. ".repeat(60)}`);
@@ -87,7 +87,7 @@ function requestTransform(onReady?: (pi: ExtensionAPI) => void): ExtensionFactor
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   test(`real ${api} compaction reuses observed declarations and cache fields without old response state`, { timeout: 20_000 }, async () => {
-    const fixture = await sessionFixture({ api, extensions: [requestTransform(), createCodexCompactionExtension()] });
+    const fixture = await sessionFixture({ api, extensions: [requestTransform(), codexCompaction] });
     try {
       for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Preserve the implementation constraints. ".repeat(60)}`);
       const ordinary = fixture.requests.at(-1)?.payload;
@@ -124,8 +124,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         return { ...payload, input };
       });
     };
-    const fixture = await sessionFixture({ api, extensions: (fetch) => [
-      removeHistoryItem, createCodexCompactionExtension({ fetch }),
+    const fixture = await sessionFixture({ api, extensions: [
+      removeHistoryItem, codexCompaction,
     ] });
     try {
       for (let turn = 1; turn <= 3; turn++) {
@@ -155,7 +155,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 test("real session drops observed request fields when thinking or active tools change", { timeout: 20_000 }, async () => {
   for (const change of ["thinking", "tools"] as const) {
     let controls: ExtensionAPI | undefined;
-    const fixture = await sessionFixture({ extensions: [requestTransform((pi) => { controls = pi; }), createCodexCompactionExtension()] });
+    const fixture = await sessionFixture({ extensions: [requestTransform((pi) => { controls = pi; }), codexCompaction] });
     try {
       for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the current decisions. ".repeat(80)}`);
       assert.ok(controls);
@@ -176,7 +176,7 @@ test("real session drops observed request fields when thinking or active tools c
 });
 
 test("a saved v1 checkpoint resumes through a real session after the package rename", { timeout: 20_000 }, async () => {
-  const fixture = await sessionFixture({ extensions: [createCodexCompactionExtension()] });
+  const fixture = await sessionFixture({ extensions: [codexCompaction] });
   try {
     for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the existing history. ".repeat(80)}`);
     await fixture.session.compact();
@@ -228,7 +228,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         };
       });
     };
-    const fixture = await sessionFixture({ api, extensions: [requestTransform(), projectRequest, createCodexCompactionExtension()] });
+    const fixture = await sessionFixture({ api, extensions: [requestTransform(), projectRequest, codexCompaction] });
     try {
       for (let cycle = 0; cycle < 2; cycle++) {
         for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${cycle}/${turn}. ${"Keep the decisions. ".repeat(80)}`);
@@ -280,8 +280,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       });
       pi.on("agent_settled", (_event, ctx) => { settledPrompts.push(ctx.getSystemPrompt()); });
     };
-    const fixture = await sessionFixture({ api, extensions: (fetch) => [
-      requestTransform(), perRunPrompt, createCodexCompactionExtension({ fetch }),
+    const fixture = await sessionFixture({ api, extensions: [
+      requestTransform(), perRunPrompt, codexCompaction,
     ] });
     try {
       for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Preserve the run's decisions. ".repeat(60)}`);

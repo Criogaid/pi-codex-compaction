@@ -3,7 +3,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
-import { createCodexCompactionExtension } from "../src/index.js";
+import codexCompaction from "../src/index.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, sessionFixture, type SessionRequest } from "./helpers.js";
 
@@ -68,7 +68,7 @@ function sseFailure(...chunks: string[]) {
 async function checkpointRetryOutcome(api: ResponsesApi, reply: () => Response) {
   let failRemote = false;
   const fixture = await sessionFixture({
-    api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+    api, extensions: [codexCompaction],
     models: (base) => [base, { ...base, id: summaryModelId, name: "Fixture text summary" }],
     settings: { retry: { enabled: false, provider: { maxRetries: 2, maxRetryDelayMs: 1 } } },
     respond: (request) => failRemote && hasTrigger(request) ? reply() : undefined,
@@ -254,7 +254,7 @@ for (const api of responsesApis) {
   test(`real ${api} layers failed V2 text fallback over A without losing or duplicating history`, { timeout: 30_000 }, async () => {
     let failRemote = false;
     const fixture = await sessionFixture({
-      api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+      api, extensions: [codexCompaction],
       models: (base) => [base, { ...base, id: summaryModelId, name: "Fixture text summary" }],
       respond: (request) => failRemote && hasTrigger(request)
         ? new Response("Temporary fixture outage", { status: 503 }) : undefined,
@@ -349,7 +349,7 @@ for (const api of responsesApis) {
   for (const enabled of [true, false]) {
     test(`real ${api} keeps native text fallback without A, V2 enabled=${enabled}`, { timeout: 20_000 }, async () => {
       const fixture = await sessionFixture({
-        api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+        api, extensions: [codexCompaction],
         models: (base) => [base, { ...base, id: summaryModelId, name: "Fixture text summary" }],
         respond: (request) => hasTrigger(request) ? new Response("Fixture rejection", { status: 400 }) : undefined,
       });
