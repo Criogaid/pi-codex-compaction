@@ -34,9 +34,8 @@ export function compactionRetryLimit(configured?: number): number {
   return Math.max(0, Math.min(MAX_RETRIES, Math.floor(Number.isFinite(configured) ? configured! : MAX_RETRIES)));
 }
 
-function checkedDeadline(delayNs: bigint, receivedAt: bigint): number | undefined {
-  const deadline = Number(receivedAt + delayNs) / Number(NS_PER_MS);
-  return Number.isFinite(deadline) ? deadline : undefined;
+function deadlineMs(delayNs: bigint, receivedAt: bigint): number {
+  return Number(receivedAt + delayNs) / Number(NS_PER_MS);
 }
 
 function httpDateMs(value: string): number | undefined {
@@ -94,7 +93,7 @@ function retryDeadline(headers: unknown, { receivedAt, wallTime }: ReturnType<ty
     const digits = seconds.replace(/^0+/, "");
     if (digits.length > MAX_U64.toString().length) return undefined;
     const duration = BigInt(digits);
-    return duration <= MAX_U64 ? checkedDeadline(duration * NS_PER_SECOND, receivedAt) : undefined;
+    return duration <= MAX_U64 ? deadlineMs(duration * NS_PER_SECOND, receivedAt) : undefined;
   }
   const date = httpDateMs(seconds);
   return date === undefined ? undefined : receivedAtMs + Math.max(0, date - wallTime);
@@ -131,12 +130,12 @@ function rateLimitDeadline(message: string | null | undefined, receivedAt: bigin
   if (match[2].toLowerCase() === "ms") {
     // Codex truncates fractional milliseconds and saturates the unsigned conversion.
     const wholeMs = Number.isFinite(value) ? BigInt(Math.trunc(value)) : MAX_U64;
-    return checkedDeadline((wholeMs > MAX_U64 ? MAX_U64 : wholeMs) * NS_PER_MS, receivedAt);
+    return deadlineMs((wholeMs > MAX_U64 ? MAX_U64 : wholeMs) * NS_PER_MS, receivedAt);
   }
   if (value > MAX_U64) return undefined;
   const wholeSeconds = Math.trunc(value);
   const fractionalNs = Math.round((value - wholeSeconds) * Number(NS_PER_SECOND));
-  return checkedDeadline(BigInt(wholeSeconds) * NS_PER_SECOND + BigInt(fractionalNs), receivedAt);
+  return deadlineMs(BigInt(wholeSeconds) * NS_PER_SECOND + BigInt(fractionalNs), receivedAt);
 }
 
 function httpFailure(response: Response, retryAt: number | undefined, value: unknown): TransientFailure | undefined {
