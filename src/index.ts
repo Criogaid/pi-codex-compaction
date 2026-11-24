@@ -132,12 +132,11 @@ interface CompactionRun {
   readonly signal: AbortSignal;
   owned(): boolean;
   setStatus(message: string): void;
+  summarize(
+    input: Pick<FallbackCompactionRequest, "preparation" | "defaultModel">,
+    remoteError: unknown,
+  ): ReturnType<typeof requestFallbackCompaction>;
 }
-
-type SummarizeWithPi = (
-  input: Pick<FallbackCompactionRequest, "preparation" | "defaultModel">,
-  remoteError: unknown,
-) => ReturnType<typeof requestFallbackCompaction>;
 
 function stopTextCompaction(ctx: ExtensionContext, run: CompactionRun, error: unknown) {
   if (run.owned() && ctx.hasUI) {
@@ -151,12 +150,11 @@ async function compactFallback(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
   run: CompactionRun,
-  summarize: SummarizeWithPi,
   remoteError: unknown,
 ) {
   try {
     if (!run.owned()) return { cancel: true };
-    const result = await summarize({ preparation: event.preparation }, remoteError);
+    const result = await run.summarize({ preparation: event.preparation }, remoteError);
     if (!run.owned()) return { cancel: true };
     if (!result && remoteError !== undefined && ctx.hasUI) {
       ctx.ui.notify(`Codex remote compaction failed; using Pi compaction. ${errorMessage(remoteError)}`, "warning");
@@ -171,7 +169,6 @@ async function recoverLayeredCheckpoint(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
   run: CompactionRun,
-  summarize: SummarizeWithPi,
   remoteError: RemoteCompactionTransientError,
   prior: CodexCheckpointDetails,
   selection: NonNullable<FallbackCompactionRequest["defaultModel"]>,
@@ -181,7 +178,7 @@ async function recoverLayeredCheckpoint(
     const { firstKeptEntryId } = event.preparation;
     const boundary = prepareCheckpointLayer(event.branchEntries, firstKeptEntryId, prior);
     if (boundary.messages.length === 0) return { cancel: true };
-    const result = await summarize({
+    const result = await run.summarize({
       defaultModel: selection,
       preparation: {
         ...event.preparation,
@@ -220,7 +217,6 @@ async function compactRemotely(
   ctx: ExtensionContext,
   run: CompactionRun,
   supported: CapableModel,
-  summarize: SummarizeWithPi,
   fetch: typeof globalThis.fetch | undefined,
   snapshots: RequestSnapshots,
 ) {
@@ -260,7 +256,7 @@ async function compactRemotely(
       signal,
       onPrepared: () => {
         if (!run.owned()) throw new Error("Compaction session changed");
-        // Provider retries prepare the payload again; announce the compaction once.
+        // Each V2 attempt prepares the payload again; announce the compaction once.
         if (announced) return;
         announced = true;
         if (ctx.hasUI) ctx.ui.notify(
@@ -301,13 +297,13 @@ async function compactRemotely(
   } catch (error) {
     if (!run.owned()) return { cancel: true };
     // A failure during checkpoint resolution cannot establish that native fallback is safe.
-    if (checkpoint?.state === "none") return compactFallback(event, ctx, run, summarize, error);
+    if (checkpoint?.state === "none") return compactFallback(event, ctx, run, error);
     try {
       if (checkpoint?.state !== "parsed" || !(error instanceof RemoteCompactionTransientError) ||
           !await compatibleIdentity(checkpoint.details, ctx, supported.model)) {
         throw new Error("The failed remote request is not eligible for safe layered recovery", { cause: error });
       }
-      return await recoverLayeredCheckpoint(event, ctx, run, summarize, error, checkpoint.details, {
+      return await recoverLayeredCheckpoint(event, ctx, run, error, checkpoint.details, {
         model: supported.model,
         thinkingLevel: reasoning,
       });
@@ -318,58 +314,6 @@ async function compactRemotely(
       return { cancel: true };
     }
   }
-}
-
-async function compactSession(
-  pi: ExtensionAPI,
-  event: SessionBeforeCompactEvent,
-  ctx: ExtensionContext,
-  run: CompactionRun,
-  compactionSettingsPath: string,
-  fetch: typeof globalThis.fetch | undefined,
-  snapshots: RequestSnapshots,
-) {
-  const supported = capableModel(ctx.model);
-  if (!run.owned()) return { cancel: true };
-  let configuration: CompactionConfiguration;
-  try {
-    configuration = (await loadCompactionSettings(compactionSettingsPath)).configuration;
-  } catch (error) {
-    if (run.owned() && ctx.hasUI) {
-      ctx.ui.notify(`Could not read compaction settings; compaction stopped. ${errorMessage(error)}`, "error");
-    }
-    return { cancel: true };
-  }
-  if (!run.owned()) return { cancel: true };
-
-  const summarize: SummarizeWithPi = (input, remoteError) => {
-    let announced = false;
-    return requestFallbackCompaction({
-      ...input,
-      summaryModel: configuration.summaryModel,
-      modelRegistry: ctx.modelRegistry,
-      settings: pi.getSettings(),
-      customInstructions: event.customInstructions,
-      signal: run.signal,
-      sessionId: run.sessionId,
-      onPrepared: ({ model, thinkingLevel }) => {
-        if (!run.owned()) throw new Error("Compaction session changed");
-        if (announced) return;
-        announced = true;
-        run.setStatus("Pi fallback compaction...");
-        if (!ctx.hasUI) return;
-        if (remoteError !== undefined) {
-          ctx.ui.notify(`Codex remote compaction failed; using the configured summary model. ${errorMessage(remoteError)}`, "warning");
-        }
-        ctx.ui.notify(`Using Pi text compaction with ${model.provider}/${model.id} (${thinkingLevel}).`, "info");
-      },
-    });
-  };
-
-  if (!configuration.remoteCompactionEnabled || !supported) {
-    return compactFallback(event, ctx, run, summarize, undefined);
-  }
-  return compactRemotely(pi, event, ctx, run, supported, summarize, fetch, snapshots);
 }
 
 export function createCodexCompactionExtension(
@@ -409,17 +353,60 @@ export function createCodexCompactionExtension(
       const { signal } = event;
       const sameSession = () => ctx.sessionManager.getSessionId() === sessionId;
       const ownsStatus = () => runNumber === latestRun && sameSession();
-      const run: CompactionRun = {
-        sessionId,
-        signal,
-        // A model switch leaves the run on its starting model, as in Pi's compaction.
-        owned: () => !signal.aborted && sameSession(),
-        setStatus: (message) => {
-          if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, message);
-        },
-      };
+      // A model switch leaves the run on its starting model, as in Pi's compaction.
+      const owned = () => !signal.aborted && sameSession();
       try {
-        return await compactSession(pi, event, ctx, run, compactionSettingsPath, options.fetch, snapshots.current());
+        const { fetch } = options;
+        const requestSnapshots = snapshots.current();
+        const supported = capableModel(ctx.model);
+        if (!owned()) return { cancel: true };
+        let configuration: CompactionConfiguration;
+        try {
+          configuration = (await loadCompactionSettings(compactionSettingsPath)).configuration;
+        } catch (error) {
+          if (owned() && ctx.hasUI) {
+            ctx.ui.notify(`Could not read compaction settings; compaction stopped. ${errorMessage(error)}`, "error");
+          }
+          return { cancel: true };
+        }
+        if (!owned()) return { cancel: true };
+
+        const run: CompactionRun = {
+          sessionId,
+          signal,
+          owned,
+          setStatus(message) {
+            if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, message);
+          },
+          summarize(input, remoteError) {
+            let announced = false;
+            return requestFallbackCompaction({
+              ...input,
+              summaryModel: configuration.summaryModel,
+              modelRegistry: ctx.modelRegistry,
+              settings: pi.getSettings(),
+              customInstructions: event.customInstructions,
+              signal,
+              sessionId,
+              onPrepared: ({ model, thinkingLevel }) => {
+                if (!run.owned()) throw new Error("Compaction session changed");
+                if (announced) return;
+                announced = true;
+                run.setStatus("Pi fallback compaction...");
+                if (!ctx.hasUI) return;
+                if (remoteError !== undefined) {
+                  ctx.ui.notify(`Codex remote compaction failed; using the configured summary model. ${errorMessage(remoteError)}`, "warning");
+                }
+                ctx.ui.notify(`Using Pi text compaction with ${model.provider}/${model.id} (${thinkingLevel}).`, "info");
+              },
+            });
+          },
+        };
+
+        if (!configuration.remoteCompactionEnabled || !supported) {
+          return await compactFallback(event, ctx, run, undefined);
+        }
+        return await compactRemotely(pi, event, ctx, run, supported, fetch, requestSnapshots);
       } finally {
         if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, undefined);
       }
