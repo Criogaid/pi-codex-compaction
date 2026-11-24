@@ -20,7 +20,7 @@ export interface CapableModel {
 export function normalizeUrl(value: string): string {
   const url = new URL(value);
   if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("URL must use HTTP or HTTPS");
-  if (url.username || url.password || url.search || url.hash) {
+  if (url.username || url.password || /[?#]/.test(url.href)) {
     throw new Error("URL must not contain credentials, a query, or a fragment");
   }
   url.pathname = url.pathname.replace(/\/+$/, "") || "/";
