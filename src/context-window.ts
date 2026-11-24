@@ -6,6 +6,7 @@ import { historyGroups, type HistoryGroup } from "./history-groups.js";
 import { approximateTokenCount, approximateTokensFromBytes } from "./text-budget.js";
 
 const EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95;
+const COMPACTION_ENCRYPTED_BYTES_PER_ESTIMATED_BYTE = 3;
 const DEFAULT_FUNCTION_NAMESPACE = "functions";
 const TRUNCATED_OUTPUT_MESSAGE = "Output exceeded the available model context and was truncated";
 
@@ -36,10 +37,11 @@ function itemBytes(item: JsonObject, images: ImageEstimates): number {
     case "message":
       return contentBytes(item.content, images);
     case "reasoning":
+      return reasoningBytes(item.encrypted_content);
     case "compaction":
     case "compaction_summary":
     case "context_compaction":
-      return reasoningBytes(item.encrypted_content);
+      return Math.ceil(textBytes(item.encrypted_content) / COMPACTION_ENCRYPTED_BYTES_PER_ESTIMATED_BYTE);
     case "function_call":
       return textBytes(item.name) + textBytes(item.namespace ?? DEFAULT_FUNCTION_NAMESPACE) + textBytes(item.arguments);
     case "custom_tool_call":
