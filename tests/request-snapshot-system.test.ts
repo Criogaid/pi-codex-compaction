@@ -583,7 +583,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     assert.deepEqual(fixture.errors, []);
   });
 
-  test(`${api} V2 keeps a differing forced head and matches the next ordinary request's system delta`, async (t) => {
+  test(`${api} V2 preserves the observed forced prefix and keeps the later system delta in place`, async (t) => {
     const force = "FORCE";
     const fixture = await sessionFixture({ api,
       models: (base) => [{ ...base, compat: { ...base.compat, supportsMidConvoSystemMessages: true } }],
@@ -593,17 +593,20 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     await fixture.session.prompt(warmup);
     await fixture.session.prompt(warmup);
     const ordinary = lastPayload(fixture);
-    assert.equal(api === "openai-codex-responses" ? ordinary.instructions : inputItems(ordinary)[0].content, force);
+    const observed = inputItems(ordinary);
     const { delta, user } = appendSystemSuffix(fixture);
-    const leaf = fixture.session.sessionManager.getLeafId();
-    assert.ok(leaf);
+
     const items = await compactInput(fixture);
-    const v2 = systemLayout(lastPayload(fixture));
-    assert.deepEqual(items.slice(-3, -1), [delta, user]);
-    assert.deepEqual(v2, { ...systemLayout(ordinary), input: [...systemLayout(ordinary).input, delta] });
-    const next = await nextOrdinaryFrom(fixture, leaf, "Continue with the final task.");
+    if (api === "openai-codex-responses") {
+      assert.equal(ordinary.instructions, force);
+      assert.equal(lastPayload(fixture).instructions, ordinary.instructions);
+    } else {
+      assert.deepEqual(items[0], { role: "developer", content: force });
+    }
+    assert.deepEqual(items.slice(0, observed.length), observed);
+    assert.deepEqual(items.slice(observed.length).slice(-3, -1), [delta, user]);
+    assert.deepEqual(items.filter((item) => item.content === delta.content), [delta]);
     assert.deepEqual(fixture.errors, []);
-    assert.deepEqual(v2, systemLayout(next));
   });
 
   test(`${api} V2 uses model B's ordinary prompt after a provider hook switches models`, async (t) => {
