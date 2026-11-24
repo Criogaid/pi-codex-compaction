@@ -138,6 +138,90 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     }
   });
 
+  test(`${api} replays a checkpoint when recording a provider snapshot fails`, { timeout: 20_000 }, async () => {
+    let failRecording = false;
+    const proxyField: ExtensionFactory = (pi) => void pi.on("before_provider_request", ({ payload }) => {
+      if (!failRecording) return;
+      assert.ok(isObject(payload));
+      return { ...payload, reasoning: new Proxy({ effort: "low" }, {}) };
+    });
+    const fixture = await sessionFixture({ api, extensions: [proxyField, createCodexCompactionExtension()] });
+    try {
+      for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the decisions. ".repeat(80)}`);
+      const { details } = await fixture.session.compact();
+      assert.ok(parseCheckpointDetails(details));
+      failRecording = true;
+      for (let turn = 0; turn < 2; turn++) {
+        await fixture.session.prompt(`Continue ${turn}.`);
+        const payload = fixture.requests.at(-1)?.payload;
+        assert.ok(payload && Array.isArray(payload.input));
+        assert.equal(countType(payload.input, "compaction"), 1);
+        assert.ok(!JSON.stringify(payload.input).includes("PI_CODEX_REMOTE_CHECKPOINT"));
+        assert.deepEqual(payload.reasoning, { effort: "low" });
+      }
+      assert.deepEqual(fixture.errors, []);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test(`${api} preserves replay errors and drops the previous wire snapshot when recording fails`, { timeout: 20_000 }, async () => {
+    const wireOnly = "Only present in the previous request payload.";
+    let marker: string | undefined;
+    let failRecording = false;
+    const editRequest: ExtensionFactory = (pi) => {
+      pi.on("context", (event) => failRecording ? { messages: transforms.annotate(event.messages) } : undefined);
+      pi.on("before_provider_request", ({ payload }) => {
+        const activeMarker = marker;
+        if (activeMarker === undefined) return;
+        assert.ok(isObject(payload) && Array.isArray(payload.input));
+        if (!failRecording) {
+          return { ...payload, input: [...payload.input,
+            { type: "message", role: "user", content: [{ type: "input_text", text: wireOnly }] }] };
+        }
+        const checkpoint = payload.input.find((item) => hasCheckpointMarker({ input: [item] }, activeMarker));
+        assert.ok(checkpoint);
+        return { ...payload, input: [...payload.input, checkpoint],
+          reasoning: new Proxy({ effort: "low" }, {}) };
+      });
+    };
+    const fixture = await sessionFixture({ api, extensions: [editRequest, createCodexCompactionExtension()] });
+    try {
+      for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the decisions. ".repeat(80)}`);
+      const { details } = await fixture.session.compact();
+      const saved = parseCheckpointDetails(details);
+      assert.ok(saved);
+      marker = checkpointMarker(saved.checkpointId);
+      await fixture.session.prompt(`Continue. ${"Use the compacted history. ".repeat(40)}`);
+      const prior = fixture.requests.at(-1)?.payload;
+      assert.ok(prior && Array.isArray(prior.input));
+      assert.equal(countType(prior.input, "compaction"), 1);
+      assert.ok(JSON.stringify(prior.input).includes(wireOnly));
+      assert.deepEqual(fixture.errors, []);
+
+      failRecording = true;
+      await fixture.session.prompt("Continue with the request-local note.");
+      const replayErrors = [...fixture.errors];
+      const failed = fixture.requests.at(-1)?.payload;
+      assert.ok(failed && Array.isArray(failed.input));
+      assert.deepEqual(failed.reasoning, { effort: "low" });
+
+      await fixture.session.compact();
+      const compact = fixture.requests.at(-1)?.payload;
+      assert.ok(compact && Array.isArray(compact.input));
+      assert.equal(countType(compact.input, "compaction_trigger"), 1);
+      assert.equal(countType(compact.input, "compaction"), 1);
+      const text = JSON.stringify(compact.input);
+      assert.ok(text.includes(annotation));
+      assert.ok(!text.includes(wireOnly), "Do not reuse the previous observed wire input");
+      assert.ok(!text.includes("PI_CODEX_REMOTE_CHECKPOINT"));
+      assert.equal(replayErrors.length, 1);
+      assert.match(replayErrors[0], /contained 2 checkpoint markers/);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test(`${api} V2 uses this turn's context after a checkpoint replay error`, { timeout: 20_000 }, async () => {
     const wireOnly = "Only present in the previous request payload.";
     let marker: string | undefined;
