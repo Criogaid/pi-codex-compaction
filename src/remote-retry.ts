@@ -25,8 +25,6 @@ const NS_PER_MS = 1_000_000n;
 const NS_PER_SECOND = 1_000n * NS_PER_MS;
 const MAX_U64 = (1n << 64n) - 1n;
 const I64_LIMIT = 2 ** 63;
-// Codex's Rust Instant uses unsigned Duration on Windows and signed seconds on Unix.
-const MAX_INSTANT_NS = ((process.platform === "win32" ? MAX_U64 : MAX_U64 >> 1n) + 1n) * NS_PER_SECOND - 1n;
 
 type RetrySchedule = number | "backoff";
 interface TransientFailure { readonly retry: RetrySchedule | undefined }
@@ -37,8 +35,8 @@ export function compactionRetryLimit(configured?: number): number {
 }
 
 function checkedDeadline(delayNs: bigint, receivedAt: bigint): number | undefined {
-  const deadline = receivedAt + delayNs;
-  return deadline <= MAX_INSTANT_NS ? Number(deadline) / Number(NS_PER_MS) : undefined;
+  const deadline = Number(receivedAt + delayNs) / Number(NS_PER_MS);
+  return Number.isFinite(deadline) ? deadline : undefined;
 }
 
 function httpDateMs(value: string): number | undefined {
@@ -135,7 +133,7 @@ function rateLimitDeadline(message: string | null | undefined, receivedAt: bigin
     const wholeMs = Number.isFinite(value) ? BigInt(Math.trunc(value)) : MAX_U64;
     return checkedDeadline((wholeMs > MAX_U64 ? MAX_U64 : wholeMs) * NS_PER_MS, receivedAt);
   }
-  if (!Number.isFinite(value)) return undefined;
+  if (value > MAX_U64) return undefined;
   const wholeSeconds = Math.trunc(value);
   const fractionalNs = Math.round((value - wholeSeconds) * Number(NS_PER_SECOND));
   return checkedDeadline(BigInt(wholeSeconds) * NS_PER_SECOND + BigInt(fractionalNs), receivedAt);
