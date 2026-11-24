@@ -102,9 +102,7 @@ test("V2 rewrites only the sent body, preserving Pi effort updates in the checkp
   const target = capableModel(model);
   assert.ok(target);
   const update = { type: "configuration_update", reasoning: { effort: "low" } };
-  const registry = await testRegistry(withResponsesPayloadHook(provider, (payload) => ({
-    ...payload, input: [...payload.input.flatMap((item) => item.role === "assistant" ? [update, item] : [item]), update],
-  })));
+  const registry = await testRegistry(provider);
   const canonical = [{ role: "system" as const, content: "Preserve settings.", timestamp: 0 },
     { role: "user" as const, content: "source", timestamp: 1 }];
   const inputs: ProviderRequestInputs = { systemPrompt: "Preserve settings.", thinkingLevel: "low", settings: {}, activeTools: [], tools: [] };
@@ -122,6 +120,7 @@ test("V2 rewrites only the sent body, preserving Pi effort updates in the checkp
     fetch: async () => response(),
   }).result();
   assert.notEqual(assistant.stopReason, "error", assistant.errorMessage ?? "ordinary request failed");
+  assert.equal(assistant.providerThinkingLevel, "low");
   assert.ok(observed && Array.isArray(observed.input));
   assert.deepEqual(observed.input.at(-1), update);
   const current = [...canonical, { ...assistant, content: [{ type: "text" as const, text: "reply" }], timestamp: 2 }];

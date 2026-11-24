@@ -7,7 +7,7 @@ import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
 import codexCompaction from "../src/index.js";
 import { isObject, isObjectArray } from "../src/protocol.js";
-import { isolateAgentConfig, sessionFixture } from "./helpers.js";
+import { isolateAgentConfig, midConversationEffortModel, sessionFixture } from "./helpers.js";
 
 const settingsPath = join(isolateAgentConfig(), COMPACTION_SETTINGS_RELATIVE_PATH);
 beforeEach(() => rm(dirname(settingsPath), { recursive: true, force: true }));
@@ -47,7 +47,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       };
       const emitsUpdates = api === "openai-responses";
       const fixture = await sessionFixture({
-        api, extensions: [observePiPayload, codexCompaction], simulatePi152Effort: true, settings: retrySettings,
+        api, extensions: [observePiPayload, codexCompaction], settings: retrySettings,
+        models: emitsUpdates ? (base) => [midConversationEffortModel(base)] : undefined,
         respond({ payload }) {
           if (responsesPayload(payload).input.at(-1)?.type === trigger.type && ++compactionAttempts === 1) {
             return new Response("Fixture busy", { status: 503, headers: { "retry-after-ms": "1" } });
@@ -95,8 +96,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   }
 }
 
-test("synthetic Pi 1.5.2 effort shape groups outputs by same-model assistant message", { timeout: 20_000 }, async (t) => {
-  const fixture = await sessionFixture({ extensions: [], simulatePi152Effort: true });
+test("Pi groups effort updates by same-model assistant message", { timeout: 20_000 }, async (t) => {
+  const fixture = await sessionFixture({ extensions: [], models: (base) => [midConversationEffortModel(base)] });
   t.after(() => fixture.close());
   await fixture.session.prompt("Record a real assistant reply at low effort.");
   const assistant = fixture.session.messages.findLast((message) => message.role === "assistant");
@@ -130,8 +131,8 @@ test("synthetic Pi 1.5.2 effort shape groups outputs by same-model assistant mes
 });
 
 test("openai-responses leaves effort on the request when mid-conversation effort is unsupported", { timeout: 20_000 }, async (t) => {
-  const fixture = await sessionFixture({ extensions: [], simulatePi152Effort: true,
-    models: (base) => [{ ...base, compat: { ...base.compat, supportsMidConvoEffort: false } }],
+  const fixture = await sessionFixture({ extensions: [],
+    models: (base) => [{ ...midConversationEffortModel(base), compat: { ...base.compat, supportsMidConvoEffort: false } }],
   });
   t.after(() => fixture.close());
   await fixture.session.prompt("Record a reply at low effort.");
@@ -148,7 +149,7 @@ test("V2 retry over a checkpoint preserves the request baseline and later effort
   let retrySecondCompaction = false;
   let rejected = false;
   const fixture = await sessionFixture({
-    extensions: [codexCompaction], simulatePi152Effort: true, settings: retrySettings,
+    extensions: [codexCompaction], models: (base) => [midConversationEffortModel(base)], settings: retrySettings,
     respond({ payload }) {
       if (retrySecondCompaction && !rejected && responsesPayload(payload).input.at(-1)?.type === trigger.type) {
         rejected = true;
@@ -188,7 +189,7 @@ test("V2 retry over a checkpoint preserves the request baseline and later effort
 });
 
 test("chat defaults to Pi effort updates without config and a command toggle applies on the next request", { timeout: 20_000 }, async (t) => {
-  const fixture = await sessionFixture({ extensions: [codexCompaction], simulatePi152Effort: true });
+  const fixture = await sessionFixture({ extensions: [codexCompaction], models: (base) => [midConversationEffortModel(base)] });
   t.after(() => fixture.close());
   const notices: string[] = [];
   // Pi uses only the selector and notification methods for this RPC command.
@@ -211,7 +212,7 @@ test("chat defaults to Pi effort updates without config and a command toggle app
 });
 
 test("compaction keeps the session effort switch for V2 and subsequent chat requests", { timeout: 20_000 }, async (t) => {
-  const fixture = await sessionFixture({ extensions: [codexCompaction], simulatePi152Effort: true });
+  const fixture = await sessionFixture({ extensions: [codexCompaction], models: (base) => [midConversationEffortModel(base)] });
   t.after(() => fixture.close());
   await fillHistory(fixture.session, "Task");
   await setEffortSwitch(true);

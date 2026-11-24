@@ -7,7 +7,7 @@ import type { ExtensionFactory, ExtensionUIContext } from "@earendil-works/pi-co
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
 import codexCompaction from "../src/index.js";
 import { isObject, isObjectArray, type JsonObject } from "../src/protocol.js";
-import { isolateAgentConfig, sessionFixture } from "./helpers.js";
+import { isolateAgentConfig, midConversationEffortModel, sessionFixture } from "./helpers.js";
 
 const settingsPath = join(isolateAgentConfig(), COMPACTION_SETTINGS_RELATIVE_PATH);
 beforeEach(async () => {
@@ -17,13 +17,12 @@ beforeEach(async () => {
 
 const settings = (enabled: boolean) => ({ version: 2, reasoningEffortUpdates: { enabled } });
 const writeEffortSwitch = (enabled: boolean) => writeFile(settingsPath, JSON.stringify(settings(enabled)));
-const update = { type: "configuration_update", reasoning: { effort: "medium" } };
+const update = { type: "configuration_update", reasoning: { effort: "low" } };
 
 async function startFixture(t: TestContext, ...extensions: ExtensionFactory[]) {
   const fixture = await sessionFixture({
     extensions: extensions.length ? extensions : [codexCompaction],
-    // A synthetic effort update distinguishes pass-through from rewriting independently of adapter shapes.
-    serializePayload: (payload) => ({ ...payload, input: [...payload.input, update] }),
+    models: (base) => [midConversationEffortModel(base)],
   });
   t.after(() => fixture.close());
   return fixture;
@@ -48,7 +47,7 @@ test("the first ordinary request reads the effort switch without session_start",
   const fixture = await startFixture(t, withoutSessionStart);
   await fixture.session.prompt("Start the task without a startup notification.");
   assert.equal(fixture.requests.length, 1);
-  assert.equal(responsesPayload(fixture.requests[0].payload).effort, "medium");
+  assert.equal(responsesPayload(fixture.requests[0].payload).effort, "low");
   assert.deepEqual(fixture.errors, []);
 });
 
@@ -66,7 +65,7 @@ test("an in-flight compaction keeps its effort switch and cannot overwrite a men
   for (let turn = 1; turn <= 3; turn++) {
     await fixture.session.prompt(`Task ${turn}: ${"Preserve the agreed implementation constraints. ".repeat(60)}`);
   }
-  assert.equal(responsesPayload(fixture.requests.at(-1)?.payload).effort, "medium");
+  assert.equal(responsesPayload(fixture.requests.at(-1)?.payload).effort, "low");
   const beforeCompaction = fixture.requests.length;
 
   const readFinished = Promise.withResolvers<void>();
@@ -107,12 +106,12 @@ test("an in-flight compaction keeps its effort switch and cannot overwrite a men
   assert.equal(fixture.requests.length, beforeCompaction + 1);
   const v2 = responsesPayload(fixture.requests.at(-1)?.payload);
   assert.equal(v2.input.at(-1)?.type, "compaction_trigger");
-  assert.equal(v2.effort, "medium");
+  assert.equal(v2.effort, "low");
 
   await fixture.session.prompt("Continue after changing the effort switch.");
   const chat = responsesPayload(fixture.requests.at(-1)?.payload);
   assert.ok(chat.input.some((item) => item.type === "compaction"));
-  assert.equal(chat.effort, "low");
+  assert.equal(chat.effort, "medium");
   assert.deepEqual(chat.input.at(-1), update);
   assert.deepEqual(fixture.errors, []);
 });
@@ -121,7 +120,7 @@ test("session_start during reload adopts the edited effort switch before the nex
   await writeEffortSwitch(false);
   const fixture = await startFixture(t);
   await fixture.session.prompt("Start the task with the rewrite disabled.");
-  assert.equal(responsesPayload(fixture.requests.at(-1)?.payload).effort, "low");
+  assert.equal(responsesPayload(fixture.requests.at(-1)?.payload).effort, "medium");
 
   await writeEffortSwitch(true);
   await fixture.session.reload();
@@ -129,7 +128,7 @@ test("session_start during reload adopts the edited effort switch before the nex
   await writeEffortSwitch(false);
   await fixture.session.prompt("Continue after reloading the session.");
   assert.equal(fixture.requests.length, 2);
-  assert.equal(responsesPayload(fixture.requests.at(-1)?.payload).effort, "medium");
+  assert.equal(responsesPayload(fixture.requests.at(-1)?.payload).effort, "low");
   assert.deepEqual(fixture.errors, []);
 });
 
@@ -146,7 +145,7 @@ test("corrupt settings at reload warn once and leave subsequent requests as Pi s
     setStatus(_key, _text) {},
   } as ExtensionUIContext });
   await fixture.session.prompt("Start the task with the rewrite enabled.");
-  assert.equal(responsesPayload(fixture.requests.at(-1)?.payload).effort, "medium");
+  assert.equal(responsesPayload(fixture.requests.at(-1)?.payload).effort, "low");
   assert.equal(notices.length, 0);
 
   await writeFile(settingsPath, "{");
