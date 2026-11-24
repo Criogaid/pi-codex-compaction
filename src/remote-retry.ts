@@ -7,54 +7,106 @@ const MAX_RETRIES = 2;
 const MAX_RETRY_DELAY_MS = 60_000;
 const MAX_OBSERVED_EVENT_CHARS = 1_048_576;
 const TRANSIENT_HTTP = new Set([408, 409, 429, 500, 502, 503, 504]);
-const TRANSIENT_CODES = new Set(["server_error", "server_is_overloaded", "rate_limit_exceeded", "slow_down"]);
-const PERMANENT_CODES = new Set([
-  "insufficient_quota", "credit_balance_exhausted", "organization_spend_limit_exceeded",
-  "project_spend_limit_exceeded", "usage_limit_reached", "usage_not_included", "context_length_exceeded",
-  "invalid_prompt", "invalid_api_key", "authentication_error", "permission_denied", "access_denied",
-  "cyber_policy", "bio_policy", "misalignment_policy_violation", "content_filter",
+const CAPACITY_CODES = new Set(["server_is_overloaded", "policy_capacity_unavailable"]);
+const RATE_LIMIT_CODES = new Set(["rate_limit_exceeded", "slow_down"]);
+const HTTP_429_PERMANENT_TYPES = new Set(["usage_limit_reached", "usage_not_included", "insufficient_quota"]);
+const HTTP_PERMANENT_CODES = new Set([
+  "insufficient_quota", "credit_balance_exhausted", "organization_usage_limit_exceeded",
+  "api_key_spend_limit_exceeded", "organization_spend_limit_exceeded", "project_spend_limit_exceeded",
+  "flex_unavailable", "context_length_exceeded", "invalid_prompt", "invalid_api_key", "authentication_error",
+  "permission_denied", "access_denied", "cyber_policy", "bio_policy", "misalignment_policy_violation",
+  "content_filter", "content_policy_violation", "inference_hook_denied", "invalid_access_program",
+  "unsupported_access_program", "access_program_not_enabled", "budget_reached", "audio_too_large",
+  "audio_too_short", "invalid_audio", "invalid_audio_data", "invalid_audio_format",
+  "missing_audio_sample_rate", "model_not_found",
 ]);
 const TRANSIENT_NETWORK = new Set([
   "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH",
   "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
 ]);
 
-export interface RetryEvidence { reason: string; retryAt?: number }
+const NS_PER_MS = 1_000_000n;
+const NS_PER_SECOND = 1_000n * NS_PER_MS;
+const MAX_U64 = (1n << 64n) - 1n;
+// Codex's Rust Instant uses unsigned Duration on Windows and signed seconds on Unix.
+const MAX_INSTANT_NS = ((process.platform === "win32" ? MAX_U64 : MAX_U64 >> 1n) + 1n) * NS_PER_SECOND - 1n;
+
+type RetrySchedule = number | "backoff";
+interface TransientFailure { readonly retry: RetrySchedule | undefined }
+const TRANSIENT_BACKOFF: TransientFailure = { retry: "backoff" };
 
 export function compactionRetryLimit(configured?: number): number {
   return Math.max(0, Math.min(MAX_RETRIES, Math.floor(Number.isFinite(configured) ? configured! : MAX_RETRIES)));
 }
 
-function retryDeadline(headers: Headers): number | undefined {
-  const milliseconds = headers.get("retry-after-ms");
-  const seconds = headers.get("retry-after");
-  for (const [value, scale] of [[milliseconds, 1], [seconds, 1_000]] as const) {
-    if (value !== null && /^\d+(?:\.\d+)?$/.test(value.trim())) {
-      const ms = Number(value) * scale;
-      // Numeric overflow is still server advice beyond our cap, not an absent header.
-      return Date.now() + ms;
+function checkedDeadline(delayNs: bigint, receivedAt: bigint): number | undefined {
+  const deadline = receivedAt + delayNs;
+  return deadline <= MAX_INSTANT_NS ? Number(deadline) / Number(NS_PER_MS) : undefined;
+}
+
+function httpDateMs(value: string): number | undefined {
+  // Canonicalize obsolete HTTP-date forms before checking the calendar and weekday with Date.
+  let imf = value;
+  const rfc850 = /^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-([A-Za-z]{3})-(\d{2}) (\d{2}:\d{2}:\d{2}) GMT$/.exec(value);
+  const asctime = /^([A-Za-z]{3}) ([A-Za-z]{3}) ( \d|\d{2}) (\d{2}:\d{2}:\d{2}) (\d{4})$/.exec(value);
+  if (rfc850) {
+    const [, weekday, day, month, year, time] = rfc850;
+    imf = `${weekday.slice(0, 3)}, ${day} ${month} ${Number(year) < 70 ? "20" : "19"}${year} ${time} GMT`;
+  } else if (asctime) {
+    const [, weekday, month, day, time, year] = asctime;
+    imf = `${weekday}, ${day.trim().padStart(2, "0")} ${month} ${year} ${time} GMT`;
+  }
+  const date = new Date(imf);
+  const year = date.getUTCFullYear();
+  return year >= 1970 && year <= 9999 && date.toUTCString() === imf ? date.getTime() : undefined;
+}
+
+function retryDeadline(headers: unknown, receivedAt: bigint, wallTime: number): number | undefined {
+  let milliseconds: string | undefined;
+  let seconds: string | undefined;
+  if (headers instanceof Headers) {
+    milliseconds = headers.get("retry-after-ms")?.trim();
+    seconds = headers.get("retry-after")?.trim();
+  } else if (isObject(headers)) {
+    for (const name of Object.keys(headers).sort()) {
+      const value = headers[name];
+      if (typeof value !== "string" && typeof value !== "number") continue;
+      const text = String(value);
+      // Rust rejects illegal field bytes before interpreting SSE headers as retry advice.
+      if (/[^\t\x20-\x7e\x80-\xff]/.test(text)) continue;
+      switch (name.toLowerCase()) {
+        case "retry-after-ms": milliseconds = text.trim(); break;
+        case "retry-after": seconds = text.trim(); break;
+      }
     }
   }
-  if (seconds !== null && !/^[+-]?[\d.]+$/.test(seconds.trim())) {
-    const date = Date.parse(seconds);
-    if (Number.isFinite(date)) return Math.max(Date.now(), date);
+  const receivedAtMs = Number(receivedAt) / Number(NS_PER_MS);
+  // Pi's millisecond extension treats numeric overflow as advice beyond the wait cap.
+  if (milliseconds !== undefined && /^\d+(?:\.\d+)?$/.test(milliseconds)) return receivedAtMs + Number(milliseconds);
+  if (seconds === undefined) return undefined;
+  if (/^\d+$/.test(seconds)) {
+    const digits = seconds.replace(/^0+/, "");
+    if (digits.length > MAX_U64.toString().length) return undefined;
+    const duration = BigInt(digits);
+    return duration <= MAX_U64 ? checkedDeadline(duration * NS_PER_SECOND, receivedAt) : undefined;
   }
-  return undefined;
+  const date = httpDateMs(seconds);
+  return date === undefined ? undefined : receivedAtMs + Math.max(0, date - wallTime);
 }
 
 export async function waitForCompactionRetry(
-  evidence: RetryEvidence, retry: number, maxDelayMs: number | undefined, signal: AbortSignal,
-): Promise<void> {
+  schedule: RetrySchedule, retry: number, maxDelayMs: number | undefined, signal: AbortSignal,
+): Promise<boolean> {
   signal.throwIfAborted();
   // Pi's zero means no configured ceiling; V2 still enforces its own bounded wait.
   const cap = maxDelayMs !== undefined && Number.isFinite(maxDelayMs) && maxDelayMs > 0
     ? Math.min(maxDelayMs, MAX_RETRY_DELAY_MS) : MAX_RETRY_DELAY_MS;
-  const requested = evidence.retryAt === undefined ? undefined : Math.max(0, evidence.retryAt - Date.now());
-  if (requested !== undefined && requested > cap) {
-    throw new Error(`Remote compaction retry delay exceeds the allowed maximum of ${cap}ms (${evidence.reason})`);
-  }
-  await delay(requested ?? Math.min(500 * 2 ** retry, cap), undefined, { signal });
+  const requested = schedule === "backoff" ? Math.min(500 * 2 ** retry, cap)
+    : Math.max(0, schedule - Number(process.hrtime.bigint()) / Number(NS_PER_MS));
+  if (requested > cap) return false;
+  await delay(requested, undefined, { signal });
   signal.throwIfAborted();
+  return true;
 }
 
 function networkFailure(error: unknown): boolean {
@@ -66,35 +118,32 @@ function networkFailure(error: unknown): boolean {
   return false;
 }
 
-function classifyError(value: unknown): { code?: string; permanent: boolean; invalid: boolean; message?: string } {
-  if (!isObject(value)) return { permanent: false, invalid: true };
-  const records = [value, ...(isObject(value.error) ? [value.error] : [])];
-  let invalid = value.error !== undefined && !isObject(value.error);
-  const codes: string[] = [];
-  for (const record of records) {
-    // OpenAI error bodies carry `"code": null`; classify those by `type` like an absent code.
-    if (record.code !== undefined && record.code !== null) {
-      if (typeof record.code === "string" && record.code) codes.push(record.code);
-      else invalid = true;
-    } else if (typeof record.type === "string" && record.type !== "error" &&
-        !record.type.startsWith("response.")) codes.push(record.type);
+function rateLimitDeadline(message: string | null | undefined, receivedAt: bigint): number | undefined {
+  const match = message?.match(/try again in\s*(\d+(?:\.\d+)?)\s*(s|ms|seconds?)/i);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  if (match[2].toLowerCase() === "ms") {
+    // Codex truncates fractional milliseconds and saturates the unsigned conversion.
+    const wholeMs = Number.isFinite(value) ? BigInt(Math.trunc(value)) : MAX_U64;
+    return checkedDeadline((wholeMs > MAX_U64 ? MAX_U64 : wholeMs) * NS_PER_MS, receivedAt);
   }
-  const unique = [...new Set(codes)];
-  return {
-    code: unique.length === 1 ? unique[0] : undefined,
-    permanent: codes.some((code) => PERMANENT_CODES.has(code)),
-    invalid: invalid || unique.length > 1,
-    message: records.map((record) => record.message).find((message): message is string => typeof message === "string"),
-  };
+  if (!Number.isFinite(value)) return undefined;
+  const wholeSeconds = Math.trunc(value);
+  const fractionalNs = Math.round((value - wholeSeconds) * Number(NS_PER_SECOND));
+  return checkedDeadline(BigInt(wholeSeconds) * NS_PER_SECOND + BigInt(fractionalNs), receivedAt);
 }
 
-function rateLimitDeadline(code: string, message: string | undefined): number | undefined {
-  // Codex interprets this advice only for explicit rate-limit codes, never arbitrary error prose.
-  if (code !== "rate_limit_exceeded" && code !== "slow_down") return undefined;
-  const match = message?.match(/\btry again in\s+(\d+(?:\.\d+)?)\s*(ms|seconds?|s)\b/i);
-  if (!match) return undefined;
-  const ms = Number(match[1]) * (match[2].toLowerCase() === "ms" ? 1 : 1_000);
-  return Date.now() + ms;
+function httpFailure(response: Response, retryAt: number | undefined, value: unknown): TransientFailure | undefined {
+  const error = isObject(value) && isObject(value.error) ? value.error : undefined;
+  const code = typeof error?.code === "string" ? error.code : undefined;
+  const { status, headers } = response;
+  if (code !== undefined && HTTP_PERMANENT_CODES.has(code)) return;
+  if (!TRANSIENT_HTTP.has(status) || headers.get("x-should-retry") === "false") return;
+  if (status === 429) {
+    if (retryAt === undefined || (typeof error?.type === "string" && HTTP_429_PERMANENT_TYPES.has(error.type))) return;
+    return { retry: retryAt };
+  }
+  return { retry: status === 503 && code !== undefined && CAPACITY_CODES.has(code) ? retryAt : retryAt ?? "backoff" };
 }
 
 const LF = 0x0a;
@@ -199,7 +248,7 @@ class SseEvidenceObserver {
 }
 
 export class CompactionAttempt {
-  private evidence?: RetryEvidence;
+  private failure?: TransientFailure;
   private blocked = false;
   private terminal = false;
   private progress = false;
@@ -213,32 +262,44 @@ export class CompactionAttempt {
     if (error !== undefined && !this.fatal) this.fatal = { error };
   }
   fetchFailed(error: unknown): void {
-    if (!this.terminal && networkFailure(error)) this.evidence = { reason: "transient network failure" };
+    if (!this.terminal && networkFailure(error)) this.failure = TRANSIENT_BACKOFF;
   }
   observeSdkError(value: unknown, name: string): void {
     // OpenAI’s SDK intercepts named errors and truthy data.error before calling Pi’s hook.
-    if (this.api !== "openai-responses" || name.startsWith("thread.") ||
-        (name !== "error" && !(isObject(value) && value.error))) return;
-    this.observeFailure(value);
+    if (this.api !== "openai-responses" || name.startsWith("thread.")) return;
+    const event = isObject(value) ? value : undefined;
+    if (name === "error" || event?.error) this.observeFailure(event?.error, event);
   }
 
-  private observeFailure(value: unknown): Error | undefined {
+  private observeFailure(value: unknown, standaloneHeaders?: { headers?: unknown }): Error | undefined {
     if (this.terminal || this.blocked) return;
     this.terminal = true;
-    const error = classifyError(value);
-    const { code } = error;
-    if (error.invalid || error.permanent || !code || !TRANSIENT_CODES.has(code)) {
-      this.blockRetry();
-      return;
-    }
-    this.evidence = { reason: `server error ${code}`, retryAt: rateLimitDeadline(code, error.message) };
-    return new Error(`Remote compaction failed temporarily (${code})`);
+    if (!isObject(value)) return;
+    const { code, message, headers } = value;
+    if (typeof code !== "string" || (message != null && typeof message !== "string")) return;
+    const capacity = CAPACITY_CODES.has(code);
+    const rateLimited = RATE_LIMIT_CODES.has(code);
+    if (!capacity && (standaloneHeaders || (!rateLimited && code !== "server_error"))) return;
+    const receivedAt = process.hrtime.bigint();
+    const wallTime = Date.now();
+    const retryAt = retryDeadline(headers, receivedAt, wallTime) ??
+      (standaloneHeaders ? retryDeadline(standaloneHeaders.headers, receivedAt, wallTime)
+        : rateLimited ? rateLimitDeadline(message, receivedAt) : undefined);
+    this.failure = { retry: capacity ? retryAt : retryAt ?? "backoff" };
+    return new Error(message ?? "Remote compaction failed temporarily (" + code + ")");
   }
 
   observeEvent(value: unknown): Error | undefined {
     if (!isObject(value) || typeof value.type !== "string") { this.blockRetry(); return; }
-    if (value.type === "error") return this.observeFailure(value);
+    if (value.type === "error") return this.observeFailure(value.error, value);
     if (value.type === "response.failed") return this.observeFailure(isObject(value.response) ? value.response.error : undefined);
+    if (value.type === "response.incomplete" && !this.terminal && !this.blocked &&
+        isObject(value.response) && isObject(value.response.incomplete_details) &&
+        value.response.incomplete_details.reason === "content_filter") {
+      this.terminal = true;
+      this.failure = TRANSIENT_BACKOFF;
+      return new Error("Remote compaction failed temporarily (content_filter)");
+    }
     if (value.type === "response.completed" || value.type === "response.incomplete" ||
         value.type === "response.cancelled" || (this.api === CODEX_API && value.type === "response.done")) {
       this.terminal = true;
@@ -246,18 +307,17 @@ export class CompactionAttempt {
     if (value.type === "response.created" || value.type === "response.in_progress" ||
         value.type === "response.output_item.added" || value.type === "response.output_item.done") this.progress = true;
   }
-  retryEvidence(): RetryEvidence | undefined {
-    if (this.blocked) return undefined;
-    return this.evidence ?? (!this.terminal && this.eof && this.progress ? { reason: "Responses stream ended before its terminal event" } : undefined);
+  outcome(): TransientFailure | undefined {
+    if (this.blocked) return;
+    return this.failure ?? (!this.terminal && this.eof && this.progress ? TRANSIENT_BACKOFF : undefined);
   }
 
   observeResponse(response: Response, signal: AbortSignal, completed: () => boolean): Response {
-    if (!response.ok) {
-      if (TRANSIENT_HTTP.has(response.status) && response.headers.get("x-should-retry") !== "false") {
-        this.evidence = { reason: `HTTP ${response.status}`, retryAt: retryDeadline(response.headers) };
-      } else this.blockRetry();
+    const retryAt = response.ok ? undefined : retryDeadline(response.headers, process.hrtime.bigint(), Date.now());
+    if (!response.body) {
+      if (!response.ok) this.failure = httpFailure(response, retryAt, undefined);
+      return response;
     }
-    if (!response.body) return response;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     // Pi requests a stream explicitly, so successful bodies are SSE regardless of response headers.
@@ -292,14 +352,12 @@ export class CompactionAttempt {
       inspectErrorBody(decoder.decode());
       if (errorBodyTooLarge) return;
       let value: unknown;
-      try { value = JSON.parse(errorBody); }
+      try { if (errorBody) value = JSON.parse(errorBody); }
       catch (error) {
         // Gateways can return non-JSON diagnostics, including a partial body before a reset.
         if (!(error instanceof SyntaxError)) throw error;
-        return;
       }
-      const error = classifyError(value);
-      if (error.permanent || error.invalid || (error.code && !TRANSIENT_CODES.has(error.code))) this.blockRetry();
+      this.failure = httpFailure(response, retryAt, value);
     };
     const body = new ReadableStream<Uint8Array>({
       start(controller) {

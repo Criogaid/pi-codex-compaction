@@ -15,7 +15,7 @@ const REQUEST_TIMEOUT_MS = 300_000;
 const MISSING_PAYLOAD_MESSAGE = "Provider did not expose a request payload";
 const UNEXPECTED_PAYLOAD_MODEL = "Provider payload used an unexpected model";
 
-/** Only an exhausted, explicitly transient request is eligible for layered recovery. */
+/** A confirmed transient failure can use layered recovery when resending stops. */
 export class RemoteCompactionTransientError extends Error {
   constructor(cause: unknown) {
     super(cause instanceof Error ? cause.message : String(cause), { cause });
@@ -232,10 +232,11 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     } catch (error) {
       request.signal.throwIfAborted();
       if (attempt.fatal) throw attempt.fatal.error;
-      const evidence = attempt.retryEvidence();
-      if (!evidence) throw error;
-      if (retry >= retries) throw new RemoteCompactionTransientError(error);
-      await waitForCompactionRetry(evidence, retry, request.maxRetryDelayMs, request.signal);
+      const failure = attempt.outcome();
+      if (!failure) throw error;
+      if (failure.retry !== undefined && retry < retries &&
+          await waitForCompactionRetry(failure.retry, retry, request.maxRetryDelayMs, request.signal)) continue;
+      throw new RemoteCompactionTransientError(error);
     }
   }
 }
