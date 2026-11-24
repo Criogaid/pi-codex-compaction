@@ -234,16 +234,16 @@ export class CompactionAttempt {
   }
 
   observeResponse(response: Response, signal: AbortSignal, api: Api, completed: () => boolean): Response {
-    const isSse = response.ok && response.headers.get("content-type")?.toLowerCase().includes("text/event-stream");
     if (!response.ok) {
       if (TRANSIENT_HTTP.has(response.status) && response.headers.get("x-should-retry") !== "false") {
         this.evidence = { reason: `HTTP ${response.status}`, retryAt: retryDeadline(response.headers) };
       } else this.blockRetry();
     }
-    if (!response.body || (response.ok && !isSse)) return response;
+    if (!response.body) return response;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    const sse = isSse ? new SseEvidenceObserver(this, api) : undefined;
+    // Pi requests a stream explicitly, so successful bodies are SSE regardless of response headers.
+    const sse = response.ok ? new SseEvidenceObserver(this, api) : undefined;
     let errorBody = "";
     let errorBodyTooLarge = false;
     let closed = false;
