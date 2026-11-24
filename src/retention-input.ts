@@ -4,7 +4,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertToLlm, parseSkillBlock } from "@earendil-works/pi-coding-agent";
 import { SaxesParser } from "saxes";
-import { historyGroups, inputText, matchesMarkedText, trimWhiteSpace } from "./history-groups.js";
+import { historyGroups, inputText, isUserItem, matchesMarkedText, trimWhiteSpace } from "./history-groups.js";
 import type { ImageEstimates } from "./image-budget.js";
 import { isObject, type JsonObject } from "./protocol.js";
 import type { RetentionInput } from "./retention.js";
@@ -75,7 +75,7 @@ function hookPrompt(text: string): boolean {
   return finished && !invalid && trimWhiteSpace(hookRunId).length > 0 && textFields === 1;
 }
 function isUserMessage(item: JsonObject): boolean {
-  if ((item.type !== undefined && item.type !== "message") || item.role !== "user" || !Array.isArray(item.content)) return false;
+  if (!isUserItem(item) || !Array.isArray(item.content)) return false;
   let hasContext = false;
   let hasHook = false;
   let allHookOrContext = true;
@@ -102,10 +102,6 @@ export function userItemOrigins(messages: readonly AgentMessage[]): UserItemOrig
   return messages.flatMap((message) => convertToLlm([message])
     .filter((llm) => llm.role === "user" && (typeof llm.content === "string" || llm.content.length > 0))
     .map(() => origin(message)));
-}
-
-function isUserItem(item: JsonObject): boolean {
-  return (item.type === undefined || item.type === "message") && item.role === "user";
 }
 
 /** Match provider user items to Pi origins; a changed user sequence falls back to text classification. */

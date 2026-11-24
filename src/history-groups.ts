@@ -27,6 +27,10 @@ export function inputText(value: unknown): string | undefined {
     "text" in value && typeof value.text === "string" ? trimWhiteSpace(value.text) : undefined;
 }
 
+export function isUserItem(item: JsonObject): boolean {
+  return (item.type === undefined || item.type === "message") && item.role === "user";
+}
+
 function isResizeNotice(item: JsonObject): boolean {
   if ((item.type !== undefined && item.type !== "message") || item.role !== "developer" ||
     !Array.isArray(item.content) || item.content.length !== 1) return false;
@@ -41,7 +45,7 @@ export function historyGroups(input: readonly JsonObject[]): HistoryGroup[] {
     const source = input[index];
     const next = input[index + 1];
     const canHaveResizeNotice = source.type === "function_call_output" || source.type === "custom_tool_call_output" ||
-      ((source.type === undefined || source.type === "message") && source.role === "user");
+      isUserItem(source);
     groups.push({ source, notice: canHaveResizeNotice && next && isResizeNotice(next) ? input[++index] : undefined });
   }
   return groups;
