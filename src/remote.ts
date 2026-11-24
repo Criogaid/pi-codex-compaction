@@ -34,7 +34,7 @@ export interface RemoteCompactionRequest {
   /** Apply the current Pi image policy to both fresh input and replayed opaque checkpoint history. */
   blockImages?: boolean;
   /** Send Codex's sparse reasoning-effort updates; V2 bypasses the request hook that rewrites ordinary requests. */
-  reasoningEffortUpdates?: boolean;
+  reasoningEffortUpdates: boolean;
   /** Pi's provider retry setting; Codex caps compaction retries below it. */
   maxRetries?: number;
   maxRetryDelayMs?: number;
