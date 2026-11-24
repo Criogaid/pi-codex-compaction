@@ -43,8 +43,11 @@ for (const [name, boundary] of [
 }
 
 test("only a user message with a single input_text part recognizes a native summary", () => {
+  const low = update("low");
+  const reasoning = { effort: "low" };
+  assert.deepEqual(rewrite({ input: [summary, low], reasoning }), { input: [summary], reasoning });
   for (const item of [{ ...summary, role: "assistant" }, { ...summary, content: [message("ordinary").content[0], ...summary.content] }, { ...summary, content: [{ type: "text", text: summary.content[0].text }] }]) {
-    const payload = { input: [item, update("low")], reasoning: { effort: "low" } };
+    const payload = { input: [item, low], reasoning };
     assert.equal(rewrite(payload), payload);
   }
 });
@@ -98,9 +101,13 @@ test("rewritten request prefixes remain stable as new turns arrive", () => {
       const current = { input: [...history, update(effort)], reasoning: { effort: "medium" } };
       const result = rewrite(current);
       assert.ok(typeof result === "object" && result !== null && "input" in result && Array.isArray(result.input));
-      history = [...current.input, message("next")];
-      const next = rewrite({ input: [...history, update(effort)], reasoning: { effort: "medium" } });
+      const nextTurn = message("next");
+      history = [...current.input, nextTurn];
+      const repeated = update(effort);
+      const next = rewrite({ input: [...history, repeated], reasoning: { effort: "medium" } });
       assert.ok(typeof next === "object" && next !== null && "input" in next && Array.isArray(next.input));
+      assert.ok(!next.input.includes(repeated), "The repeated sampling update is removed");
+      assert.deepEqual(next.input.slice(result.input.length), [nextTurn]);
       assert.deepEqual(next.input.slice(0, result.input.length), result.input);
       const withoutTail = rewrite({ input: [...current.input.slice(0, -1), message("next"), update("high")], reasoning: { effort: "medium" } });
       assert.ok(typeof withoutTail === "object" && withoutTail !== null && "input" in withoutTail && Array.isArray(withoutTail.input));
@@ -131,7 +138,9 @@ test("rewriting is idempotent on the returned payload and a copy is rewritten ag
 });
 
 test("a payload marked by the standalone extension is passed through", () => {
-  const payload = { input: [update("low"), update("low")], reasoning: { effort: "medium" } };
+  const low = update("low");
+  const payload = { input: [low, low], reasoning: { effort: "medium" } };
+  assert.deepEqual(rewrite({ ...payload }), { input: [low], reasoning: { effort: "low" } });
   // The shared marker is the compatibility contract between the two extensions.
   Object.defineProperty(payload, Symbol.for("@criogaid/pi-codex-reasoning-effort/rewritten"), { value: true });
   assert.equal(rewrite(payload), payload);

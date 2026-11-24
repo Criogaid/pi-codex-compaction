@@ -42,6 +42,47 @@ export function withResponsesPayloadHook(
   };
 }
 
+// Pi 1.5.2 pi-ai/dist/api/openai-responses-shared.js serializes one update before each
+// same-model assistant message's first wire output, then appends the request's sampling update.
+function withPi152ResponsesEffort(provider: Provider): Provider {
+  return { ...provider,
+    streamSimple(model, context, options) {
+      if (model.api !== "openai-responses" || !model.compat || !("supportsMidConvoEffort" in model.compat) ||
+        !model.compat.supportsMidConvoEffort || !options?.reasoning) {
+        return provider.streamSimple(model, context, options);
+      }
+      const messages = context.messages.map((message) => {
+        if (message.role !== "assistant" || message.provider !== model.provider || message.api !== model.api ||
+          message.model !== model.id || !message.content.some((part) => part.type !== "thinking" || part.thinkingSignature)) return message;
+        const effort = message.providerThinkingLevel;
+        if (effort === undefined) return message;
+        // Signed thinking items pass through the pinned adapter's serializer without shifting text IDs.
+        return { ...message, content: [{ type: "thinking" as const, thinking: "",
+          thinkingSignature: JSON.stringify({ type: "configuration_update", reasoning: { effort } }),
+        }, ...message.content] };
+      });
+      let requestedEffort: string | undefined;
+      const stream = provider.streamSimple(model, { ...context, messages }, { ...options,
+        onPayload: async (payload, preparedModel) => {
+          assert.ok(isObject(payload) && isObjectArray(payload.input));
+          const reasoning = payload.reasoning;
+          assert.ok(isObject(reasoning) && typeof reasoning.effort === "string");
+          requestedEffort = reasoning.effort;
+          // Pi 1.5.2 pi-ai/dist/api/openai-responses.js sends a fixed request effort in this mode.
+          const simulated = { ...payload, reasoning: { ...reasoning, effort: "medium" },
+            input: [...payload.input, { type: "configuration_update", reasoning: { effort: reasoning.effort } }] };
+          return await options.onPayload?.(simulated, preparedModel) ?? simulated;
+        },
+      });
+      // Pi 1.0.4 does not stamp the native effort. Do so before the agent persists the result.
+      void stream.result().then((message) => {
+        if (requestedEffort !== undefined) message.providerThinkingLevel = requestedEffort;
+      });
+      return stream;
+    },
+  };
+}
+
 // Overlapping overrides in one process must be disposed in reverse order.
 export function mockFetch(fetch: typeof globalThis.fetch): Disposable {
   const original = globalThis.fetch;
@@ -74,6 +115,7 @@ export async function sessionFixture(options: {
   readonly api?: "openai-responses" | "openai-codex-responses";
   readonly extensions: readonly ExtensionFactory[];
   readonly serializePayload?: Parameters<typeof withResponsesPayloadHook>[1];
+  readonly simulatePi152Effort?: boolean;
   readonly models?: (base: Model<Api>) => readonly Model<Api>[];
   readonly settings?: Parameters<typeof SettingsManager.inMemory>[0];
   readonly respond?: (request: SessionRequest) => Response | undefined | Promise<Response | undefined>;
@@ -86,7 +128,8 @@ export async function sessionFixture(options: {
   const catalogModel = provider.getModels().find((model) => model.id === "gpt-6.1-sol");
   assert.ok(catalogModel);
   const baseModel = { ...catalogModel, contextWindow: 32_000, maxTokens: 4_096,
-    compat: { ...catalogModel.compat, supportsStore: false, remoteCompaction: { protocol: "v2" } } };
+    compat: { ...catalogModel.compat, supportsStore: false, remoteCompaction: { protocol: "v2" },
+      ...(options.simulatePi152Effort && api === "openai-responses" ? { supportsMidConvoEffort: true } : {}) } };
   const models = options.models?.(baseModel) ?? [baseModel];
   const model = models[0];
   assert.ok(model);
@@ -128,10 +171,13 @@ export async function sessionFixture(options: {
     modelsPath: null, refreshOnCreate: false,
   });
   const accessToken = `fixture.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.signature`;
-  const adapter = options.serializePayload ? withResponsesPayloadHook(provider, options.serializePayload) : provider;
+  const simulatedProvider = options.simulatePi152Effort ? withPi152ResponsesEffort(provider) : provider;
+  const adapter = options.serializePayload ? withResponsesPayloadHook(simulatedProvider, options.serializePayload) : simulatedProvider;
   runtime.registerNativeProvider({
     ...adapter, getModels: () => [...models], getAllModels: () => [...models],
-    auth: { apiKey: { name: "Fixture", resolve: async () => ({ auth: { apiKey: accessToken } }) } },
+    auth: { apiKey: { name: "Fixture", resolve: async () => ({
+      auth: { apiKey: options.simulatePi152Effort && api === "openai-responses" ? "sk-fixture-key" : accessToken },
+    }) } },
   });
   const settingsManager = SettingsManager.inMemory({
     transport: "sse",
