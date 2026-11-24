@@ -150,8 +150,8 @@ export function reuseContextSnapshot(messages: AgentMessage[], snapshot: Context
     if (!sameLayout) {
       const folded = observed.length === 1 && snapshot.messages[0] === observed[0] && getCurrentSystemMessage(source);
       if (!folded || fingerprintMessage(folded) !== fingerprintMessage(observed[0])) return messages;
-      const head = getCurrentSystemMessage(messages);
-      if (!head) return messages;
+      // The validated source prefix contains a system message, so the full transcript folds to a head.
+      const head = getCurrentSystemMessage(messages)!;
       return [head, ...structuredClone(snapshot.messages.slice(1)), ...withoutSystemMessages(suffix)];
     }
   }
