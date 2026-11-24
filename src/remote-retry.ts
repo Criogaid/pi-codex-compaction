@@ -160,14 +160,7 @@ class SseEvidenceObserver {
     const line = this.line;
     this.line = "";
     if (!line) {
-      if (this.data.length) {
-        const data = this.data.join("\n");
-        if (data.trim() === "[DONE]") this.attempt.blockRetry();
-        else {
-          try { this.attempt.observeEvent(normalizeCompactionEvent(this.api, JSON.parse(data)), this.event); }
-          catch { this.attempt.blockRetry(); }
-        }
-      }
+      this.observeRecord(true);
       this.data = [];
       this.event = "";
       this.size = 0;
@@ -183,11 +176,25 @@ class SseEvidenceObserver {
     if (this.oversized) return;
     this.line += this.decoder.decode();
     if (this.line) this.finishLine();
-    if (this.data.length) {
-      // EOF can cut a valid response mid-frame. Still veto a complete permanent error at EOF.
-      try { this.attempt.observeEvent(normalizeCompactionEvent(this.api, JSON.parse(this.data.join("\n"))), this.event); }
-      catch { /* Incomplete JSON at EOF is a truncated frame, unlike invalid JSON in a complete frame. */ }
+    this.observeRecord(false);
+  }
+
+  private observeRecord(framed: boolean): void {
+    if (!this.data.length) return;
+    const data = this.data.join("\n");
+    if (data.trim() === "[DONE]") {
+      this.attempt.blockRetry();
+      return;
     }
+    let value: unknown;
+    try { value = JSON.parse(data); }
+    catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      // An undelimited residual record can contain truncated JSON.
+      if (framed) this.attempt.blockRetry();
+      return;
+    }
+    this.attempt.observeEvent(normalizeCompactionEvent(this.api, value), this.event);
   }
 }
 
