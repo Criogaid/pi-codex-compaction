@@ -1,6 +1,7 @@
 // Own bounded V2 retry evidence before Pi adapters reduce errors to message strings.
 import { setTimeout as delay } from "node:timers/promises";
-import { isObject } from "./protocol.js";
+import type { Api } from "@earendil-works/pi-ai";
+import { isObject, normalizeCompactionEvent } from "./protocol.js";
 
 const MAX_RETRIES = 2;
 const MAX_RETRY_DELAY_MS = 60_000;
@@ -109,7 +110,7 @@ class SseEvidenceObserver {
   private event = "";
   private skipLf = false;
   private oversized = false;
-  constructor(private readonly attempt: CompactionAttempt) {}
+  constructor(private readonly attempt: CompactionAttempt, private readonly api: Api) {}
 
   feed(bytes: Uint8Array): number[] | undefined {
     let cuts: number[] | undefined;
@@ -164,7 +165,7 @@ class SseEvidenceObserver {
         const data = this.data.join("\n");
         if (data.trim() === "[DONE]") this.attempt.blockRetry();
         else {
-          try { this.attempt.observeEvent(JSON.parse(data), this.event); }
+          try { this.attempt.observeEvent(normalizeCompactionEvent(this.api, JSON.parse(data)), this.event); }
           catch { this.attempt.blockRetry(); }
         }
       }
@@ -185,7 +186,7 @@ class SseEvidenceObserver {
     if (this.line) this.finishLine();
     if (this.data.length) {
       // EOF can cut a valid response mid-frame. Still veto a complete permanent error at EOF.
-      try { this.attempt.observeEvent(JSON.parse(this.data.join("\n")), this.event); }
+      try { this.attempt.observeEvent(normalizeCompactionEvent(this.api, JSON.parse(this.data.join("\n"))), this.event); }
       catch { /* Incomplete JSON at EOF is a truncated frame, unlike invalid JSON in a complete frame. */ }
     }
   }
@@ -219,7 +220,7 @@ export class CompactionAttempt {
       this.blockRetry();
     }
     if (typeof value.type !== "string") this.blockRetry();
-    if (value.type === "response.completed" || value.type === "response.done" ||
+    if (value.type === "response.completed" ||
         value.type === "response.incomplete" || value.type === "response.failed" || value.type === "response.cancelled") {
       this.terminal = true;
     }
@@ -232,7 +233,7 @@ export class CompactionAttempt {
     return this.evidence ?? (this.eof && this.progress ? { reason: "Responses stream ended before its terminal event" } : undefined);
   }
 
-  observeResponse(response: Response, signal: AbortSignal, completed: () => boolean): Response {
+  observeResponse(response: Response, signal: AbortSignal, api: Api, completed: () => boolean): Response {
     const isSse = response.ok && response.headers.get("content-type")?.toLowerCase().includes("text/event-stream");
     if (!response.ok) {
       if (TRANSIENT_HTTP.has(response.status) && response.headers.get("x-should-retry") !== "false") {
@@ -242,7 +243,7 @@ export class CompactionAttempt {
     if (!response.body || (response.ok && !isSse)) return response;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    const sse = isSse ? new SseEvidenceObserver(this) : undefined;
+    const sse = isSse ? new SseEvidenceObserver(this, api) : undefined;
     let errorBody = "";
     let errorBodyTooLarge = false;
     let closed = false;

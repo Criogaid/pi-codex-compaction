@@ -6,7 +6,7 @@ import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, typ
 import { trimToolOutputsToContextWindow } from "./context-window.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
-import { CodexCompactionProtocolError, type CompactionPayload, createCompactionCollector, isObject, isObjectArray, type JsonObject, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
+import { CodexCompactionProtocolError, type CompactionPayload, createCompactionCollector, isObject, isObjectArray, type JsonObject, normalizeCompactionEvent, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
 import { applyProviderRequest, type ProviderRequestSnapshot } from "./request-snapshot.js";
 import { CompactionAttempt, compactionRetryLimit, waitForCompactionRetry } from "./remote-retry.js";
 
@@ -123,7 +123,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
           : input instanceof Request
             ? await baseFetch(new Request(identity!.endpoint, new Request(input, init)))
             : await baseFetch(identity!.endpoint, init);
-        return attempt.observeResponse(response, request.signal, () => collector.completed);
+        return attempt.observeResponse(response, request.signal, model.api, () => collector.completed);
       } catch (error) {
         attempt.fetchFailed(error);
         throw error;
@@ -205,8 +205,9 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
             throw error;
           }
         },
-        onProviderStreamEvent: (event) => {
+        onProviderStreamEvent: (rawEvent) => {
           request.signal.throwIfAborted();
+          const event = normalizeCompactionEvent(model.api, rawEvent);
           const transient = attempt.observeEvent(event);
           if (transient) throw transient;
           try {

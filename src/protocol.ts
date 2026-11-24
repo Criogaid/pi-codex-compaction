@@ -1,4 +1,7 @@
 // Own Responses V2 item validation and checkpoint payload transformations.
+import type { Api } from "@earendil-works/pi-ai";
+
+export const CODEX_API = "openai-codex-responses" as const;
 export const REMOTE_COMPACTION_PROTOCOL = "remote-compaction-v2" as const;
 
 export type JsonObject = Record<string, unknown>;
@@ -62,6 +65,13 @@ export function validateCompactionItem(
   return { ...structuredClone(value), type: "compaction" };
 }
 
+/** Pi exposes raw Codex events before mapping its response.done alias to a Responses terminal event. */
+export function normalizeCompactionEvent(api: Api, event: unknown): unknown {
+  if (api !== CODEX_API || !isObject(event) || event.type !== "response.done") return event;
+  const completed = isObject(event.response) && event.response.status === "completed";
+  return { ...event, type: completed ? "response.completed" : "response.incomplete" };
+}
+
 export interface CompactionCollector {
   readonly completed: boolean;
   observe(event: unknown): void;
@@ -86,10 +96,9 @@ export function createCompactionCollector(): CompactionCollector {
         }
         item = validateCompactionItem(event.item);
       }
-      // Pi exposes raw Codex events before normalizing the successful response.done alias.
-      if (event.type === "response.completed" || event.type === "response.done") {
+      if (event.type === "response.completed") {
         const status = isObject(event.response) ? event.response.status : undefined;
-        if (status !== "completed" && (event.type === "response.done" || status !== undefined)) {
+        if (status !== undefined && status !== "completed") {
           throw new CodexCompactionProtocolError("Remote compaction did not complete successfully");
         }
         if (!item) {

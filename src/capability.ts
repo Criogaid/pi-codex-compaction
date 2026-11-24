@@ -1,8 +1,8 @@
 // Own model eligibility and endpoint identity; authentication supplies the effective base URL.
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { isObject } from "./protocol.js";
+import { CODEX_API, isObject } from "./protocol.js";
 
-export const CODEX_API = "openai-codex-responses" as const;
+// Name-matched models need a Responses payload with an input array and a query-free request URL.
 export const RESPONSES_APIS: readonly Api[] = ["openai-responses", CODEX_API];
 
 export interface ProviderIdentity {
