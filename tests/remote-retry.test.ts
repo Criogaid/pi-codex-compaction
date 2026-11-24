@@ -13,7 +13,7 @@ import { getLatestCompactionEntry } from "@earendil-works/pi-coding-agent";
 import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
 import { createCodexCompactionExtension } from "../src/index.js";
-import { requestRemoteCompaction, type RemoteCompactionRequest } from "../src/remote.js";
+import { RemoteCompactionTransientError, requestRemoteCompaction, type RemoteCompactionRequest } from "../src/remote.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, sessionFixture, testRegistry } from "./helpers.js";
 
@@ -57,6 +57,12 @@ function httpError(status: number, retryAfterMs = "1", code = "server_error"): R
   return new Response(JSON.stringify({ error: { code, message: "Fixture HTTP failure" } }), {
     status, headers: { "content-type": "application/json", "retry-after-ms": retryAfterMs },
   });
+}
+
+function assertTransientWithCause(error: unknown): boolean {
+  assert.ok(error instanceof RemoteCompactionTransientError);
+  assert.ok(error.cause instanceof Error);
+  return true;
 }
 
 async function fixture(api: ResponsesApi, resolve?: () => Promise<AuthResult | undefined>, asRequest = false,
@@ -380,8 +386,7 @@ for (const api of responsesApis) {
       ["missing compaction", () => sse([created, terminal])],
       ["quota", () => failed("insufficient_quota")],
       ["HTTP quota", () => httpError(429, "1", "insufficient_quota")],
-      ["HTTP unknown error", () => httpError(503, "1", "unknown_fixture_error")],
-      ["HTTP invalid request", () => httpError(503, "1", "invalid_request_error")],
+      ["HTTP invalid request", () => httpError(400, "1", "invalid_request_error")],
       ["oversized HTTP quota", () => new Response(JSON.stringify({
         padding: "x".repeat(1_048_576), error: { code: "insufficient_quota", message: "Fixture quota exceeded" },
       }), { status: 429, headers: { "content-type": "application/json", "retry-after-ms": "1" } })],
@@ -395,9 +400,6 @@ for (const api of responsesApis) {
       ["output limit", () => sse([created, { type: "response.incomplete", response: {
         status: "incomplete", incomplete_details: { reason: "max_output_tokens" },
       } }])],
-      ["content filter", () => sse([created, { type: "response.incomplete", response: {
-        status: "incomplete", incomplete_details: { reason: "content_filter" },
-      } }])],
       ["malformed JSON", () => new Response(frames([created]) + "data: {not-json}\n\n", { headers: streamHeaders })],
       ["malformed error", () => sse([created, { type: "error", error: { code: 429 } }])],
     ];
@@ -406,6 +408,24 @@ for (const api of responsesApis) {
       await assert.rejects(requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(reply) }), Error, label);
       f.assertAttempts(1);
     }
+  });
+
+  test(`${api}: retries HTTP 503 with an unknown error code and uses the successful retry`, async () => {
+    const f = await fixture(api);
+    const result = await requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies((attempt) =>
+      attempt === 1 ? httpError(503, "1", "unknown_fixture_error") : success()) });
+    assert.equal(result.item.encrypted_content, "fresh-successful-checkpoint");
+    f.assertAttempts(2);
+  });
+
+  test(`${api}: retries a content-filtered response.incomplete even when followed by [DONE]`, async () => {
+    const f = await fixture(api);
+    const body = frames([created, { type: "response.incomplete", response: {
+      status: "incomplete", incomplete_details: { reason: "content_filter" },
+    } }]) + "data: [DONE]\n\n";
+    await assert.rejects(requestRemoteCompaction({ ...f.request,
+      fetch: f.fetchReplies(() => new Response(body, { headers: streamHeaders })) }), assertTransientWithCause);
+    f.assertAttempts(3);
   });
 
   for (const code of ["server_error", "rate_limit_exceeded"] as const) {
@@ -422,17 +442,16 @@ for (const api of responsesApis) {
     const f = await fixture(api);
     await assert.rejects(requestRemoteCompaction({ ...f.request,
       fetch: f.fetchReplies(() => failed("rate_limit_exceeded", "Please try again in 500ms.")) }),
-    /retry delay|Retry-After|delay.*exceed/i);
+    assertTransientWithCause);
     f.assertAttempts(1);
   });
 
   for (const named of [false, true]) {
-    test(`${api}: classifies ${named ? "SSE event:error" : "nested error"} as transient before SDK normalization`, async () => {
+    test(`${api}: does not retry a standalone ${named ? "named SSE error" : "nested error"} followed by EOF`, async () => {
       const f = await fixture(api);
-      const result = await requestRemoteCompaction({ ...f.request,
-        fetch: f.fetchReplies((attempt) => attempt === 1 ? errorEvent("server_error", named) : success()) });
-      assert.equal(result.item.encrypted_content, "fresh-successful-checkpoint");
-      f.assertAttempts(2);
+      await assert.rejects(requestRemoteCompaction({ ...f.request,
+        fetch: f.fetchReplies(() => errorEvent("server_error", named)) }), { constructor: Error });
+      f.assertAttempts(1);
     });
 
     test(`${api}: does not retry a permanent ${named ? "SSE event:error" : "nested error"}`, async () => {
@@ -568,14 +587,16 @@ for (const api of responsesApis) {
   test(`${api}: refuses a Retry-After delay above the cap instead of retrying early`, async () => {
     const f = await fixture(api);
     await assert.rejects(requestRemoteCompaction({ ...f.request,
-      fetch: f.fetchReplies(() => httpError(503, "500")) }), /retry delay|Retry-After|delay.*exceed/i);
+      fetch: f.fetchReplies(() => httpError(503, "500")) }),
+    assertTransientWithCause);
     f.assertAttempts(1);
   });
 
   test(`${api}: overflowing numeric retry advice does not fall back to an earlier retry`, async () => {
     const f = await fixture(api);
     await assert.rejects(requestRemoteCompaction({ ...f.request,
-      fetch: f.fetchReplies(() => httpError(503, "9".repeat(400))) }), /retry delay|delay.*exceed/i);
+      fetch: f.fetchReplies(() => httpError(503, "9".repeat(400))) }),
+    assertTransientWithCause);
     f.assertAttempts(1);
   });
 
