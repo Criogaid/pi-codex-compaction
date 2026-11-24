@@ -717,6 +717,8 @@ async function providerCompaction(messages: SessionMessage[], options: {
     const source = options.prepareOrdinarySource?.(canonical) ?? canonical;
     const head = getCurrentSystemMessage(convertToLlm(source));
     assert.ok(head);
+    const systemPromptOptions = { forceSystemPrompt: options.ordinaryPrompt };
+    await mock.events.get("before_agent_start")?.[0]?.({ type: "before_agent_start", systemPromptOptions }, current.ctx);
     const changed = await mock.events.get("context")?.[0]?.({ type: "context", messages: source.filter((message) => message.role !== "system") }, current.ctx);
     assert.equal(changed, undefined, "Other extensions' context handlers must see Pi's own messages");
     // Other extensions' context handlers all run before this extension's system-inclusive projection.

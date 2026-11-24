@@ -33,14 +33,15 @@ const inputs: ProviderRequestInputs = {
 };
 const noPayload = () => ({ payload: undefined, inputs, replay: "skipped" as const });
 
-function preparedTracker(canonical: AgentMessage[], projected: AgentMessage[] = canonical) {
+function preparedTracker(canonical: AgentMessage[], projected: AgentMessage[] = canonical, forceSystemPrompt?: string) {
   const tracker = new RequestSnapshotTracker();
+  tracker.recordRunStart(sessionId, { cwd: process.cwd(), forceSystemPrompt });
   tracker.recordContext(sessionId, target, () => canonical);
   tracker.recordProjectedRequest(sessionId, target, () => canonical, () => undefined, projected, false);
   return tracker;
 }
 
-test("current returns live published snapshots and provider retries preserve the captured context", () => {
+test("current returns the live context projection without inferring a prompt override", () => {
   const tracker = new RequestSnapshotTracker();
   const live = tracker.current();
   const canonical = [system(), user()];
@@ -55,16 +56,14 @@ test("current returns live published snapshots and provider retries preserve the
   assert.deepEqual(snapshot.messages, projected);
   assert.notEqual(snapshot.messages, projected);
   assert.deepEqual(snapshot.sourceFingerprints, canonical.map(fingerprintMessage));
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => "retry prompt", noPayload);
-  assert.equal(live.context, snapshot);
   assert.equal(tracker.current(), live);
   const request = compactionRequest(live, sessionId, target, canonical, inputs, declarationsInTranscript);
-  assert.deepEqual(request.context.messages, [system("retry prompt"), projected[1]]);
+  assert.deepEqual(request.context.messages, projected);
 });
 
 test("reset clears pending and published state without changing a previously returned view", () => {
   const canonical = [system(), user()];
-  const tracker = preparedTracker(canonical);
+  const tracker = preparedTracker(canonical, canonical, "forced prompt");
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt", noPayload);
   const previous = tracker.current();
   const snapshot = previous.context;
@@ -86,6 +85,7 @@ test("reset clears pending and published state without changing a previously ret
   tracker.recordProjectedRequest(sessionId, target, () => next, () => undefined, next, false);
   tracker.recordProviderRequest(sessionId, target, () => next, () => "next forced prompt", noPayload);
   assert.deepEqual(tracker.current().context?.messages, next);
+  assert.equal(tracker.current().promptOverride, undefined);
   assert.equal(previous.context, snapshot);
   assert.equal(previous.promptOverride, override);
 });
@@ -191,7 +191,7 @@ for (const scenario of ["session", "model", "backend", "changed prefix", "shorte
 test("a prompt override replaces the system text while retaining transcript tools and omitting fallback declarations", () => {
   const head: SystemMessage = { ...system(), toolsAdded: tools };
   const canonical = [head, user()];
-  const tracker = preparedTracker(canonical);
+  const tracker = preparedTracker(canonical, canonical, "forced prompt");
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt", noPayload);
   const result = compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript);
   assert.deepEqual(result.context, { messages: [{ ...head, content: "forced prompt" }, canonical[1]] });
@@ -497,7 +497,11 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 
 test("settled prompt overrides reuse matching wire state but reject a new effective prompt", () => {
   const canonical = [system(), user()];
-  const tracker = observedRequest(canonical, wirePayload(), { ...inputs, systemPrompt: "forced prompt" });
+  const force = { ...inputs, systemPrompt: "forced prompt" };
+  const tracker = preparedTracker(canonical, canonical, force.systemPrompt);
+  tracker.recordProviderRequest(sessionId, target, () => canonical, () => force.systemPrompt,
+    () => ({ payload: wirePayload(), inputs: force, replay: "skipped" }));
+  tracker.recordSettledRun(sessionId, target, () => inputs);
   assert.ok(compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript).providerRequest);
   assert.ok(
     compactionRequest(tracker.current(), sessionId, target, canonical, { ...inputs, systemPrompt: "forced prompt" },
@@ -601,7 +605,7 @@ for (const [name, change] of changedRequestInputs) {
   });
 }
 
-test("settlement records one base prompt per snapshot and the next provider request replaces it", () => {
+test("settlement binds one base prompt and preserves the snapshot until a new request", () => {
   const canonical = [system(), user()];
   const tracker = observedRequest(canonical, wirePayload());
   const baseInputs = { ...inputs, systemPrompt: "first base prompt" };
@@ -612,9 +616,15 @@ test("settlement records one base prompt per snapshot and the next provider requ
   assert.equal(
     compactionRequest(tracker.current(), sessionId, target, canonical, laterInputs,
       declarationsInTranscript).providerRequest, undefined);
-  tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt,
+  const publishNextPayload = () => tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt,
     () => ({ payload: { ...wirePayload(), prompt_cache_key: "next-request" }, inputs, replay: "skipped" }));
-  assert.equal(tracker.current().providerRequest?.settledInputsKey, undefined);
+  publishNextPayload();
+  const { providerRequest: settled } = compactionRequest(tracker.current(), sessionId, target, canonical, baseInputs, declarationsInTranscript);
+  assert.equal(settled?.fields.prompt_cache_key, wirePayload().prompt_cache_key);
+
+  tracker.recordContext(sessionId, target, () => canonical);
+  tracker.recordProjectedRequest(sessionId, target, () => canonical, () => undefined, canonical, false);
+  publishNextPayload();
   assert.equal(
     compactionRequest(tracker.current(), sessionId, target, canonical, baseInputs,
       declarationsInTranscript).providerRequest, undefined);
