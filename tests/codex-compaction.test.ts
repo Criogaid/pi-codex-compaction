@@ -1189,6 +1189,63 @@ test("uses the configured fallback after a remote failure and preserves legacy b
   assert.equal(warnings(), 2);
 });
 
+test("an older compaction's Pi fallback cannot overwrite or clear the newer compaction's footer status", async () => {
+  await configureFallback();
+  const { ctx, event, calls, mock } = await fallbackFixture({ currentModel: model });
+  const firstV2 = { entered: Promise.withResolvers<void>(), reply: Promise.withResolvers<Response>() };
+  const secondV2 = { entered: Promise.withResolvers<void>(), reply: Promise.withResolvers<Response>() };
+  const requests = [firstV2, secondV2];
+  let requestCount = 0;
+  mock.events.clear();
+  createCodexCompactionExtension({ fetch: async () => {
+    const request = requests[requestCount++];
+    assert.ok(request, "Expected exactly two V2 requests");
+    request.entered.resolve();
+    return request.reply.promise;
+  } })(mock.pi);
+
+  const statusWrites: Array<[key: string, value: string | undefined]> = [];
+  ctx.ui.setStatus = (key, value) => { statusWrites.push([key, value]); };
+  const compact = mock.events.get("session_before_compact")?.[0];
+  assert.ok(compact);
+  const run = (input: SessionBeforeCompactEvent) => Promise.resolve(compact(input, ctx)) as Promise<SessionBeforeCompactResult | undefined>;
+  const firstRun = run(event);
+  let secondRun: typeof firstRun | undefined;
+  try {
+    await Promise.race([firstV2.entered.promise, firstRun.then(() => { throw new Error("First compaction ended before its V2 request"); })]);
+    const secondStatusIndex = statusWrites.length;
+    secondRun = run({ ...event, signal: new AbortController().signal });
+    await Promise.race([secondV2.entered.promise, secondRun.then(() => { throw new Error("Second compaction ended before its V2 request"); })]);
+    const statusKey = "codex-compaction";
+    assert.equal(statusWrites[secondStatusIndex]?.[0], statusKey);
+    assert.ok(statusWrites[secondStatusIndex]?.[1], "Second compaction must show its footer status");
+
+    firstV2.reply.resolve(new Response("", { headers: { "content-type": "text/event-stream" } }));
+    const firstResult = await firstRun;
+    const beforeSecondRelease = statusWrites.length;
+    secondV2.reply.resolve(sseResponse());
+    const secondResult = await secondRun;
+
+    assert.ok(firstResult?.compaction);
+    assert.equal(parseCheckpointDetails(firstResult.compaction.details), undefined);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options?.signal, event.signal);
+    assert.ok(parseCheckpointDetails(secondResult?.compaction?.details), "Second compaction must complete in V2");
+    assert.equal(requestCount, 2);
+    assert.deepEqual({
+      whileSecondWasBlocked: statusWrites.slice(secondStatusIndex + 1, beforeSecondRelease),
+      whenSecondFinished: statusWrites.slice(beforeSecondRelease),
+    }, {
+      whileSecondWasBlocked: [],
+      whenSecondFinished: [[statusKey, undefined]],
+    });
+  } finally {
+    firstV2.reply.resolve(sseResponse());
+    secondV2.reply.resolve(sseResponse());
+    await Promise.allSettled([firstRun, secondRun]);
+  }
+});
+
 test("successful remote compaction does not validate an unused malformed fallback section", async () => {
   await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, fallback: null }));
   const fixture = await fallbackFixture({ currentModel: model });
