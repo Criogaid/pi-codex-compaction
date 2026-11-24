@@ -14,7 +14,7 @@ import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
 import { createCodexCompactionExtension } from "../src/index.js";
 import { RemoteCompactionTransientError, requestRemoteCompaction, type RemoteCompactionRequest } from "../src/remote.js";
-import { isObject, type JsonObject } from "../src/protocol.js";
+import { CodexCompactionProtocolError, isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, sessionFixture, testRegistry } from "./helpers.js";
 
 type ResponsesApi = "openai-responses" | "openai-codex-responses";
@@ -34,6 +34,16 @@ function sse(events: readonly unknown[]): Response {
   return new Response(frames(events), { headers: streamHeaders });
 }
 
+function chunkedSse(chunks: readonly string[], headers: HeadersInit = streamHeaders): Response {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  }), { headers });
+}
+
 function success(): Response {
   const item = { type: "compaction", encrypted_content: "fresh-successful-checkpoint" };
   return sse([created, { type: "response.output_item.done", output_index: 0, item },
@@ -41,8 +51,12 @@ function success(): Response {
       usage: { input_tokens: 23, output_tokens: 7, total_tokens: 30 } } }]);
 }
 
+function failedEvent(code: string, message: string | number, headers?: Readonly<Record<string, string>>) {
+  return { type: "response.failed", response: { status: "failed", error: { code, message, headers } } };
+}
+
 function failed(code: string, message = "Fixture provider error"): Response {
-  return sse([created, { type: "response.failed", response: { status: "failed", error: { code, message } } }]);
+  return sse([created, failedEvent(code, message)]);
 }
 
 function errorEvent(code: string, named: boolean): Response {
@@ -124,6 +138,20 @@ function hasTrigger(payload: JsonObject): boolean {
 
 const responsesApis = ["openai-responses", "openai-codex-responses"] as const;
 
+test("only Codex Responses reads past an SSE error name carrying a progress event", async () => {
+  const body = `event: error\n${frames([{ type: "response.in_progress" }])}` +
+    frames([failedEvent("server_error", "Transient response failure")]);
+  for (const [api, error, attempts] of [
+    ["openai-responses", { constructor: Error }, 1],
+    ["openai-codex-responses", assertTransientWithCause, 3],
+  ] as const) {
+    const f = await fixture(api);
+    await assert.rejects(requestRemoteCompaction({ ...f.request,
+      fetch: f.fetchReplies(() => new Response(body, { headers: streamHeaders })) }), error);
+    f.assertAttempts(attempts);
+  }
+});
+
 test("uses response.done as a terminal event only on Codex Responses", async () => {
   const events = [partialDone,
     { type: "response.done", response: { id: "resp-alias", status: "completed", output: [partialItem],
@@ -201,13 +229,7 @@ for (const [apis, lineEnding, newline, layout, contentType] of layouts) {
             respond: ({ payload }) => {
               if (!hasTrigger(payload)) return;
               const chunks = layout === "same chunk" ? [first + later] : [first, later];
-              const encoder = new TextEncoder();
-              return new Response(new ReadableStream<Uint8Array>({
-                start(controller) {
-                  for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
-                  controller.close();
-                },
-              }), { headers: contentType === undefined ? {} : { "content-type": contentType } });
+              return chunkedSse(chunks, contentType === undefined ? {} : { "content-type": contentType });
             },
           });
           t.after(() => fixture.close());
@@ -394,12 +416,8 @@ for (const api of responsesApis) {
         type: "error", code: "insufficient_quota", error: { code: "server_error" },
       }])],
       ["policy", () => failed("cyber_policy")],
-      ["unknown failure", () => failed("unknown_fixture_failure", "Rate limit. Please try again in 0.001s.")],
       ["missing event type", () => sse([created, { arbitrary: "value" }])],
       ["unknown event only", () => sse([{ type: "response.fixture_unknown" }])],
-      ["output limit", () => sse([created, { type: "response.incomplete", response: {
-        status: "incomplete", incomplete_details: { reason: "max_output_tokens" },
-      } }])],
       ["malformed JSON", () => new Response(frames([created]) + "data: {not-json}\n\n", { headers: streamHeaders })],
       ["malformed error", () => sse([created, { type: "error", error: { code: 429 } }])],
     ];
@@ -418,14 +436,19 @@ for (const api of responsesApis) {
     f.assertAttempts(2);
   });
 
-  test(`${api}: retries a content-filtered response.incomplete even when followed by [DONE]`, async () => {
-    const f = await fixture(api);
-    const body = frames([created, { type: "response.incomplete", response: {
-      status: "incomplete", incomplete_details: { reason: "content_filter" },
-    } }]) + "data: [DONE]\n\n";
-    await assert.rejects(requestRemoteCompaction({ ...f.request,
-      fetch: f.fetchReplies(() => new Response(body, { headers: streamHeaders })) }), assertTransientWithCause);
-    f.assertAttempts(3);
+  test(`${api}: retries content filtering but not the output limit before [DONE]`, async () => {
+    for (const [reason, error, attempts] of [
+      ["content_filter", assertTransientWithCause, 3],
+      ["max_output_tokens", CodexCompactionProtocolError, 1],
+    ] as const) {
+      const f = await fixture(api);
+      const body = frames([created, { type: "response.incomplete", response: {
+        status: "incomplete", incomplete_details: { reason },
+      } }]) + "data: [DONE]\n\n";
+      await assert.rejects(requestRemoteCompaction({ ...f.request,
+        fetch: f.fetchReplies(() => new Response(body, { headers: streamHeaders })) }), error);
+      f.assertAttempts(attempts);
+    }
   });
 
   for (const code of ["server_error", "rate_limit_exceeded"] as const) {
@@ -437,6 +460,58 @@ for (const api of responsesApis) {
       f.assertAttempts(2);
     });
   }
+
+  test(`${api}: rejects a numeric message on a capacity failure as a protocol error`, async () => {
+    const f = await fixture(api);
+    await assert.rejects(requestRemoteCompaction({ ...f.request,
+      fetch: f.fetchReplies(() => sse([created, failedEvent("server_is_overloaded", 42, { "retry-after": "0" })])) }),
+    CodexCompactionProtocolError);
+    f.assertAttempts(1);
+  });
+
+  test(`${api}: rate-limit wording cannot make an unknown response.failed code retryable`, async () => {
+    const f = await fixture(api);
+    await assert.rejects(requestRemoteCompaction({ ...f.request,
+      fetch: f.fetchReplies(() => failed("unknown_fixture_failure", "Rate limit. Please try again in 0.001s.")) }),
+    CodexCompactionProtocolError);
+    f.assertAttempts(1);
+  });
+
+  test(`${api}: applies the first terminal retry advice regardless of chunk boundaries`, async () => {
+    for (const [firstAdvice, secondAdvice, attempts] of [["0", "60", 3], ["60", "0", 1]] as const) {
+      const first = frames([created, failedEvent("server_error", "First failure", { "retry-after": firstAdvice })]);
+      const laterRecords = [
+        frames([failedEvent("server_error", "Later failure", { "retry-after": secondAdvice })]),
+        frames([failedEvent("insufficient_quota", "Later quota error")]),
+      ];
+      for (const later of laterRecords) {
+        for (const chunks of [[first + later], [first, later]]) {
+          const f = await fixture(api);
+          await assert.rejects(requestRemoteCompaction({ ...f.request,
+            fetch: f.fetchReplies(() => chunkedSse(chunks)) }), assertTransientWithCause);
+          f.assertAttempts(attempts);
+        }
+      }
+    }
+  });
+
+  test(`${api}: capacity failures require valid advice to resend but stay transient`, async () => {
+    for (const [advice, attempts] of [[undefined, 1], ["0", 3], ["\u000b0\u000b", 1]] as const) {
+      const f = await fixture(api);
+      const headers = advice === undefined ? undefined : { "retry-after-ms": advice };
+      await assert.rejects(requestRemoteCompaction({ ...f.request,
+        fetch: f.fetchReplies(() => sse([created, failedEvent("server_is_overloaded", "Capacity failure", headers)])) }),
+      assertTransientWithCause);
+      f.assertAttempts(attempts);
+    }
+  });
+
+  test(`${api}: stream retry headers take precedence over a known rate-limit message`, async () => {
+    const f = await fixture(api);
+    const reply = () => sse([created, failedEvent("rate_limit_exceeded", "Please try again in 500ms.", { "retry-after": "0" })]);
+    await assert.rejects(requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(reply) }), assertTransientWithCause);
+    f.assertAttempts(3);
+  });
 
   test(`${api}: refuses documented rate-limit retry advice above the delay cap`, async () => {
     const f = await fixture(api);
@@ -461,6 +536,60 @@ for (const api of responsesApis) {
       f.assertAttempts(1);
     });
   }
+
+  test(`${api}: vetoes retry on [DONE] at EOF with or without a trailing blank line`, async () => {
+    for (const trailingLf of [0, 1, 2]) {
+      const f = await fixture(api);
+      const reply = () => new Response(frames([created]) + "data: [DONE]" + "\n".repeat(trailingLf), { headers: streamHeaders });
+      await assert.rejects(requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(reply) }), { constructor: Error });
+      f.assertAttempts(1);
+    }
+  });
+
+  test(`${api}: keeps complete HTTP 503 error evidence when the response body resets`, async () => {
+    for (const [code, error] of [
+      ["insufficient_quota", { constructor: Error }],
+      ["server_error", assertTransientWithCause],
+    ] as const) {
+      const f = await fixture(api);
+      const reply = () => {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(JSON.stringify({ error: { code, message: "Fixture HTTP failure" } })));
+          },
+          pull(controller) {
+            controller.error(new TypeError("Fixture HTTP body reset", {
+              cause: Object.assign(new Error("Fixture reset"), { code: "ECONNRESET" }),
+            }));
+          },
+        });
+        return new Response(body, { status: 503, headers: { "content-type": "application/json", "retry-after": "60" } });
+      };
+      await assert.rejects(requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(reply) }), error);
+      f.assertAttempts(1);
+    }
+  });
+
+  test(`${api}: HTTP 429 needs valid advice to become retryable`, async () => {
+    for (const [advice, attempts] of [[{}, 1], [{ "retry-after": "0" }, 3],
+      [{ "retry-after": "Thu, 01 Jan 1970 00:00:00 GMT" }, 3]] as const) {
+      const f = await fixture(api);
+      const reply = () => new Response("Fixture rate limit", { status: 429, headers: advice });
+      await assert.rejects(requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(reply) }),
+        attempts === 1 ? { constructor: Error } : assertTransientWithCause);
+      f.assertAttempts(attempts);
+    }
+  });
+
+  test(`${api}: ignores a five-digit HTTP-date year and retries with backoff`, async () => {
+    const f = await fixture(api);
+    const fiveDigitDate = new Date("+010000-01-01T00:00:00.000Z").toUTCString();
+    const result = await requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies((attempt) => attempt === 1
+      ? new Response("Fixture outage", { status: 503, headers: { "retry-after": fiveDigitDate } })
+      : success()) });
+    assert.equal(result.item.encrypted_content, "fresh-successful-checkpoint");
+    f.assertAttempts(2);
+  });
 
   for (const code of [undefined, null, "server_error"] as const) {
     test(`${api}: retries a server_error type with code=${String(code)}`, async () => {

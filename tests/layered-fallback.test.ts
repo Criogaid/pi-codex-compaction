@@ -24,7 +24,188 @@ async function configure(provider: string, enabled = true) {
     summaryModel: { provider, model: summaryModelId, thinkingLevel: "low" } }));
 }
 
-for (const api of ["openai-responses", "openai-codex-responses"] as const) {
+const responsesApis = ["openai-responses", "openai-codex-responses"] as const;
+type ResponsesApi = typeof responsesApis[number];
+
+function httpFailure(status: number, error: JsonObject, retryAfter?: string) {
+  return new Response(JSON.stringify({ error }), { status, headers: {
+    "content-type": "application/json",
+    ...(retryAfter === undefined ? {} : { "retry-after": retryAfter }),
+  } });
+}
+
+function resetAfterHttpBody(error: JsonObject, retryAfter: string) {
+  const bytes = Buffer.from(JSON.stringify({ error }));
+  let sent = false;
+  return new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent) {
+        controller.error(Object.assign(new Error("Fixture connection reset"), { code: "ECONNRESET" }));
+        return;
+      }
+      controller.enqueue(bytes);
+      sent = true;
+    },
+  }, { highWaterMark: 0 }), { status: 503, headers: {
+    "content-type": "application/json", "retry-after": retryAfter,
+  } });
+}
+
+const dataFrame = (event: unknown) => `data: ${JSON.stringify(event)}\n\n`;
+const failedFrame = (code: string, fields: JsonObject = {}) => dataFrame({
+  type: "response.failed", response: { status: "failed", error: { code, ...fields } },
+});
+const sseFailure = (frames: string) => new Response(frames, { headers: { "content-type": "text/event-stream" } });
+
+async function checkpointRetryOutcome(api: ResponsesApi, reply: () => Response) {
+  let failRemote = false;
+  const fixture = await sessionFixture({
+    api, extensions: (fetch) => [createCodexCompactionExtension({ fetch })],
+    models: (base) => [base, { ...base, id: summaryModelId, name: "Fixture text summary" }],
+    settings: { retry: { enabled: false, provider: { maxRetries: 2, maxRetryDelayMs: 1 } } },
+    respond: (request) => failRemote && hasTrigger(request) ? reply() : undefined,
+  });
+  const dropped = ["new-dropped-one", "new-dropped-two"];
+  const retained = "new-retained-tail";
+  try {
+    await configure(fixture.model.provider);
+    for (const marker of ["prior-checkpoint-one", "prior-checkpoint-two", "prior-checkpoint-tail"]) {
+      await fixture.session.prompt(work(marker));
+    }
+    await fixture.session.compact();
+    for (const marker of [...dropped, retained]) await fixture.session.prompt(work(marker));
+    const checkpoint = checkpointItems(fixture.requests.at(-1)!.payload);
+    assert.equal(checkpoint.length, 1, "The first V2 creates a replayable checkpoint");
+
+    const start = fixture.requests.length;
+    failRemote = true;
+    let cancelled = false;
+    try {
+      await fixture.session.compact();
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "Compaction cancelled") throw error;
+      cancelled = true;
+    }
+    const requests = fixture.requests.slice(start);
+    const attempts = requests.filter(hasTrigger);
+    const summaries = requests.filter(({ payload }) => payload.model === summaryModelId);
+    assert.equal(requests.length, attempts.length + summaries.length, "Only V2 and the configured summary model run");
+    for (const { payload } of attempts) assert.deepEqual(checkpointItems(payload), checkpoint);
+    assert.equal(cancelled, summaries.length === 0);
+    const summaryInput = summaries.map(({ payload }) => payload.input);
+    if (summaries.length > 0) {
+      for (const marker of dropped) assert.equal(occurrences(summaryInput, marker), 1);
+      for (const marker of ["prior-checkpoint-", "encrypted_content", retained]) {
+        assert.equal(occurrences(summaryInput, marker), 0, "The summary receives only newly dropped plaintext");
+      }
+    }
+
+    await fixture.session.prompt("Continue after the V2 failure.");
+    const replay = fixture.requests.at(-1)!.payload;
+    assert.deepEqual(checkpointItems(replay), checkpoint);
+    assert.equal(occurrences(replay.input, retained), 1);
+    for (const marker of dropped) assert.equal(occurrences(replay.input, marker), cancelled ? 1 : 0);
+    assert.deepEqual(fixture.errors, []);
+    return { attempts: attempts.length, summaries: summaries.length };
+  } finally {
+    await fixture.close();
+    await rm(configPath, { force: true });
+  }
+}
+
+async function checkCheckpointRetryCases(api: ResponsesApi, cases: readonly (readonly [
+  name: string, reply: () => Response, attempts: number, summaries: number,
+])[]) {
+  const actual = [];
+  for (const [name, reply] of cases) actual.push({ name, ...await checkpointRetryOutcome(api, reply) });
+  assert.deepEqual(actual, cases.map(([name, , attempts, summaries]) => ({ name, attempts, summaries })));
+}
+
+test("real Responses adapters follow different terminal records after a named error containing progress",
+  { timeout: 30_000 }, async () => {
+    const reply = () => sseFailure(
+      `event: error\n${dataFrame({ type: "response.in_progress" })}${failedFrame("server_error")}`,
+    );
+    for (const [api, attempts, summaries] of [
+      ["openai-responses", 1, 0],
+      ["openai-codex-responses", 3, 1],
+    ] as const) {
+      await checkCheckpointRetryCases(api, [[api, reply, attempts, summaries]]);
+    }
+  });
+
+for (const api of responsesApis) {
+  test(`real ${api} keeps the checkpoint on quota and invalid V2 output`, { timeout: 30_000 }, async () => {
+    await checkCheckpointRetryCases(api, [
+      ["HTTP quota code overrides a transient type",
+        () => httpFailure(503, { code: "insufficient_quota", type: "server_error" }, "0"), 1, 0],
+      ["HTTP transient type without the quota code",
+        () => httpFailure(503, { type: "server_error" }, "0"), 3, 1],
+      ["SSE capacity code with a numeric message",
+        () => sseFailure(failedFrame("server_is_overloaded", { message: 42 })), 1, 0],
+      ["Unknown SSE code with rate-limit prose",
+        () => sseFailure(failedFrame("fixture_unknown", { message: "Rate limit. Please try again in 0.001s." })), 1, 0],
+    ]);
+  });
+
+  test(`real ${api} layers capacity failures when retry advice is absent or unusable`, { timeout: 30_000 }, async () => {
+    await checkCheckpointRetryCases(api, [
+      ["HTTP capacity with no advice", () => httpFailure(503, { code: "server_is_overloaded" }), 1, 1],
+      ["HTTP capacity above the wait cap", () => httpFailure(503, { code: "server_is_overloaded" }, "60"), 1, 1],
+      ["HTTP capacity with zero advice", () => httpFailure(503, { code: "server_is_overloaded" }, "0"), 3, 1],
+      ["SSE capacity with no advice", () => sseFailure(failedFrame("policy_capacity_unavailable")), 1, 1],
+      ["SSE capacity with invalid header bytes",
+        () => sseFailure(failedFrame("policy_capacity_unavailable", { headers: { "retry-after": "\u000b0\u000b" } })), 1, 1],
+      ["SSE capacity with zero advice",
+        () => sseFailure(failedFrame("policy_capacity_unavailable", { headers: { "retry-after": "0" } })), 3, 1],
+    ]);
+  });
+
+  test(`real ${api} needs retry advice to resend or layer an ordinary 429`, { timeout: 30_000 }, async () => {
+    await checkCheckpointRetryCases(api, [
+      ["No advice", () => httpFailure(429, { message: "Fixture rate limit" }), 1, 0],
+      ["Zero advice", () => httpFailure(429, { message: "Fixture rate limit" }, "0"), 3, 1],
+    ]);
+  });
+
+  test(`real ${api} layers rate limits even when the advised wait exceeds the cap`, { timeout: 30_000 }, async () => {
+    const message = "Please try again in 500ms.";
+    await checkCheckpointRetryCases(api, [
+      ["Above-cap message advice", () => sseFailure(failedFrame("rate_limit_exceeded", { message })), 1, 1],
+      ["Zero header advice overrides the message", () => sseFailure(failedFrame("rate_limit_exceeded", {
+        message, headers: { "retry-after": "0" },
+      })), 3, 1],
+    ]);
+  });
+
+  test(`real ${api} layers content filtering only on a genuine incomplete terminal frame`, { timeout: 30_000 }, async () => {
+    const incomplete = (type: string, reason: string) => sseFailure(dataFrame({
+      type, response: { status: "incomplete", incomplete_details: { reason } },
+    }) + "data: [DONE]\n\n");
+    await checkCheckpointRetryCases(api, [
+      ["Content filter", () => incomplete("response.incomplete", "content_filter"), 3, 1],
+      ["Output limit", () => incomplete("response.incomplete", "max_output_tokens"), 1, 0],
+      ...(api === "openai-codex-responses"
+        ? [["Unsuccessful Codex alias", () => incomplete("response.done", "content_filter"), 1, 0] as const] : []),
+    ]);
+  });
+
+  test(`real ${api} preserves quota and retry advice evidence after an HTTP body reset`, { timeout: 30_000 }, async () => {
+    await checkCheckpointRetryCases(api, [
+      ["Complete quota body before reset",
+        () => resetAfterHttpBody({ code: "insufficient_quota", type: "server_error" }, "0"), 1, 0],
+      ["Above-cap advice before reset", () => resetAfterHttpBody({ code: "server_error" }, "60"), 1, 1],
+    ]);
+  });
+
+  test(`real ${api} uses the first terminal frame's retry advice before layering`, { timeout: 30_000 }, async () => {
+    const frame = (retryAfter: string) => failedFrame("server_error", { headers: { "retry-after": retryAfter } });
+    await checkCheckpointRetryCases(api, [
+      ["Zero then above-cap advice", () => sseFailure(frame("0") + frame("60")), 3, 1],
+      ["Above-cap then zero advice", () => sseFailure(frame("60") + frame("0")), 1, 1],
+    ]);
+  });
+
   test(`real ${api} layers failed V2 text fallback over A without losing or duplicating history`, { timeout: 30_000 }, async () => {
     let failRemote = false;
     const fixture = await sessionFixture({
