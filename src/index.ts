@@ -325,6 +325,7 @@ export function createCodexCompactionExtension(
     const warnings = new Set<string>();
     const snapshots = new RequestSnapshotTracker();
     let latestRun = 0;
+    let shutdownGeneration = 0;
     const warnOnce = (ctx: ExtensionContext, key: string, message: string) => {
       const scoped = `${ctx.sessionManager.getSessionId()}:${key}`;
       if (warnings.has(scoped)) return;
@@ -348,10 +349,11 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("session_before_compact", async (event, ctx) => {
+      const generation = shutdownGeneration;
       const runNumber = ++latestRun;
       const sessionId = ctx.sessionManager.getSessionId();
       const { signal } = event;
-      const sameSession = () => ctx.sessionManager.getSessionId() === sessionId;
+      const sameSession = () => generation === shutdownGeneration && ctx.sessionManager.getSessionId() === sessionId;
       const ownsStatus = () => runNumber === latestRun && sameSession();
       // A model switch leaves the run on its starting model, as in Pi's compaction.
       const owned = () => !signal.aborted && sameSession();
@@ -403,10 +405,10 @@ export function createCodexCompactionExtension(
           },
         };
 
-        if (!configuration.remoteCompactionEnabled || !supported) {
-          return await compactFallback(event, ctx, run, undefined);
-        }
-        return await compactRemotely(pi, event, ctx, run, supported, fetch, requestSnapshots);
+        const result = configuration.remoteCompactionEnabled && supported
+          ? await compactRemotely(pi, event, ctx, run, supported, fetch, requestSnapshots)
+          : await compactFallback(event, ctx, run, undefined);
+        return owned() ? result : { cancel: true };
       } finally {
         if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, undefined);
       }
@@ -479,6 +481,7 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("session_shutdown", (_event, ctx) => {
+      ++shutdownGeneration;
       warnings.clear();
       snapshots.reset();
       ctx.ui.setStatus(STATUS_KEY, undefined);
