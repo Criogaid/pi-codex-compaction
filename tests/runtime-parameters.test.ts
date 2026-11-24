@@ -125,14 +125,14 @@ test("V2 preserves Pi effort updates in checkpoint input and across retries", as
   const inputs: ProviderRequestInputs = { systemPrompt: "Preserve settings.", thinkingLevel: "low", settings: {}, activeTools: [], tools: [] };
   const tracker = new RequestSnapshotTracker();
   tracker.recordContext(sessionId, target, () => canonical);
-  tracker.recordProjectedRequest(sessionId, target, () => canonical, () => undefined, canonical);
+  tracker.recordProjectedRequest(sessionId, target, () => canonical, () => undefined, canonical, false);
   let observed: JsonObject | undefined;
   const assistant = await registry.streamSimple(model, { messages: canonical }, {
     reasoning: "low", transport: "sse",
     onPayload: (payload) => {
       assert.ok(isObject(payload));
       observed = structuredClone(payload);
-      tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt, () => ({ payload, inputs }));
+      tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt, () => ({ payload, inputs, replay: "skipped" }));
     },
     fetch: async () => response(),
   }).result();

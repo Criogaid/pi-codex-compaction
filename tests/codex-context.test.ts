@@ -146,7 +146,7 @@ if (!process.execArgv.includes(mockFlag)) {
       const target = { model: supported, identity: { provider: supported.provider, api: supported.api,
         modelId: supported.id, baseUrl: supported.baseUrl, endpoint: `${supported.baseUrl}/responses` } };
       tracker.recordContext("session", target, () => canonical);
-      tracker.recordProjectedRequest("session", target, () => canonical, () => undefined, canonical);
+      tracker.recordProjectedRequest("session", target, () => canonical, () => undefined, canonical, false);
       fingerprint.mock.resetCalls();
       tracker.recordContext("session", undefined, () => assert.fail("unsupported context must not read canonical"));
       assert.equal(fingerprint.mock.callCount(), 0);
@@ -155,7 +155,7 @@ if (!process.execArgv.includes(mockFlag)) {
       assert.equal(tracker.current().context, undefined, "unsupported context clears a pending projected snapshot");
       assert.equal(tracker.current().promptOverride, undefined);
       tracker.recordProjectedRequest("session", target, () => assert.fail("unsupported context clears its pending source"),
-        () => assert.fail("checkpoint must stay lazy"), canonical);
+        () => assert.fail("checkpoint must stay lazy"), canonical, false);
       assert.equal(fingerprint.mock.callCount(), 0);
     });
   });

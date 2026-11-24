@@ -4,8 +4,8 @@ import { test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createCodexCompactionExtension } from "../src/index.js";
-import { parseCheckpointDetails } from "../src/checkpoint.js";
-import { isObject, type JsonObject } from "../src/protocol.js";
+import { checkpointMarker, parseCheckpointDetails } from "../src/checkpoint.js";
+import { hasCheckpointMarker, isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, sessionFixture } from "./helpers.js";
 
 isolateAgentConfig();
@@ -84,6 +84,119 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
           "Load order must not change the V2 request");
       });
   }
+
+  test(`${api} keeps cache policy in V2 with an incremental hook on either side`, { timeout: 30_000 }, async () => {
+    const cachePolicy: ExtensionFactory = (pi) => void pi.on("before_provider_request", ({ payload }) => {
+      assert.ok(isObject(payload));
+      return { ...payload, prompt_cache_key: "fixture-incremental-cache", prompt_cache_options: { ttl: "30m" } };
+    });
+    const continuation = `Send this turn using the previous response ID. ${"Use the compacted history. ".repeat(40)}`;
+    let incremental = false;
+    const referenceHistory: ExtensionFactory = (pi) => void pi.on("before_provider_request", ({ payload }) => {
+      if (!incremental) return;
+      assert.ok(isObject(payload) && Array.isArray(payload.input));
+      const input = payload.input.filter((item) => isObject(item) && item.role === "user" &&
+        JSON.stringify(item).includes(continuation));
+      assert.equal(input.length, 1);
+      return { ...payload, input, previous_response_id: "fixture-response-anchor" };
+    });
+
+    for (const order of ["after", "before"] as const) {
+      const compactor = createCodexCompactionExtension();
+      const fixture = await sessionFixture({ api, extensions: [cachePolicy,
+        ...(order === "before" ? [referenceHistory, compactor] : [compactor, referenceHistory])] });
+      try {
+        incremental = false;
+        for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the decisions. ".repeat(80)}`);
+        const { details } = await fixture.session.compact();
+        assert.ok(parseCheckpointDetails(details));
+
+        incremental = true;
+        await fixture.session.prompt(continuation);
+        const ordinary = fixture.requests.at(-1)?.payload;
+        assert.ok(ordinary && Array.isArray(ordinary.input));
+        assert.equal(ordinary.previous_response_id, "fixture-response-anchor");
+        assert.equal(ordinary.input.length, 1);
+        assert.equal(countType(ordinary.input, "compaction"), 0);
+
+        await fixture.session.compact();
+        const compact = fixture.requests.at(-1)?.payload;
+        assert.ok(compact && Array.isArray(compact.input));
+        assert.equal(countType(compact.input, "compaction_trigger"), 1);
+        assert.equal(countType(compact.input, "compaction"), 1);
+        assert.equal(compact.previous_response_id, undefined);
+        assert.ok(JSON.stringify(compact.input).includes(continuation));
+        assert.deepEqual(fixture.errors, []);
+        assert.deepEqual(
+          [compact.prompt_cache_key, compact.prompt_cache_options],
+          [ordinary.prompt_cache_key, ordinary.prompt_cache_options],
+          `V2 preserves the ordinary cache policy with the incremental hook ${order} the compactor`,
+        );
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
+  test(`${api} V2 uses this turn's context after a checkpoint replay error`, { timeout: 20_000 }, async () => {
+    const wireOnly = "Only present in the previous request payload.";
+    let marker: string | undefined;
+    let duplicateMarker = false;
+    const editRequest: ExtensionFactory = (pi) => {
+      pi.on("context", (event) => duplicateMarker ? { messages: transforms.annotate(event.messages) } : undefined);
+      pi.on("before_provider_request", ({ payload }) => {
+        const activeMarker = marker;
+        if (activeMarker === undefined) return;
+        assert.ok(isObject(payload) && Array.isArray(payload.input));
+        if (!duplicateMarker) {
+          const item = { type: "message", role: "user", content: [{ type: "input_text", text: wireOnly }] };
+          return { ...payload, input: [...payload.input, item] };
+        }
+        const checkpoint = payload.input.find((item) => hasCheckpointMarker({ input: [item] }, activeMarker));
+        assert.ok(checkpoint);
+        return { ...payload, input: [...payload.input, checkpoint],
+          prompt_cache_key: "fixture-replay-error-cache", prompt_cache_options: { ttl: "30m" } };
+      });
+    };
+    const fixture = await sessionFixture({ api, extensions: [editRequest, createCodexCompactionExtension()] });
+    try {
+      for (let turn = 0; turn < 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Keep the decisions. ".repeat(80)}`);
+      const { details } = await fixture.session.compact();
+      const saved = parseCheckpointDetails(details);
+      assert.ok(saved);
+      marker = checkpointMarker(saved.checkpointId);
+
+      await fixture.session.prompt(`Continue with the checkpoint. ${"Use the compacted history. ".repeat(40)}`);
+      const prior = fixture.requests.at(-1)?.payload;
+      assert.ok(prior && Array.isArray(prior.input));
+      assert.equal(countType(prior.input, "compaction"), 1);
+      assert.ok(JSON.stringify(prior.input).includes(wireOnly));
+      assert.deepEqual(fixture.errors, []);
+
+      duplicateMarker = true;
+      await fixture.session.prompt("Continue with the request-local note.");
+      assert.equal(fixture.errors.length, 1);
+      assert.match(fixture.errors[0], /contained 2 checkpoint markers/);
+      const failed = fixture.requests.at(-1)?.payload;
+      assert.ok(failed);
+
+      await fixture.session.compact();
+      const compact = fixture.requests.at(-1)?.payload;
+      assert.ok(compact && Array.isArray(compact.input));
+      assert.equal(countType(compact.input, "compaction_trigger"), 1);
+      assert.equal(countType(compact.input, "compaction"), 1);
+      const text = JSON.stringify(compact.input);
+      assert.deepEqual({
+        note: text.includes(annotation), previousWireText: text.includes(wireOnly),
+        cacheKey: compact.prompt_cache_key, cachePolicy: compact.prompt_cache_options,
+      }, {
+        note: true, previousWireText: false,
+        cacheKey: failed.prompt_cache_key, cachePolicy: failed.prompt_cache_options,
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
 
   test(`${api} skips checkpoint replay when a context hook restores a canonically edited message`,
     { timeout: 30_000 }, async () => {
