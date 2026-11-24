@@ -1,5 +1,5 @@
 // Own Codex's pre-compaction tool-output trimming and its model-visible item estimate.
-// Reference: openai/codex rust-v0.159.2, compact_remote_history.rs and context_manager/history.rs.
+// Reference: openai/codex rust-v0.172.0, compact_remote_history.rs and context_manager/history.rs.
 import { type ImageEstimates, RESIZED_IMAGE_BYTES_ESTIMATE } from "./image-budget.js";
 import { isInputImage, isObject, type JsonObject } from "./protocol.js";
 import { historyGroups, type HistoryGroup } from "./history-groups.js";

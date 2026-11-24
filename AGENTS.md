@@ -26,4 +26,4 @@
 - Keep history grouping and marked-text matching in `src/history-groups.ts`, message classification in `src/retention-input.ts`, selection and truncation in `src/retention.ts`, tool-output trimming and item estimates in `src/context-window.ts`, and UTF-8 estimates in `src/text-budget.ts`.
 - Keep the fixed 64,000-token plaintext retention ceiling, image/label atomicity, newest-first selection, Unicode boundaries, and source immutability.
 - Keep image decoding and byte estimates in `src/image-budget.ts`; estimate each remote request once and share its URL-keyed snapshot with trimming and retention.
-- Follow enabled defaults from Codex `rust-v0.159.2`; check hook XML edge cases against its actual quick-xml parser.
+- Follow enabled defaults from Codex `rust-v0.172.0`; check hook XML edge cases against its actual quick-xml parser.

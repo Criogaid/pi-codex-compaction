@@ -1,4 +1,4 @@
-// Adapt Responses messages to Codex rust-v0.159.2's metadata-free retained groups.
+// Adapt Responses messages to Codex rust-v0.172.0's metadata-free retained groups.
 // Context markers mirror core/src/context; XML is parsed at this boundary, not by the budget core.
 // Pi message origins stand in for Codex's separate contextual messages where Pi merges them into user items.
 import type { AgentMessage } from "@earendil-works/pi-agent-core";

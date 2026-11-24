@@ -1,5 +1,5 @@
 // Own Codex's history item groups and the marked-text matching that contextual fragments share.
-// Reference: openai/codex rust-v0.159.2, compact_remote_history.rs and context-fragments/src/fragment.rs.
+// Reference: openai/codex rust-v0.172.0, compact_remote_history.rs and context-fragments/src/fragment.rs.
 import type { JsonObject } from "./protocol.js";
 
 const RESIZE_NOTICE_MARKERS = ["<image_resize_notice>", "</image_resize_notice>"] as const;

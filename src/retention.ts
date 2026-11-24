@@ -1,5 +1,5 @@
 // Own Codex V2 retention for Pi message items, including its enabled image-budget policy.
-// Reference: openai/codex rust-v0.159.2, compact_remote_v2.rs and compact_remote_v2_images.rs.
+// Reference: openai/codex rust-v0.172.0, compact_remote_v2.rs and compact_remote_v2_media.rs.
 import type { HistoryGroup } from "./history-groups.js";
 import type { ImageEstimates } from "./image-budget.js";
 import { isInputImage, type JsonObject } from "./protocol.js";
