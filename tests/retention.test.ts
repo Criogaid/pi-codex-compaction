@@ -72,6 +72,10 @@ test("keeps a resize notice with its source and charges the notice text", async 
   assert.deepEqual(retained[1], notice);
   assert.ok((content(retained[0])[0].text?.length ?? Infinity) < RETAINED_MESSAGE_TOKEN_BUDGET * 4);
   assert.deepEqual(await retain([{ role: "assistant", content: [] }, notice]), [opaque]);
+  assert.deepEqual(await retain([user("older"), notice, source]), [source, opaque]);
+  for (const type of ["function_call_output", "custom_tool_call_output"]) {
+    assert.deepEqual(await retain([user("request"), { type, output: "tool result" }, notice]), [user("request"), opaque], type);
+  }
 });
 
 test("charges at least one token for empty user messages", async () => {

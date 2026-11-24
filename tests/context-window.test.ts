@@ -93,9 +93,14 @@ test("rewrites newest outputs first and stops once the history fits", () => {
   assert.deepEqual(input, saved);
 });
 
+const searchOutput = { type: "tool_search_output", call_id: "search", status: "completed", tools: [{ description: "x".repeat(400) }] };
+
 test("empties trailing search tools while preserving output metadata", () => {
-  const output = { type: "tool_search_output", call_id: "search", status: "completed", tools: [{ description: "x".repeat(400) }] };
-  assert.deepEqual(trimToolOutputsToContextWindow([output, notice], "", 20, images), [{ ...output, tools: [] }]);
+  assert.deepEqual(trimToolOutputsToContextWindow([searchOutput], "", 20, images), [{ ...searchOutput, tools: [] }]);
+});
+
+test("stops trimming at a standalone resize notice after search output", () => {
+  assert.deepEqual(trimToolOutputsToContextWindow([searchOutput, notice], "", 20, images), [searchOutput, notice]);
 });
 
 test("stops at every non-output item even if earlier outputs still overflow", () => {
