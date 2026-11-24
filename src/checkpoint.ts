@@ -306,7 +306,7 @@ function withSystemHead(messages: readonly AgentMessage[], conversation: AgentMe
  * what those handlers see or what replays. The checkpoint must match the canonical transcript exactly. Request
  * messages traced to its summary or retained messages become one marker at the first of them; inserted, edited,
  * and later messages keep their places. Like a changed `context` result, system messages collapse into one head.
- * Return undefined when the request omits the summary or a request message traces to both compacted and live history.
+ * Return undefined when the request omits the summary or a compacted source cannot be matched unambiguously.
  */
 export function projectCheckpointTranscript(
   request: readonly AgentMessage[],
@@ -321,22 +321,29 @@ export function projectCheckpointTranscript(
   const exact = projectCheckpointContext(conversation, details);
   if (exact) return withSystemHead(request, exact);
   const summary = provenance(source[range.start]);
-  const compacted = new Set(source.slice(range.start, range.end).map(provenance));
+  const available = new Map<string, boolean>();
+  for (let i = range.start; i < range.end; i++) {
+    const key = provenance(source[i]);
+    available.set(key, !available.has(key));
+  }
   const live = new Set([...source.slice(0, range.start), ...source.slice(range.end)].map(provenance));
-  if (!conversation.some((message) => provenance(message) === summary)) return undefined;
   const projected: AgentMessage[] = [];
   let marked = false;
+  let matchedSummary = false;
   for (const message of conversation) {
     const key = provenance(message);
-    if (!compacted.has(key)) {
+    const unique = available.get(key);
+    if (unique === undefined) {
       projected.push(message);
       continue;
     }
-    if (live.has(key)) return undefined;
+    if (!unique || live.has(key)) return undefined;
+    available.set(key, false);
+    matchedSummary ||= key === summary;
     if (!marked) projected.push(markerMessage(details.checkpointId, source[range.start].timestamp));
     marked = true;
   }
-  return withSystemHead(request, projected);
+  return matchedSummary ? withSystemHead(request, projected) : undefined;
 }
 
 /**
