@@ -185,10 +185,14 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
                 for (const item of items.slice(checkpoint.contextualFrom)) contextItems.add(item);
               },
             };
-            const body = prepareRemoteCompactionPayload(adapted, trackedCheckpoint, (history) => ({
-              ...history,
-              input: trimToolOutputsToContextWindow(history.input, history.instructions, preparedModel.contextWindow, estimates),
-            }));
+            const body = prepareRemoteCompactionPayload(adapted, trackedCheckpoint, (payload) => {
+              // Codex estimates instructions and history before adding request-level items.
+              const historyEnd = payload.input.length - applied.requestTailLength;
+              const history = applied.requestTailLength ? payload.input.slice(0, historyEnd) : payload.input;
+              const input = trimToolOutputsToContextWindow(history, payload.instructions, preparedModel.contextWindow, estimates);
+              if (applied.requestTailLength) input.push(...payload.input.slice(historyEnd));
+              return { ...payload, input };
+            });
             // Boundary, marker, and trigger errors take precedence over a payload model mismatch.
             if (body.model !== model.id) throw new CodexCompactionProtocolError(UNEXPECTED_PAYLOAD_MODEL);
             const sent = body.input.slice(0, -1);

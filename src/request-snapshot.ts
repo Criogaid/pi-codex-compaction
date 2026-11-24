@@ -252,14 +252,14 @@ function boundaryIndex(input: readonly JsonObject[], text: string): number {
 export function applyProviderRequest(
   payload: CompactionPayload, target: CapableModel, snapshot: ProviderRequestSnapshot | undefined,
   contextItems: ReadonlySet<JsonObject>,
-): { readonly payload: CompactionPayload; readonly contextual: readonly boolean[] } {
+): { readonly payload: CompactionPayload; readonly contextual: readonly boolean[]; readonly requestTailLength: number } {
   const { input } = payload;
-  if (!snapshot) return { payload, contextual: input.map((item) => contextItems.has(item)) };
+  if (!snapshot) return { payload, contextual: input.map((item) => contextItems.has(item)), requestTailLength: 0 };
   const compatible = sameBackend(snapshot.identity, target.identity) && sameModel(snapshot.identity, target.model) &&
     payload.model === target.model.id;
   const prefix = snapshot.prefix;
   if (!prefix) return { payload: compatible ? { ...payload, ...structuredClone(snapshot.fields) } : payload,
-    contextual: input.map((item) => contextItems.has(item)) };
+    contextual: input.map((item) => contextItems.has(item)), requestTailLength: 0 };
   const start = boundaryIndex(input, prefix.boundary);
   const end = boundaryIndex(input, transcriptEndBoundary(prefix.boundary));
   if (end < start) throw new CodexCompactionProtocolError("Prepared request reordered the snapshot boundaries");
@@ -273,12 +273,13 @@ export function applyProviderRequest(
   if (!compatible || !tailMatches) {
     // An unrecognized request tail could make the joined input invalid; send Pi's own serialization.
     const unmarked = [...input.slice(0, start), ...suffix, ...tail];
-    return { payload: { ...payload, input: unmarked }, contextual: unmarked.map((item) => contextItems.has(item)) };
+    return { payload: { ...payload, input: unmarked }, contextual: unmarked.map((item) => contextItems.has(item)), requestTailLength: tail.length };
   }
   const fresh = [...suffix, ...tail];
   return {
     payload: { ...payload, ...structuredClone(snapshot.fields), input: [...structuredClone(prefix.input.slice(0, kept)), ...fresh] },
     contextual: [...prefix.contextual.slice(0, kept), ...fresh.map((item) => contextItems.has(item))],
+    requestTailLength: tail.length,
   };
 }
 
