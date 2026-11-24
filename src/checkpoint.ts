@@ -2,7 +2,6 @@
 // Normalize legacy fingerprints from their creation-time branch without rewriting session entries.
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { getCurrentSystemMessage, type Message } from "@earendil-works/pi-ai";
 import {
   buildSessionProjection,
   buildSessionContext,
@@ -275,16 +274,22 @@ export function createLayeredCheckpointDetails(prior: CodexCheckpointDetails, la
   return details;
 }
 
+/** Each conversation message's projection: itself, the marker at the summary, or nothing for retained messages. */
+function rangeProjection(
+  messages: readonly AgentMessage[],
+  details: CodexCheckpointDetails,
+): AgentMessage[][] | undefined {
+  const range = checkpointRange(messages, details);
+  return range && messages.map((message, index) => index === range.start
+    ? [markerMessage(details.checkpointId, message.timestamp)]
+    : index > range.start && index < range.end ? [] : [message]);
+}
+
 export function projectCheckpointContext(
   messages: readonly AgentMessage[],
   details: CodexCheckpointDetails,
 ): AgentMessage[] | undefined {
-  const range = checkpointRange(messages, details);
-  return range && [
-    ...messages.slice(0, range.start),
-    markerMessage(details.checkpointId, messages[range.start].timestamp),
-    ...messages.slice(range.end),
-  ];
+  return rangeProjection(messages, details)?.flat();
 }
 
 // Pi derives each request from the canonical transcript; request-local edits replace content, not provenance.
@@ -296,16 +301,20 @@ function provenance(message: AgentMessage): string {
   ]);
 }
 
-function withSystemHead(messages: readonly AgentMessage[], conversation: AgentMessage[]): AgentMessage[] {
-  const head = getCurrentSystemMessage(messages.filter((message): message is Message => message.role === "system"));
-  return head ? [head, ...conversation] : conversation;
+/**
+ * Keep every system message where the request has it. Pi keeps mid-conversation prompt and tool updates in place
+ * so they extend the cached prefix; folding them into the head would rewrite the prefix on each update.
+ */
+function withSystemMessages(request: readonly AgentMessage[], projections: readonly (readonly AgentMessage[])[]): AgentMessage[] {
+  let index = 0;
+  return request.flatMap((message) => message.role === "system" ? [message] : projections[index++]);
 }
 
 /**
  * Project Pi's final request transcript after every extension's `context` handler, so load order cannot change
  * what those handlers see or what replays. The checkpoint must match the canonical transcript exactly. Request
  * messages traced to its summary or retained messages become one marker at the first of them; inserted, edited,
- * and later messages keep their places. Like a changed `context` result, system messages collapse into one head.
+ * later, and system messages keep their places.
  * Return undefined when the request omits the summary or a compacted source cannot be matched unambiguously.
  */
 export function projectCheckpointTranscript(
@@ -318,8 +327,8 @@ export function projectCheckpointTranscript(
   if (!range) return undefined;
   const conversation = withoutSystemMessages(request);
   // Unchanged retained messages keep the exact projection and its cached request prefix.
-  const exact = projectCheckpointContext(conversation, details);
-  if (exact) return withSystemHead(request, exact);
+  const exact = rangeProjection(conversation, details);
+  if (exact) return withSystemMessages(request, exact);
   const summary = provenance(source[range.start]);
   const available = new Map<string, boolean>();
   for (let i = range.start; i < range.end; i++) {
@@ -327,35 +336,32 @@ export function projectCheckpointTranscript(
     available.set(key, !available.has(key));
   }
   const live = new Set([...source.slice(0, range.start), ...source.slice(range.end)].map(provenance));
-  const projected: AgentMessage[] = [];
+  const projected: AgentMessage[][] = [];
   let marked = false;
   let matchedSummary = false;
   for (const message of conversation) {
     const key = provenance(message);
     const unique = available.get(key);
     if (unique === undefined) {
-      projected.push(message);
+      projected.push([message]);
       continue;
     }
     if (!unique || live.has(key)) return undefined;
     available.set(key, false);
     matchedSummary ||= key === summary;
-    if (!marked) projected.push(markerMessage(details.checkpointId, source[range.start].timestamp));
+    projected.push(marked ? [] : [markerMessage(details.checkpointId, source[range.start].timestamp)]);
     marked = true;
   }
-  return matchedSummary ? withSystemHead(request, projected) : undefined;
+  return matchedSummary ? withSystemMessages(request, projected) : undefined;
 }
 
-/**
- * Project a full transcript the way Pi sends a request whose context handler changed messages:
- * handlers see only non-system messages, and Pi collapses the system messages into one head.
- */
+/** Project a full transcript the way the `context_with_system` handler projects an unchanged request. */
 export function projectCheckpointRequest(
   messages: readonly AgentMessage[],
   details: CodexCheckpointDetails,
 ): AgentMessage[] | undefined {
-  const projected = projectCheckpointContext(withoutSystemMessages(messages), details);
-  return projected && withSystemHead(messages, projected);
+  const projected = rangeProjection(withoutSystemMessages(messages), details);
+  return projected && withSystemMessages(messages, projected);
 }
 
 export function createCheckpointDetails(input: {
