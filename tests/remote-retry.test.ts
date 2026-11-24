@@ -116,6 +116,8 @@ function hasTrigger(payload: JsonObject): boolean {
   return Array.isArray(payload.input) && payload.input.some((item) => isObject(item) && item.type === "compaction_trigger");
 }
 
+const responsesApis = ["openai-responses", "openai-codex-responses"] as const;
+
 test("uses response.done as a terminal event only on Codex Responses", async () => {
   const events = [partialDone,
     { type: "response.done", response: { id: "resp-alias", status: "completed", output: [partialItem],
@@ -123,7 +125,7 @@ test("uses response.done as a terminal event only on Codex Responses", async () 
     { type: "response.completed", response: { id: "resp-alias", status: "completed", output: [partialItem],
       usage: { input_tokens: 91, output_tokens: 1, total_tokens: 92 } } },
   ];
-  const usages = await Promise.all((["openai-responses", "openai-codex-responses"] as const).map(async (api) => {
+  const usages = await Promise.all(responsesApis.map(async (api) => {
     const f = await fixture(api);
     const result = await requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(() => sse(events)) });
     assert.deepEqual(result.item, partialItem);
@@ -133,7 +135,36 @@ test("uses response.done as a terminal event only on Codex Responses", async () 
   assert.deepEqual(usages, [91, 23]);
 });
 
-const responsesApis = ["openai-responses", "openai-codex-responses"] as const;
+const codexAliasOutcomes = [
+  ["completed", undefined],
+  ["incomplete", /Response incomplete without a provider reason/],
+  ["failed", /An unknown error occurred/],
+  ["cancelled", /An unknown error occurred/],
+  ["in_progress", /ended without response\.completed/],
+  [undefined, /ended without response\.completed/],
+] as const;
+for (const api of responsesApis) {
+  for (const [status, codexError] of codexAliasOutcomes) {
+    test(`${api}: handles response.done with ${status ?? "missing status"} and no response.completed`, async () => {
+      const f = await fixture(api);
+      const result = requestRemoteCompaction({ ...f.request, fetch: f.fetchReplies(() => sse([
+        created, partialDone,
+        { type: "response.done", response: { id: "resp-alias", status, output: [partialItem],
+          usage: { input_tokens: 23, output_tokens: 1, total_tokens: 24 } } },
+      ])) });
+
+      if (api === "openai-responses") {
+        await assert.rejects(result, /ended before a terminal response event/);
+        f.assertAttempts(3);
+        return;
+      }
+      if (codexError) await assert.rejects(result, codexError);
+      else assert.deepEqual((await result).item, partialItem);
+      f.assertAttempts(1);
+    });
+  }
+}
+
 const layouts = [
   ...responsesApis.map((api) => [[api], "LF", "\n", "same chunk", "text/event-stream"] as const),
   [["openai-responses"], "LF", "\n", "separate chunks", "text/event-stream"],

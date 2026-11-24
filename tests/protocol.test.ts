@@ -37,6 +37,15 @@ test("normalizes a successful Codex response.done alias before collection", () =
   assert.deepEqual(collector.finish(), item);
 });
 
+test("keeps a content-filtered Codex response.done event raw", () => {
+  const event = {
+    type: "response.done",
+    response: { status: "incomplete", incomplete_details: { reason: "content_filter" } },
+  };
+  const expected = structuredClone(event);
+  assert.deepEqual(normalizeCompactionEvent(CODEX_API, event), expected);
+});
+
 test("standard Responses keeps collecting after response.done", () => {
   const collector = createCompactionCollector();
   collector.observe(done);
@@ -48,22 +57,34 @@ test("standard Responses keeps collecting after response.done", () => {
   assert.deepEqual(collector.finish(), item);
 });
 
-for (const type of ["response.done", "response.completed"] as const) {
-  for (const status of ["incomplete", "failed", "cancelled", "in_progress"]) {
-    test(`rejects ${type} with unsuccessful status ${status}`, () => {
-      const collector = createCompactionCollector();
-      collector.observe(done);
-      assert.throws(() => collector.observe(normalizeCompactionEvent(CODEX_API, { type, response: { status } })),
-        CodexCompactionProtocolError);
-    });
-  }
-}
-
-test("does not infer success from a bare response.done or incomplete terminal event", () => {
-  for (const type of ["response.done", "response.failed", "response.incomplete"]) {
+for (const status of ["incomplete", "failed", "cancelled", "in_progress"]) {
+  test(`rejects a stream ending with Codex response.done status ${status}`, () => {
     const collector = createCompactionCollector();
     collector.observe(done);
-    assert.throws(() => collector.observe(normalizeCompactionEvent(CODEX_API, { type })), CodexCompactionProtocolError);
+    collector.observe(normalizeCompactionEvent(CODEX_API, { type: "response.done", response: { status } }));
+    assert.throws(() => collector.finish(), CodexCompactionProtocolError);
+  });
+
+  test(`rejects response.completed with unsuccessful status ${status}`, () => {
+    const collector = createCompactionCollector();
+    collector.observe(done);
+    assert.throws(() => collector.observe({ type: "response.completed", response: { status } }),
+      CodexCompactionProtocolError);
+  });
+}
+
+test("rejects a stream ending with a bare Codex response.done", () => {
+  const collector = createCompactionCollector();
+  collector.observe(done);
+  collector.observe(normalizeCompactionEvent(CODEX_API, { type: "response.done" }));
+  assert.throws(() => collector.finish(), CodexCompactionProtocolError);
+});
+
+test("rejects unsuccessful terminal events without a response body", () => {
+  for (const type of ["response.failed", "response.incomplete"]) {
+    const collector = createCompactionCollector();
+    collector.observe(done);
+    assert.throws(() => collector.observe({ type }), CodexCompactionProtocolError);
   }
 });
 

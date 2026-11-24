@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
-import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { mergeRemoteCompactionHeader, requestRemoteCompaction } from "../src/remote.js";
 import { assertTrimmedOutput, testRegistry } from "./helpers.js";
 import { CodexCompactionProtocolError, isObject, type JsonObject } from "../src/protocol.js";
@@ -36,33 +35,6 @@ test("merges the V2 beta feature without dropping existing features", () => {
   assert.deepEqual(mergeRemoteCompactionHeader({ "X-Codex-Beta-Features": "feature_a,remote_compaction_v2" }),
     { "x-codex-beta-features": "feature_a,remote_compaction_v2" });
 });
-
-for (const status of ["completed", "incomplete"] as const) {
-  test(`handles the raw Codex response.done alias with status ${status} through the real adapter`, async () => {
-    const codex = openaiCodexProvider();
-    const catalogModel = codex.getModels().find((candidate) => candidate.id === "gpt-6.1-sol");
-    assert.ok(catalogModel);
-    const apiKey = `fixture.${Buffer.from(JSON.stringify({
-      "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
-    })).toString("base64url")}.signature`;
-    const registry = await testRegistry(codex, async () => ({ auth: { apiKey } }));
-    const result = requestRemoteCompaction({ ...request(registry), model: catalogModel,
-      fetch: async () => {
-        const item = { type: "compaction", encrypted_content: "valid-opaque-history" };
-        const events = [
-          { type: "response.created", response: { id: "resp-alias" } },
-          { type: "response.output_item.done", output_index: 0, item },
-          { type: "response.done", response: { id: "resp-alias", status, output: [item],
-            usage: { input_tokens: 20, output_tokens: 1 } } },
-        ];
-        return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
-          { headers: { "content-type": "text/event-stream" } });
-      },
-    });
-    if (status === "completed") assert.equal((await result).item.encrypted_content, "valid-opaque-history");
-    else await assert.rejects(result, /did not complete successfully/);
-  });
-}
 
 test("Pi resolves model headers, auth headers, scoped env, and the actual endpoint", async () => {
   const registry = await testRegistry(provider, async () => ({
