@@ -13,7 +13,7 @@
 
 ## 安装
 
-需要 Pi 0.99.1 或更新版本：
+需要 Pi 1.5.0 或更新版本：
 
 ```bash
 pi install npm:@criogaid/pi-codex-compaction
