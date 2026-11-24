@@ -856,7 +856,18 @@ test("compaction reuses request-local messages while their canonical source stay
   assert.doesNotMatch(JSON.stringify(result.payload.input), /Original tool output/);
 });
 
-for (const change of ["edit", "system", "session-start", "session-id", "model", "backend"] as const) {
+test("compaction keeps its ordinary context projection when a system delta is appended", async () => {
+  const delta = { role: "system" as const, content: "new instructions", timestamp: 4 };
+  const result = await providerCompaction(toolHistory(), { ordinaryProjection: packToolHistory,
+    afterOrdinary(session) { session.appendMessage(delta); },
+  });
+  assert.deepEqual(result.contexts[0]?.messages.at(-1), delta);
+  assert.match(JSON.stringify(result.payload.input), /new instructions/);
+  assert.match(JSON.stringify(result.payload.input), /obs_fixture/);
+  assert.doesNotMatch(JSON.stringify(result.payload.input), /Original tool output/);
+});
+
+for (const change of ["edit", "session-start", "session-id", "model", "backend"] as const) {
   test(`compaction discards its ordinary context projection after ${change} changes`, async () => {
     const result = await providerCompaction(toolHistory(), { ordinaryProjection: packToolHistory,
       async afterOrdinary(session, mock, current, requestModel) {
@@ -865,7 +876,6 @@ for (const change of ["edit", "system", "session-start", "session-id", "model", 
           assert.ok(entry);
           session.appendContextEdit(entry.id, { content: "edited request" });
         }
-        if (change === "system") session.appendMessage({ role: "system", content: "new instructions", timestamp: 4 });
         if (change === "session-start") await mock.events.get("session_start")?.[0]?.({ type: "session_start" }, current.ctx);
         if (change === "session-id") session.getSessionId = () => "replacement-session";
         if (change === "model") requestModel.id = "other-model";
