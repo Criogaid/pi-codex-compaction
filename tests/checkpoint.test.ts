@@ -12,6 +12,7 @@ import {
 import { capableModel, type ProviderIdentity } from "../src/capability.js";
 import {
   createCheckpointDetails,
+  checkpointMarker,
   fallbackSummary,
   fingerprintMessage,
   keptMessages,
@@ -130,29 +131,57 @@ function transcript(kept: AgentMessage[], after: AgentMessage[]) {
   const system: AgentMessage = { role: "system", content: "prompt", timestamp: 0 };
   const summary: AgentMessage = { role: "compactionSummary", summary: fallbackSummary(details.checkpointId), tokensBefore: 100, timestamp: 1 };
   const update: AgentMessage = { role: "system", content: "update", timestamp: 5 };
-  return { details, summary, canonical: [system, summary, ...kept, update, ...after] };
+  return { details, system, summary, update, canonical: [system, summary, ...kept, update, ...after] };
 }
 
+test("keeps checkpoint system messages in place", async (t) => {
+  const kept = user("kept", 2);
+  const after = user("new user message", 6);
+  const { details, system, summary, update, canonical } = transcript(
+    [kept, toolResult("call-kept", "kept output", 3)],
+    [after],
+  );
+  const edited = canonical.map((message) => message === kept ? user("edited retained message", kept.timestamp) : message);
+  const cases = {
+    "projectCheckpointTranscript exact match": () => projectCheckpointTranscript(canonical, canonical, details),
+    "projectCheckpointTranscript provenance match": () => projectCheckpointTranscript(edited, canonical, details),
+    projectCheckpointRequest: () => projectCheckpointRequest(canonical, details),
+  };
+
+  for (const [name, project] of Object.entries(cases)) {
+    await t.test(name, () => {
+      const projected = project();
+      assert.ok(projected);
+      assert.deepEqual(projected, [system, user(checkpointMarker(details.checkpointId), summary.timestamp), update, after]);
+      assert.strictEqual(projected[0], system);
+      assert.strictEqual(projected[2], update);
+    });
+  }
+});
+
 test("projects an unchanged request transcript exactly as a canonical request", () => {
-  const { details, canonical } = transcript([user("kept", 2)], [user("after", 6)]);
+  const after = user("after", 6);
+  const { details, system, update, canonical } = transcript([user("kept", 2)], [after]);
   const projected = projectCheckpointTranscript(canonical, canonical, details);
   assert.deepEqual(projected, projectCheckpointRequest(canonical, details));
-  assert.deepEqual(projected?.map((message) => message.role), ["system", "user", "user"]);
-  assert.equal(projected?.[0].role === "system" && projected[0].content, "prompt\n\nupdate");
+  assert.deepEqual(projected?.map((message) => message.role), ["system", "user", "system", "user"]);
+  assert.strictEqual(projected?.[0], system);
+  assert.strictEqual(projected?.[2], update);
+  assert.strictEqual(projected?.[3], after);
 });
 
 test("traces request-local edits of retained messages to one marker without moving other messages", () => {
   const kept = [user("kept", 2), toolResult("call-kept", "kept output", 3)];
   const after = [user("after", 6), toolResult("call-after", "after output", 3)];
-  const { details, summary, canonical } = transcript(kept, after);
+  const { details, system, summary, update, canonical } = transcript(kept, after);
   const note: AgentMessage = { role: "custom", customType: "note", content: "request-local note", display: false, timestamp: 1 };
-  const request = [canonical[0], summary, note, { ...user("[tagged] kept", 2) }, canonical[4], { ...user("[tagged] after", 6) }, after[1]];
+  const request = [system, summary, note, user("[tagged] kept", 2), update, user("[tagged] after", 6), after[1]];
   const projected = projectCheckpointTranscript(request, canonical, details);
   assert.ok(projected);
   const exact = projectCheckpointRequest(canonical, details);
   assert.ok(exact);
-  assert.deepEqual(projected.slice(0, 2), exact.slice(0, 2), "the head and marker match the canonical projection");
-  assert.deepEqual(projected.slice(2), [note, request[5], after[1]]);
+  assert.deepEqual(projected.slice(0, 2), exact.slice(0, 2), "the leading system message and marker match the canonical projection");
+  assert.deepEqual(projected.slice(2), [note, update, request[5], after[1]]);
   const pruned = projectCheckpointTranscript([summary, ...after], canonical, details);
   assert.deepEqual(pruned?.slice(1), after, "removed retained messages need no marker of their own");
 });
