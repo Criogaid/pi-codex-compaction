@@ -1878,13 +1878,13 @@ test("malformed JSON stops before any remote request because the V2 switch canno
   assert.equal(fixture.calls.length, 0);
 });
 
-for (const { virtualMaxTokens, reserveTokens, expected } of [
-  { virtualMaxTokens: 1_024, reserveTokens: 16_384, expected: [10_000, 8_192] },
-  { virtualMaxTokens: 0, reserveTokens: 16_384, expected: [10_000, 8_192] },
-  { virtualMaxTokens: 20_000, reserveTokens: 16_384, expected: [10_000, 8_192] },
-  { virtualMaxTokens: 1_024, reserveTokens: 1_000, expected: [800, 500] },
+for (const { virtualMaxTokens, reserveTokens } of [
+  { virtualMaxTokens: 1_024, reserveTokens: 16_384 },
+  { virtualMaxTokens: 0, reserveTokens: 16_384 },
+  { virtualMaxTokens: 20_000, reserveTokens: 16_384 },
+  { virtualMaxTokens: 1_024, reserveTokens: 1_000 },
 ]) {
-  test(`virtual fallback ignores display limit ${virtualMaxTokens} and preserves reserve ${reserveTokens}`, async () => {
+  test(`virtual fallback leaves the output budget to the routed model with display limit ${virtualMaxTokens} and reserve ${reserveTokens}`, async () => {
     const fixture = await fallbackFixture();
     const registry: ModelRegistry = fixture.ctx.modelRegistry;
     let routes = 0;
@@ -1908,10 +1908,12 @@ for (const { virtualMaxTokens, reserveTokens, expected } of [
     fixture.event.preparation.turnPrefixMessages = [{ role: "user", content: "Continue the current task.", timestamp: 2 }];
     const result = await fixture.run();
     assert.ok(result?.compaction);
-    assert.deepEqual(fixture.calls.map((call) => call.options?.maxTokens), expected);
+    assert.equal(fixture.calls.length, 2, "send both native summaries");
     assert.equal(routes, 2, "route each native summary once");
     for (const call of fixture.calls) {
       assert.equal(call.model.id, fallbackModel.id);
+      assert.equal(call.model.maxTokens, fallbackModel.maxTokens);
+      assert.equal(call.options?.maxTokens, undefined, "Pi leaves the output budget to the physical adapter");
       assert.equal(call.options?.reasoning, "medium");
     }
     assert.equal(fixture.ctx.model?.id, astraModel.id);
