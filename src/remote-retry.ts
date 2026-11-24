@@ -96,39 +96,69 @@ function rateLimitDeadline(code: string, message: string | undefined): number | 
   return Date.now() + ms;
 }
 
-/** Observe framing independently: OpenAI's SDK intercepts some SSE error frames before Pi's raw hook. */
+const LF = 0x0a;
+const CR = 0x0d;
+
+/** Observe retry evidence before the SDK handles errors, and align delivery with SSE record boundaries. */
 class SseEvidenceObserver {
+  private readonly decoder = new TextDecoder();
   private line = "";
+  private lineHasBytes = false;
   private data: string[] = [];
   private size = 0;
   private event = "";
   private skipLf = false;
   private oversized = false;
   constructor(private readonly attempt: CompactionAttempt) {}
-  feed(text: string): void {
-    if (this.oversized) return;
-    for (const char of text) {
-      if (this.skipLf && char === "\n") { this.skipLf = false; continue; }
+
+  feed(bytes: Uint8Array): number[] | undefined {
+    let cuts: number[] | undefined;
+    let start = 0;
+    if (bytes.length && this.skipLf) {
+      if (bytes[0] === LF) start++;
       this.skipLf = false;
-      if (char === "\r" || char === "\n") {
-        this.finishLine();
-        this.skipLf = char === "\r";
-      } else if (!this.oversized) {
-        this.size += char.length;
-        if (this.size > MAX_OBSERVED_EVENT_CHARS) {
-          this.oversized = true;
-          this.line = "";
-          this.data = [];
-          this.attempt.blockRetry();
-          return;
-        } else this.line += char;
-      }
     }
+    for (let i = start; i < bytes.length; i++) {
+      const byte = bytes[i];
+      if (byte !== CR && byte !== LF) continue;
+      this.append(bytes.subarray(start, i + 1), true);
+      const blank = !this.lineHasBytes && i === start;
+      this.lineHasBytes = false;
+      this.finishLine();
+      if (byte === CR) {
+        if (bytes[i + 1] === LF) i++;
+        else this.skipLf = i + 1 === bytes.length;
+      }
+      start = i + 1;
+      if (blank && start < bytes.length) (cuts ??= []).push(start);
+    }
+    if (start < bytes.length) {
+      this.lineHasBytes = true;
+      this.append(bytes.subarray(start), false);
+    }
+    return cuts;
   }
+
+  private append(bytes: Uint8Array, endsLine: boolean): void {
+    if (this.oversized) return;
+    // Decode through the line ending so a split UTF-8 code point stays within its line.
+    const decoded = this.decoder.decode(bytes, { stream: true });
+    const text = endsLine ? decoded.slice(0, -1) : decoded;
+    this.size += text.length;
+    if (this.size > MAX_OBSERVED_EVENT_CHARS) {
+      this.oversized = true;
+      this.line = "";
+      this.data = [];
+      this.attempt.blockRetry();
+      return;
+    }
+    this.line += text;
+  }
+
   private finishLine(): void {
+    if (this.oversized) return;
     const line = this.line;
     this.line = "";
-    if (this.oversized) return;
     if (!line) {
       if (this.data.length) {
         const data = this.data.join("\n");
@@ -151,6 +181,7 @@ class SseEvidenceObserver {
   }
   finish(): void {
     if (this.oversized) return;
+    this.line += this.decoder.decode();
     if (this.line) this.finishLine();
     if (this.data.length) {
       // EOF can cut a valid response mid-frame. Still veto a complete permanent error at EOF.
@@ -201,7 +232,7 @@ export class CompactionAttempt {
     return this.evidence ?? (this.eof && this.progress ? { reason: "Responses stream ended before its terminal event" } : undefined);
   }
 
-  observeResponse(response: Response, signal: AbortSignal): Response {
+  observeResponse(response: Response, signal: AbortSignal, completed: () => boolean): Response {
     const isSse = response.ok && response.headers.get("content-type")?.toLowerCase().includes("text/event-stream");
     if (!response.ok) {
       if (TRANSIENT_HTTP.has(response.status) && response.headers.get("x-should-retry") !== "false") {
@@ -217,48 +248,79 @@ export class CompactionAttempt {
     let closed = false;
     let abort: () => void;
     const cleanup = () => { closed = true; signal.removeEventListener("abort", abort); };
-    const inspect = (text: string) => {
-      if (sse) sse.feed(text);
-      else if (!errorBodyTooLarge) {
-        if (errorBody.length + text.length > MAX_OBSERVED_EVENT_CHARS) {
-          errorBodyTooLarge = true;
-          errorBody = "";
-          this.blockRetry();
-        } else errorBody += text;
+    const cancelSource = async (reason?: unknown) => {
+      cleanup();
+      try {
+        await reader.cancel(reason);
+      } finally {
+        reader.releaseLock();
       }
     };
+    const inspectErrorBody = (text: string) => {
+      if (errorBodyTooLarge) return;
+      if (errorBody.length + text.length > MAX_OBSERVED_EVENT_CHARS) {
+        errorBodyTooLarge = true;
+        errorBody = "";
+        this.blockRetry();
+      } else errorBody += text;
+    };
+    let chunk: Uint8Array | undefined;
+    let cuts: number[] | undefined;
+    let offset = 0;
+    let nextCut = 0;
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         abort = () => {
           if (closed) return;
-          cleanup();
           controller.error(signal.reason);
-          void reader.cancel(signal.reason).finally(() => reader.releaseLock()).catch(() => {});
+          // Cancellation of the source cannot change the abort already delivered to the consumer.
+          void cancelSource(signal.reason).catch(() => {});
         };
         signal.addEventListener("abort", abort, { once: true });
         if (signal.aborted) abort();
       },
       pull: async (controller) => {
         try {
-          const result = await reader.read();
-          if (closed) return;
-          if (result.done) {
-            inspect(decoder.decode());
-            sse?.finish();
-            if (!sse && !errorBodyTooLarge) {
-              try {
-                const error = classifyError(JSON.parse(errorBody));
-                if (error.permanent || error.invalid || (error.code && !TRANSIENT_CODES.has(error.code))) this.blockRetry();
-              } catch { /* A transient HTTP status can legitimately carry a non-JSON gateway error. */ }
-            }
-            this.eof = Boolean(sse);
-            cleanup();
-            reader.releaseLock();
+          if (sse && completed()) {
             controller.close();
-          } else {
-            inspect(decoder.decode(result.value, { stream: true }));
-            controller.enqueue(result.value);
+            // The adapter has processed completion. Source cleanup cannot change that result.
+            void cancelSource().catch(() => {});
+            return;
           }
+          if (!chunk) {
+            const result = await reader.read();
+            if (closed) return;
+            if (result.done) {
+              if (sse) sse.finish();
+              else {
+                inspectErrorBody(decoder.decode());
+                if (!errorBodyTooLarge) {
+                  try {
+                    const error = classifyError(JSON.parse(errorBody));
+                    if (error.permanent || error.invalid || (error.code && !TRANSIENT_CODES.has(error.code))) this.blockRetry();
+                  } catch { /* A transient HTTP status can legitimately carry a non-JSON gateway error. */ }
+                }
+              }
+              this.eof = Boolean(sse);
+              cleanup();
+              reader.releaseLock();
+              controller.close();
+              return;
+            }
+            chunk = result.value;
+            // Keep retry evidence at the network-chunk boundary, even when the SDK throws before Pi sees the event.
+            if (sse) cuts = sse.feed(chunk);
+            else inspectErrorBody(decoder.decode(chunk, { stream: true }));
+          }
+          const cut = cuts?.[nextCut++];
+          if (cut !== undefined) {
+            controller.enqueue(chunk.subarray(offset, cut));
+            offset = cut;
+            return;
+          }
+          controller.enqueue(offset ? chunk.subarray(offset) : chunk);
+          chunk = undefined;
+          offset = nextCut = 0;
         } catch (error) {
           if (closed) return;
           this.fetchFailed(error);
@@ -269,8 +331,7 @@ export class CompactionAttempt {
       },
       cancel(reason) {
         if (closed) return;
-        cleanup();
-        return reader.cancel(reason).finally(() => reader.releaseLock());
+        return cancelSource(reason);
       },
     }, { highWaterMark: 0 });
     return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });

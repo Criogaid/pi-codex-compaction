@@ -63,6 +63,7 @@ export function validateCompactionItem(
 }
 
 export interface CompactionCollector {
+  readonly completed: boolean;
   observe(event: unknown): void;
   finish(): JsonObject;
 }
@@ -76,6 +77,7 @@ export function createCompactionCollector(): CompactionCollector {
   let item: JsonObject | undefined;
   let completedItem: JsonObject | undefined;
   return {
+    get completed() { return completedItem !== undefined; },
     observe(event) {
       if (completedItem || !isObject(event)) return;
       // A provider may restart its response when falling back from WebSocket to HTTP.
