@@ -187,7 +187,7 @@ function parseSummaryModel(summary: unknown): SummaryModel {
 /**
  * Capture one revision; reading configuration.summaryModel validates it on demand and can throw.
  * Saving locks across Pi processes before checking the revision and atomically replacing the file.
- * A selection without a summaryModel field keeps the file's summary model as written.
+ * Omitted fields keep the values from that revision; an omitted summaryModel survives without validation.
  */
 export async function loadCompactionSettings(path: string) {
   const original = await readSettingsFile(path);
@@ -200,11 +200,7 @@ export async function loadCompactionSettings(path: string) {
   const { configuration, rawSummaryModel } = parsed;
   return {
     configuration,
-    async save(selection: {
-      readonly remoteCompactionEnabled: boolean;
-      readonly reasoningEffortUpdatesEnabled: boolean;
-      readonly summaryModel?: SummaryModel | undefined;
-    }): Promise<void> {
+    async save(selection: Partial<CompactionConfiguration>): Promise<void> {
       const summaryModel = "summaryModel" in selection ? selection.summaryModel : rawSummaryModel?.value;
       await withFileMutationQueue(path, async () => {
         await mkdir(dirname(path), { recursive: true });
@@ -212,8 +208,8 @@ export async function loadCompactionSettings(path: string) {
           const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
           const bytes = Buffer.from(`${JSON.stringify({
             version: SETTINGS_VERSION,
-            remoteCompaction: { enabled: selection.remoteCompactionEnabled },
-            reasoningEffortUpdates: { enabled: selection.reasoningEffortUpdatesEnabled },
+            remoteCompaction: { enabled: selection.remoteCompactionEnabled ?? configuration.remoteCompactionEnabled },
+            reasoningEffortUpdates: { enabled: selection.reasoningEffortUpdatesEnabled ?? configuration.reasoningEffortUpdatesEnabled },
             ...(summaryModel === undefined ? {} : { summaryModel }),
           }, null, 2)}\n`);
           if (bytes.length > MAX_SETTINGS_BYTES) throw new Error(`Compaction settings must not exceed ${MAX_SETTINGS_BYTES} bytes`);

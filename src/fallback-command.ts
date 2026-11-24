@@ -173,23 +173,18 @@ async function configureCompaction(
     const action = await chooseAction(ctx, configuration, summary, selected);
     if (action === undefined) return;
     selected = action;
-    const switches = {
-      remoteCompactionEnabled: configuration.remoteCompactionEnabled,
-      reasoningEffortUpdatesEnabled: configuration.reasoningEffortUpdatesEnabled,
-    };
     if (action === "model") {
       const choice = await chooseSummaryModel(ctx);
       if (choice !== undefined) {
-        await settings.save({ ...switches, summaryModel: choice.value });
-        onReasoningEffortUpdatesSaved(switches.reasoningEffortUpdatesEnabled);
+        await settings.save({ summaryModel: choice.value });
+        onReasoningEffortUpdatesSaved(configuration.reasoningEffortUpdatesEnabled);
         ctx.ui.notify(describeSummaryModel(choice.value), "info");
       }
     } else {
       const { field, on, off } = SWITCHES[action];
-      const enabled = !switches[field];
-      // Omitting summaryModel keeps the file's value as written, including one that fails validation.
-      await settings.save({ ...switches, [field]: enabled });
-      onReasoningEffortUpdatesSaved(action === "effort" ? enabled : switches.reasoningEffortUpdatesEnabled);
+      const enabled = !configuration[field];
+      await settings.save({ [field]: enabled });
+      onReasoningEffortUpdatesSaved(action === "effort" ? enabled : configuration.reasoningEffortUpdatesEnabled);
       ctx.ui.notify(enabled ? on : off, "info");
     }
     // TUI keeps the same row selected so repeated Enter presses toggle in place.
