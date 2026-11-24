@@ -453,6 +453,7 @@ export function createCodexCompactionExtension(
         () => canonicalMessages(ctx),
         () => activeCheckpoint(ctx),
         messages ?? event.messages,
+        messages !== undefined,
       );
       return messages ? { messages } : undefined;
     });
@@ -465,7 +466,7 @@ export function createCodexCompactionExtension(
         () => canonicalMessages(ctx),
         () => ctx.getSystemPrompt(),
         // Keep the wire marker in the snapshot; ordinary requests and V2 each replay it exactly once.
-        () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx), replayedCheckpoint: payload !== undefined }),
+        () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx), replay: payload === undefined ? "skipped" : "applied" }),
       );
       return payload;
     });

@@ -5,7 +5,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import { getCurrentSystemMessage, getSystemMessageText, type Context, type Message, type Tool } from "@earendil-works/pi-ai";
 import { convertToLlm, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { RESPONSES_APIS, sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
-import { type CodexCheckpointDetails, checkpointMarker, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
+import { type CodexCheckpointDetails, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
 import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, type CompactionPayload, isObject, isObjectArray, type JsonObject } from "./protocol.js";
 import { contextUserItems, userItemOrigins } from "./retention-input.js";
 
@@ -182,7 +182,7 @@ export interface ProviderRequestSnapshot extends ProjectedSourceSnapshot {
   /** The same inputs after the observed run settled and Pi fell back to its base prompt options. */
   readonly settledInputsKey?: string;
   readonly fields: ProviderRequestFields;
-  /** Absent when the observed input depends on server-side conversation state. */
+  /** Absent when the observed input is missing checkpoint replay or depends on server-side conversation state. */
   readonly prefix?: {
     readonly boundary: string;
     readonly contextLength: number;
@@ -197,7 +197,7 @@ function requestInputsKey(target: CapableModel, inputs: ProviderRequestInputs): 
 }
 
 function captureProviderRequest(
-  context: ContextSnapshot, target: CapableModel, payload: unknown, inputs: ProviderRequestInputs,
+  context: ContextSnapshot, target: CapableModel, payload: unknown, inputs: ProviderRequestInputs, replayMissing: boolean,
 ): ProviderRequestSnapshot | undefined {
   if (!isObject(payload) || payload.model !== target.model.id ||
     !isObjectArray(payload.input)) return undefined;
@@ -217,18 +217,18 @@ function captureProviderRequest(
     (prompt_cache_retention !== undefined && typeof prompt_cache_retention !== "string") ||
     (service_tier !== undefined && typeof service_tier !== "string") ||
     (text !== undefined && !isObject(text)) || (verbosity !== undefined && typeof verbosity !== "string")) return undefined;
-  const contextual = contextUserItems(payload.input, userItemOrigins(context.messages));
   // Copy policy only: a diagnostic response ID or prewarm operation belongs to the observed request.
   const cachePolicy = mode !== undefined || ttl !== undefined ? { mode, ttl } : undefined;
-  const serverHistory = payload.previous_response_id != null || payload.conversation != null ||
+  const independentFieldsOnly = replayMissing || payload.previous_response_id != null || payload.conversation != null ||
     payload.input.some((item) => item.type === "item_reference");
+  const contextual = independentFieldsOnly ? undefined : contextUserItems(payload.input, userItemOrigins(context.messages));
   return {
     sessionId: context.sessionId, identity: context.identity, sourceFingerprints: context.sourceFingerprints,
     projectionOnlyFingerprints: context.projectionOnlyFingerprints,
     systemPrompt: inputs.systemPrompt, inputsKey: requestInputsKey(target, inputs),
     fields: structuredClone({ instructions, tools, reasoning, parallel_tool_calls, text, prompt_cache_key,
       prompt_cache_retention, prompt_cache_options: cachePolicy, service_tier }),
-    prefix: serverHistory ? undefined : {
+    prefix: contextual && {
       boundary: `PI_CODEX_REQUEST_BOUNDARY_${randomUUID()}`, contextLength: context.messages.length,
       input: structuredClone(payload.input), contextual: payload.input.map((item) => contextual.has(item)),
     },
@@ -300,7 +300,7 @@ export interface RequestSnapshots {
 interface TrackedSnapshots {
   promptOverride?: PromptOverride;
   pendingSource?: SourceSnapshot;
-  pendingContext?: { readonly source: SourceSnapshot; readonly context: ContextSnapshot; readonly checkpointId?: string };
+  pendingContext?: { readonly source: SourceSnapshot; readonly context: ContextSnapshot; readonly requiresReplay: boolean };
   context?: ContextSnapshot;
   providerRequest?: ProviderRequestSnapshot;
 }
@@ -337,6 +337,7 @@ export class RequestSnapshotTracker {
     canonical: () => AgentMessage[],
     checkpoint: () => CodexCheckpointDetails | undefined,
     projected: readonly AgentMessage[],
+    requiresReplay: boolean,
   ): void {
     const pending = target && snapshotFor(this.state.pendingSource, sessionId, target);
     this.state.pendingSource = undefined;
@@ -348,7 +349,7 @@ export class RequestSnapshotTracker {
     const prior = checkpoint();
     const source = prior ? projectCheckpointRequest(messages, prior) : messages;
     if (source) this.state.pendingContext = {
-      source: pending, context: captureContextSnapshot(sessionId, target, source, projected), checkpointId: prior?.checkpointId,
+      source: pending, context: captureContextSnapshot(sessionId, target, source, projected), requiresReplay,
     };
   }
 
@@ -358,7 +359,7 @@ export class RequestSnapshotTracker {
     target: CapableModel | undefined,
     canonical: () => AgentMessage[],
     systemPrompt: () => string,
-    observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs; readonly replayedCheckpoint?: boolean },
+    observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs; readonly replay: "applied" | "skipped" },
   ): void {
     const messages = target ? canonical() : undefined;
     this.state.promptOverride = target && messages && capturePromptOverride(messages, sessionId, target, systemPrompt());
@@ -371,13 +372,8 @@ export class RequestSnapshotTracker {
     this.state.context = matched?.context;
     this.state.providerRequest = undefined;
     if (!matched || !target) return;
-    const { payload, inputs, replayedCheckpoint } = observation();
-    if (!replayedCheckpoint && matched.checkpointId) {
-      const marker = checkpointMarker(matched.checkpointId);
-      if (matched.context.messages.some((message) => message.role === "user" && Array.isArray(message.content) &&
-        message.content.some((part) => part.type === "text" && part.text === marker))) return;
-    }
-    this.state.providerRequest = captureProviderRequest(matched.context, target, payload, inputs);
+    const { payload, inputs, replay } = observation();
+    this.state.providerRequest = captureProviderRequest(matched.context, target, payload, inputs, matched.requiresReplay && replay === "skipped");
   }
 
   /**
