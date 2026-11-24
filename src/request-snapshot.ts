@@ -210,6 +210,10 @@ function requestInputsKey(target: CapableModel, inputs: ProviderRequestInputs): 
   return JSON.stringify({ model: target.model, ...inputs, settings });
 }
 
+function fieldsIndependentOfSystemMessages({ instructions: _instructions, tools: _tools, ...fields }: ProviderRequestFields) {
+  return fields;
+}
+
 function captureProviderRequest(
   context: ContextSnapshot, target: CapableModel, payload: unknown, inputs: ProviderRequestInputs, replayMissing: boolean,
 ): ProviderRequestSnapshot | undefined {
@@ -472,11 +476,10 @@ export function compactionRequest(
   const effectiveInputs = override ? { ...inputs, systemPrompt: override.text } : inputs;
   const key = requestInputsKey(target, effectiveInputs);
   const suffix = snapshot && matchingProjectionSuffix(current, snapshot);
-  // A new system message can change items on either side of the splice. Keep matching fields,
-  // but let Pi serialize the input as a whole in that case.
+  // A system delta can change the serialized history, instructions and tools on either side of the splice.
   const providerRequest = suffix && (snapshot.inputsKey === key || snapshot.settledInputsKey === key)
-    ? snapshot.prefix && suffix.some((message) => message.role === "system")
-      ? { ...snapshot, prefix: undefined }
+    ? suffix.some((message) => message.role === "system")
+      ? { ...snapshot, prefix: undefined, fields: fieldsIndependentOfSystemMessages(snapshot.fields) }
       : snapshot
     : undefined;
 
