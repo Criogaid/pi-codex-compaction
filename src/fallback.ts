@@ -1,9 +1,10 @@
 // Own summary-model resolution and Pi's native text summarization through the model registry.
-import { getSupportedThinkingLevels, type Api, type AssistantMessage, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type AssistantMessage, type AssistantMessageEventStream, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { compact, SettingsManager, type ExtensionAPI, type ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { SummaryModel } from "./fallback-settings.js";
 
 const REQUEST_TIMEOUT_MS = 300_000;
+const PROVIDER_ABORT_MESSAGE = "Fallback compaction was aborted by the provider";
 
 interface FallbackModel {
   readonly model: Model<Api>;
@@ -50,6 +51,7 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
   const budgetModel = selection.model.api === "pi-virtual" ? { ...selection.model, maxTokens: 0 } : selection.model;
   // Pi can append file lists to empty summaries; inspect the actual completions.
   const responses: AssistantMessage[] = [];
+  let abortedStream: AssistantMessageEventStream | undefined;
   const result = await compact(
     request.preparation,
     budgetModel,
@@ -59,7 +61,9 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
     request.signal,
     selection.thinkingLevel,
     async (_model, context, options) => {
-      request.signal.throwIfAborted();
+      // Pi can start another segment after an abort. It only reads .result(),
+      // so the terminal stream can satisfy that call without dispatching again.
+      if (abortedStream) return abortedStream;
       const stream = request.modelRegistry.streamSimple(selection.model, context, {
         ...options,
         transport: settings.getTransport(),
@@ -74,20 +78,21 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
         },
       });
       const message = await stream.result();
-      // Pi treats an aborted response as terminal for retries but can still start the next segment.
-      if (message.stopReason === "aborted") {
-        request.signal.throwIfAborted();
-        throw new Error("Fallback compaction was aborted by the provider");
-      }
-      responses.push(message);
+      if (message.stopReason === "aborted") abortedStream = stream;
+      else responses.push(message);
       return stream;
     },
     undefined,
     settings.getRetrySettings(),
     undefined,
     request.sessionId,
-  );
+  ).catch((cause: unknown) => {
+    request.signal.throwIfAborted();
+    if (!abortedStream) throw cause;
+    throw new Error(PROVIDER_ABORT_MESSAGE, { cause });
+  });
   request.signal.throwIfAborted();
+  if (abortedStream) throw new Error(PROVIDER_ABORT_MESSAGE);
   request.onPrepared(selection);
   for (const message of responses) {
     // Pi owns retrying error responses; validate only completions it accepted.
