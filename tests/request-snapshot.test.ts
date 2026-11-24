@@ -7,7 +7,7 @@ import { convertResponsesMessages, convertResponsesTools } from "@earendil-works
 import { getDeclaredTools, normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { CapableModel } from "../src/capability.js";
 import { checkpointMarker, createCheckpointDetails, fallbackSummary, fingerprintMessage } from "../src/checkpoint.js";
-import { applyProviderRequest, compactionRequest, providerRequestFor, RequestSnapshotTracker, type ProviderRequestInputs, type RequestDeclarations } from "../src/request-snapshot.js";
+import { applyProviderRequest, compactionRequest, RequestSnapshotTracker, type ProviderRequestInputs } from "../src/request-snapshot.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 
 const sessionId = "snapshot-session";
@@ -23,9 +23,8 @@ const target: CapableModel = {
 const tools: Tool[] = [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }];
 const user = (content = "source", timestamp = 1): UserMessage => ({ role: "user", content, timestamp });
 const system = (content = "canonical prompt", timestamp = 0): SystemMessage => ({ role: "system", content, timestamp });
-const declarationsInTranscript: RequestDeclarations = {
+const declarationsInTranscript: Parameters<typeof compactionRequest>[5] = {
   blockImages: false,
-  systemPrompt: () => "canonical prompt",
   tools: () => assert.fail("the transcript already declares its tools"),
 };
 const inputs: ProviderRequestInputs = {
@@ -145,7 +144,7 @@ test("a checkpoint projects the source before binding and reusing the ordinary r
   tracker.recordProjectedRequest(sessionId, target, () => canonical, () => details, projected);
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt", noPayload);
   assert.deepEqual(tracker.current().context?.sourceFingerprints, source.map(fingerprintMessage));
-  const result = compactionRequest(tracker.current(), sessionId, target, source, declarationsInTranscript);
+  const result = compactionRequest(tracker.current(), sessionId, target, source, inputs, declarationsInTranscript);
   assert.deepEqual(result.messages, projected);
   assert.deepEqual(result.context, { messages: projected });
 });
@@ -168,7 +167,7 @@ test("compaction reuses the projected prefix, appends new messages, and does not
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => "canonical prompt", noPayload);
   const current = [...canonical, user("new suffix", 2)];
   const saved = structuredClone({ current, projected });
-  const result = compactionRequest(tracker.current(), sessionId, target, current, declarationsInTranscript);
+  const result = compactionRequest(tracker.current(), sessionId, target, current, inputs, declarationsInTranscript);
   assert.deepEqual(result.messages, [...projected, current[2]]);
   assert.deepEqual(result.context, { messages: [...projected, current[2]] });
   assert.notEqual(result.messages[1], projected[1]);
@@ -185,7 +184,7 @@ for (const scenario of ["session", "model", "backend", "changed prefix", "shorte
     const current = scenario === "changed prefix" ? [system(), user("edited")]
       : scenario === "shortened prefix" ? [system()] : canonical;
     const result = compactionRequest(tracker.current(), scenario === "session" ? "other-session" : sessionId,
-      requestTarget, current, declarationsInTranscript);
+      requestTarget, current, inputs, declarationsInTranscript);
     assert.deepEqual(result.context, { messages: current });
     assert.equal(result.messages, current);
   });
@@ -196,7 +195,7 @@ test("a prompt override replaces the system text while retaining transcript tool
   const canonical = [head, user()];
   const tracker = preparedTracker(canonical);
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt", noPayload);
-  const result = compactionRequest(tracker.current(), sessionId, target, canonical, declarationsInTranscript);
+  const result = compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript);
   assert.deepEqual(result.context, { messages: [{ ...head, content: "forced prompt" }, canonical[1]] });
   assert.deepEqual(canonical[0], head);
 });
@@ -206,18 +205,17 @@ test("a changed system head invalidates a saved prompt override", () => {
   const tracker = new RequestSnapshotTracker();
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => "forced prompt", noPayload);
   const current = [system("edited canonical prompt"), user()];
-  const result = compactionRequest(tracker.current(), sessionId, target, current, declarationsInTranscript);
+  const result = compactionRequest(tracker.current(), sessionId, target, current, inputs, declarationsInTranscript);
   assert.deepEqual(result.context, { messages: current });
 });
 
-test("a transcript without system messages reads and includes the supplied prompt and tools", (t) => {
+test("a transcript without system messages includes the supplied prompt and loads tools", (t) => {
   const current = [user()];
-  const systemPrompt = t.mock.fn(() => "declared prompt");
   const readTools = t.mock.fn(() => tools);
-  const result = compactionRequest({}, sessionId, target, current, { blockImages: false, systemPrompt, tools: readTools });
+  const result = compactionRequest({}, sessionId, target, current, { ...inputs, systemPrompt: "declared prompt" },
+    { blockImages: false, tools: readTools });
   assert.deepEqual(result.context, { systemPrompt: "declared prompt", tools, messages: current });
   assert.equal(result.messages, current);
-  assert.equal(systemPrompt.mock.callCount(), 1);
   assert.equal(readTools.mock.callCount(), 1);
 });
 
@@ -225,7 +223,7 @@ for (const blockImages of [true, false]) {
   test(`image blocking ${blockImages} preserves text order and deduplicates only adjacent placeholders`, () => {
     const image = { type: "image" as const, data: "fixture", mimeType: "image/png" };
     const probe: UserMessage = { role: "user", content: [image], timestamp: 0 };
-    const projected = compactionRequest({}, sessionId, target, [system(), probe], { ...declarationsInTranscript, blockImages: true });
+    const projected = compactionRequest({}, sessionId, target, [system(), probe], inputs, { ...declarationsInTranscript, blockImages: true });
     const projectedUser = projected.context.messages[1];
     assert.equal(projectedUser.role, "user");
     assert.ok(Array.isArray(projectedUser.content));
@@ -239,7 +237,7 @@ for (const blockImages of [true, false]) {
     const textOnly: UserMessage = { role: "user", content: [blocked, blocked], timestamp: 3 };
     const current = [head, imageUser, tool, textOnly];
     const saved = structuredClone(current);
-    const result = compactionRequest({}, sessionId, target, current, { ...declarationsInTranscript, blockImages });
+    const result = compactionRequest({}, sessionId, target, current, inputs, { ...declarationsInTranscript, blockImages });
     const expected = blockImages ? [blocked, text, blocked] : content;
     assert.deepEqual(result.context, { messages: [head, { ...imageUser, content: expected }, { ...tool, content: expected }, textOnly] });
     assert.deepEqual(current, saved);
@@ -267,7 +265,7 @@ test("observed declarations and cache fields survive newer messages without copy
   const observed = wirePayload();
   const tracker = observedRequest(canonical, observed);
   const current = [...canonical, user("new turn", 2)];
-  const snapshot = providerRequestFor(tracker.current(), sessionId, target, current, inputs);
+  const { providerRequest: snapshot } = compactionRequest(tracker.current(), sessionId, target, current, inputs, declarationsInTranscript);
   assert.ok(snapshot?.prefix);
   observed.tools[0].name = "mutated-after-capture";
   observed.input[0].content?.push({ type: "input_text", text: "mutated-after-capture" });
@@ -307,7 +305,7 @@ for (const scenario of [
     const prefix: JsonObject[] = [{ role: "user", content: "source" }];
     if (scenario.prefixEffort) prefix.push({ type: "configuration_update", reasoning: { effort: scenario.prefixEffort } });
     const tracker = observedRequest(canonical, { model: model.id, input: prefix });
-    const captured = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+    const { providerRequest: captured } = compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript);
     assert.ok(captured?.prefix);
     const snapshot = { ...captured, prefix: { ...captured.prefix, contextual: prefix.map((_, index) => index === 0) } };
     const suffix: JsonObject[] = [];
@@ -342,7 +340,7 @@ test("matching multi-item request tails replace observed values and preserve con
   const observedTail = [{ type: "configuration_update", reasoning: { effort: "low" } },
     { type: "request_options", policy: "previous" }];
   const tracker = observedRequest(canonical, { model: model.id, input: [history, ...observedTail] });
-  const captured = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+  const { providerRequest: captured } = compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript);
   assert.ok(captured?.prefix);
   const snapshot = { ...captured, prefix: { ...captured.prefix, contextual: [true, false, true] } };
   const suffix = { role: "user", content: "new turn" };
@@ -375,7 +373,7 @@ for (const scenario of [
       { role: "user", content: "observed source" },
       { type: "configuration_update", reasoning: { effort: "low" } },
     ] });
-    const snapshot = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+    const { providerRequest: snapshot } = compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript);
     assert.ok(snapshot?.prefix);
     const head = { role: "user", content: "fresh source" };
     const suffix = { role: "user", content: "new turn" };
@@ -396,19 +394,23 @@ test("wire snapshots reject session, backend, source, prompt, tool, thinking and
   const canonical = [system(), user()];
   const tracker = observedRequest(canonical, wirePayload());
   const snapshots = tracker.current();
-  assert.equal(providerRequestFor(snapshots, "different-session", target, canonical, inputs), undefined);
+  assert.equal(
+    compactionRequest(snapshots, "different-session", target, canonical, inputs,
+      declarationsInTranscript).providerRequest, undefined);
   const otherBackend = { ...target, identity: { ...target.identity, baseUrl: "https://other.example", endpoint: "https://other.example/responses" } };
-  assert.equal(providerRequestFor(snapshots, sessionId, otherBackend, canonical, inputs), undefined);
-  assert.equal(providerRequestFor(snapshots, sessionId, target, [system(), user("edited")], inputs), undefined);
-  assert.equal(providerRequestFor(snapshots, sessionId, target, [system()], inputs), undefined);
+  assert.equal(compactionRequest(snapshots, sessionId, otherBackend, canonical, inputs, declarationsInTranscript).providerRequest, undefined);
+  assert.equal(
+    compactionRequest(snapshots, sessionId, target, [system(), user("edited")], inputs,
+      declarationsInTranscript).providerRequest, undefined);
+  assert.equal(compactionRequest(snapshots, sessionId, target, [system()], inputs, declarationsInTranscript).providerRequest, undefined);
   for (const changed of [
     { ...inputs, systemPrompt: "updated" },
     { ...inputs, thinkingLevel: "high" as const },
     { ...inputs, activeTools: ["new-tool"] },
     { ...inputs, tools: inputs.tools.map((tool) => ({ ...tool, parameters: { type: "object", properties: { path: { type: "string" } } } })) },
     { ...inputs, settings: { transport: "websocket" as const } },
-  ]) assert.equal(providerRequestFor(snapshots, sessionId, target, canonical, changed), undefined);
-  const snapshot = providerRequestFor(snapshots, sessionId, target, canonical, inputs);
+  ]) assert.equal(compactionRequest(snapshots, sessionId, target, canonical, changed, declarationsInTranscript).providerRequest, undefined);
+  const { providerRequest: snapshot } = compactionRequest(snapshots, sessionId, target, canonical, inputs, declarationsInTranscript);
   assert.ok(snapshot?.prefix);
   const fresh = wirePayload();
   const start = { role: "user", content: [{ type: "input_text", text: snapshot.prefix.boundary }] };
@@ -425,7 +427,7 @@ test("missing wire fields remove obsolete defaults and malformed observations di
   const canonical = [system(), user()];
   const payload = { model: model.id, input: [{ role: "user", content: "source" }] };
   const tracker = observedRequest(canonical, payload);
-  const snapshot = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+  const { providerRequest: snapshot } = compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript);
   assert.ok(snapshot?.prefix);
   const fresh = wirePayload();
   const actual = applyProviderRequest({ ...fresh, input: [...fresh.input,
@@ -474,7 +476,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       content: [{ type: "text", text: "pong" }], isError: false, timestamp: 3 };
     const canonical: AgentMessage[] = [{ ...system(), toolsAdded: [grammar] }, user(), assistant, resultMessage];
     const saved = structuredClone(canonical);
-    const request = compactionRequest({}, sessionId, grammarTarget, canonical, declarationsInTranscript);
+    const request = compactionRequest({}, sessionId, grammarTarget, canonical, inputs, declarationsInTranscript);
     const context = normalizeContext(request.context);
     const converted = convertResponsesMessages(grammarModel, context, new Set([model.provider]), {
       supportsMidConvoSystemMessages: true,
@@ -498,12 +500,16 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
 test("settled prompt overrides reuse matching wire state but reject a new effective prompt", () => {
   const canonical = [system(), user()];
   const tracker = observedRequest(canonical, wirePayload(), { ...inputs, systemPrompt: "forced prompt" });
-  assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, inputs));
-  assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, { ...inputs, systemPrompt: "forced prompt" }));
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, { ...inputs, systemPrompt: "new configured prompt" }), undefined);
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, { ...inputs, thinkingLevel: "high" }), undefined);
+  assert.ok(compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript).providerRequest);
+  assert.ok(
+    compactionRequest(tracker.current(), sessionId, target, canonical, { ...inputs, systemPrompt: "forced prompt" },
+      declarationsInTranscript).providerRequest);
+  assert.equal(
+    compactionRequest(tracker.current(), sessionId, target, canonical, { ...inputs, thinkingLevel: "high" },
+      declarationsInTranscript).providerRequest, undefined);
   const request = compactionRequest(tracker.current(), sessionId, target, canonical,
-    { ...declarationsInTranscript, systemPrompt: () => "new configured prompt" });
+    { ...inputs, systemPrompt: "new configured prompt" }, declarationsInTranscript);
+  assert.equal(request.providerRequest, undefined);
   assert.deepEqual(request.context.messages, canonical);
 });
 
@@ -515,7 +521,7 @@ for (const reference of [
   test(`server history references preserve locally reconstructed history for ${Object.keys(reference)[0]}`, () => {
     const canonical = [system(), user("full local history")];
     const tracker = observedRequest(canonical, { ...wirePayload(), ...reference });
-    const snapshot = providerRequestFor(tracker.current(), sessionId, target, canonical, inputs);
+    const { providerRequest: snapshot } = compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript);
     assert.ok(snapshot);
     assert.equal(snapshot.prefix, undefined);
     const fresh = { model: model.id, input: [{ role: "user", content: "full local history" }] };
@@ -534,13 +540,14 @@ test("a non-forced run prompt reuses its wire prefix only after the matching run
   const tracker = observedRequest(canonical, observed);
   const baseInputs = { ...inputs, systemPrompt: "base prompt" };
   assert.equal(tracker.current().promptOverride, undefined, "The persisted head already contains the run prompt");
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs), undefined);
+  assert.equal(
+    compactionRequest(tracker.current(), sessionId, target, canonical, baseInputs,
+      declarationsInTranscript).providerRequest, undefined);
   tracker.recordSettledRun(sessionId, target, () => baseInputs);
   const current = [...canonical, user("new suffix", 2)];
-  const snapshot = providerRequestFor(tracker.current(), sessionId, target, current, baseInputs);
+  const request = compactionRequest(tracker.current(), sessionId, target, current, baseInputs, declarationsInTranscript);
+  const snapshot = request.providerRequest;
   assert.ok(snapshot?.prefix);
-  const request = compactionRequest(tracker.current(), sessionId, target, current,
-    { ...declarationsInTranscript, systemPrompt: () => baseInputs.systemPrompt }, snapshot);
   const input: readonly unknown[] = convertResponsesMessages(model, normalizeContext(request.context), new Set([model.provider]));
   assert.ok(input.every(isObject));
   const fresh = { model: model.id, input };
@@ -551,9 +558,15 @@ test("a non-forced run prompt reuses its wire prefix only after the matching run
   for (const field of ["instructions", "tools", "prompt_cache_key", "prompt_cache_retention", "prompt_cache_options"] as const) {
     assert.deepEqual(payload[field], observed[field]);
   }
-  assert.ok(providerRequestFor(tracker.current(), sessionId, target, current, inputs), "The observed run prompt remains valid");
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, current, { ...baseInputs, systemPrompt: "unobserved prompt" }), undefined);
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, [system("edited head"), user()], baseInputs), undefined);
+  assert.ok(
+    compactionRequest(tracker.current(), sessionId, target, current, inputs,
+      declarationsInTranscript).providerRequest, "The observed run prompt remains valid");
+  assert.equal(
+    compactionRequest(tracker.current(), sessionId, target, current, { ...baseInputs, systemPrompt: "unobserved prompt" },
+      declarationsInTranscript).providerRequest, undefined);
+  assert.equal(
+    compactionRequest(tracker.current(), sessionId, target, [system("edited head"), user()], baseInputs,
+      declarationsInTranscript).providerRequest, undefined);
 });
 
 const unknownSettings = { ...inputs.settings, futureRequestPolicy: "changed" };
@@ -575,12 +588,18 @@ for (const [name, change] of changedRequestInputs) {
     const rejected = observedRequest(canonical, wirePayload());
     rejected.recordSettledRun(sessionId, target, () => changed);
     assert.equal(rejected.current().providerRequest?.settledInputsKey, undefined);
-    assert.equal(providerRequestFor(rejected.current(), sessionId, target, canonical, baseInputs), undefined);
-    assert.equal(providerRequestFor(rejected.current(), sessionId, target, canonical, changed), undefined);
+    assert.equal(
+      compactionRequest(rejected.current(), sessionId, target, canonical, baseInputs,
+        declarationsInTranscript).providerRequest, undefined);
+    assert.equal(
+      compactionRequest(rejected.current(), sessionId, target, canonical, changed,
+        declarationsInTranscript).providerRequest, undefined);
     const accepted = observedRequest(canonical, wirePayload());
     accepted.recordSettledRun(sessionId, target, () => baseInputs);
-    assert.ok(providerRequestFor(accepted.current(), sessionId, target, canonical, baseInputs));
-    assert.equal(providerRequestFor(accepted.current(), sessionId, target, canonical, changed), undefined);
+    assert.ok(compactionRequest(accepted.current(), sessionId, target, canonical, baseInputs, declarationsInTranscript).providerRequest);
+    assert.equal(
+      compactionRequest(accepted.current(), sessionId, target, canonical, changed,
+        declarationsInTranscript).providerRequest, undefined);
   });
 }
 
@@ -591,17 +610,23 @@ test("settlement records one base prompt per snapshot and the next provider requ
   const laterInputs = { ...inputs, systemPrompt: "later base prompt" };
   tracker.recordSettledRun(sessionId, target, () => baseInputs);
   tracker.recordSettledRun(sessionId, target, () => laterInputs);
-  assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs));
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, laterInputs), undefined);
+  assert.ok(compactionRequest(tracker.current(), sessionId, target, canonical, baseInputs, declarationsInTranscript).providerRequest);
+  assert.equal(
+    compactionRequest(tracker.current(), sessionId, target, canonical, laterInputs,
+      declarationsInTranscript).providerRequest, undefined);
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt,
     () => ({ payload: { ...wirePayload(), prompt_cache_key: "next-request" }, inputs }));
   assert.equal(tracker.current().providerRequest?.settledInputsKey, undefined);
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs), undefined);
-  assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, inputs));
+  assert.equal(
+    compactionRequest(tracker.current(), sessionId, target, canonical, baseInputs,
+      declarationsInTranscript).providerRequest, undefined);
+  assert.ok(compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript).providerRequest);
   tracker.recordSettledRun(sessionId, target, () => laterInputs);
-  const latest = providerRequestFor(tracker.current(), sessionId, target, canonical, laterInputs);
+  const { providerRequest: latest } = compactionRequest(tracker.current(), sessionId, target, canonical, laterInputs, declarationsInTranscript);
   assert.equal(latest?.fields.prompt_cache_key, "next-request");
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs), undefined);
+  assert.equal(
+    compactionRequest(tracker.current(), sessionId, target, canonical, baseInputs,
+      declarationsInTranscript).providerRequest, undefined);
 });
 
 for (const scope of ["session", "model", "backend", "unsupported model"] as const) {
@@ -614,9 +639,11 @@ for (const scope of ["session", "model", "backend", "unsupported model"] as cons
       : scope === "backend" ? { ...target, identity: { ...target.identity, endpoint: "https://other.example/responses" } } : target;
     tracker.recordSettledRun(scope === "session" ? "other-session" : sessionId, settledTarget, () => baseInputs);
     assert.equal(tracker.current().providerRequest?.settledInputsKey, undefined);
-    assert.equal(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs), undefined);
+    assert.equal(
+      compactionRequest(tracker.current(), sessionId, target, canonical, baseInputs,
+        declarationsInTranscript).providerRequest, undefined);
     tracker.recordSettledRun(sessionId, target, () => baseInputs);
-    assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs));
+    assert.ok(compactionRequest(tracker.current(), sessionId, target, canonical, baseInputs, declarationsInTranscript).providerRequest);
   });
 }
 
@@ -649,13 +676,17 @@ for (const settings of interfaceSettings) {
     const canonical = [system(), user()];
     const tracker = observedRequest(canonical, wirePayload());
     const changed = { ...inputs, settings };
-    assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, changed));
+    assert.ok(compactionRequest(tracker.current(), sessionId, target, canonical, changed, declarationsInTranscript).providerRequest);
     const baseInputs = { ...changed, systemPrompt: "base prompt" };
     tracker.recordSettledRun(sessionId, target, () => baseInputs);
-    assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, baseInputs));
-    assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, { ...baseInputs, settings: inputs.settings }));
+    assert.ok(compactionRequest(tracker.current(), sessionId, target, canonical, baseInputs, declarationsInTranscript).providerRequest);
+    assert.ok(
+      compactionRequest(tracker.current(), sessionId, target, canonical, { ...baseInputs, settings: inputs.settings },
+        declarationsInTranscript).providerRequest);
     const observedWithSetting = observedRequest(canonical, wirePayload(), changed);
-    assert.ok(providerRequestFor(observedWithSetting.current(), sessionId, target, canonical, inputs), "Removing a display setting also preserves reuse");
+    assert.ok(
+      compactionRequest(observedWithSetting.current(), sessionId, target, canonical, inputs,
+        declarationsInTranscript).providerRequest, "Removing a display setting also preserves reuse");
   });
 }
 
@@ -688,10 +719,11 @@ test("a persisted projection-only message rejects both snapshots without duplica
   const projected = [canonical[0], transient, canonical[1]];
   const tracker = preparedTracker(canonical, projected);
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt, () => ({ payload: wirePayload(), inputs }));
-  assert.ok(providerRequestFor(tracker.current(), sessionId, target, canonical, inputs));
+  assert.ok(compactionRequest(tracker.current(), sessionId, target, canonical, inputs, declarationsInTranscript).providerRequest);
   const current: AgentMessage[] = [...canonical, { ...transient, details: { persisted: true }, timestamp: 9 }];
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, current, inputs), undefined);
-  assert.deepEqual(compactionRequest(tracker.current(), sessionId, target, current, declarationsInTranscript).messages, current);
+  const request = compactionRequest(tracker.current(), sessionId, target, current, inputs, declarationsInTranscript);
+  assert.equal(request.providerRequest, undefined);
+  assert.deepEqual(request.messages, current);
 });
 
 test("a reordered repeated source message is not mistaken for a later persisted transient", () => {
@@ -701,8 +733,10 @@ test("a reordered repeated source message is not mistaken for a later persisted 
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt, () => ({ payload: wirePayload(), inputs }));
   const suffix = user("repeat", 3);
   const current = [...canonical, suffix];
-  assert.ok(providerRequestFor(tracker.current(), sessionId, target, current, inputs));
-  assert.deepEqual(compactionRequest(tracker.current(), sessionId, target, current, declarationsInTranscript).messages, [...projected, suffix]);
+  const request = compactionRequest(tracker.current(), sessionId, target, current, inputs, declarationsInTranscript);
+  assert.ok(request.providerRequest?.prefix);
+  const { boundary } = request.providerRequest.prefix;
+  assert.deepEqual(request.messages, [...projected, user(boundary, 0), suffix, user(`${boundary}_END`, 0)]);
 });
 
 test("a projection containing more copies than its source rejects an ambiguous repeated suffix", () => {
@@ -711,6 +745,7 @@ test("a projection containing more copies than its source rejects an ambiguous r
   const tracker = preparedTracker(canonical, projected);
   tracker.recordProviderRequest(sessionId, target, () => canonical, () => inputs.systemPrompt, () => ({ payload: wirePayload(), inputs }));
   const current = [...canonical, user("repeat", 2)];
-  assert.equal(providerRequestFor(tracker.current(), sessionId, target, current, inputs), undefined);
-  assert.deepEqual(compactionRequest(tracker.current(), sessionId, target, current, declarationsInTranscript).messages, current);
+  const request = compactionRequest(tracker.current(), sessionId, target, current, inputs, declarationsInTranscript);
+  assert.equal(request.providerRequest, undefined);
+  assert.deepEqual(request.messages, current);
 });

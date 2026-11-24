@@ -40,7 +40,7 @@ import { requestRemoteCompaction, RemoteCompactionTransientError } from "./remot
 import { requestFallbackCompaction } from "./fallback.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH, loadCompactionSettings, type CompactionConfiguration } from "./fallback-settings.js";
 import { registerCompactionCommand } from "./fallback-command.js";
-import { compactionRequest, providerRequestFor, RequestSnapshotTracker, type ProviderRequestInputs, type RequestSnapshots } from "./request-snapshot.js";
+import { compactionRequest, RequestSnapshotTracker, type ProviderRequestInputs, type RequestSnapshots } from "./request-snapshot.js";
 
 const STATUS_KEY = "codex-compaction";
 const COMPLETION_ENTRY_TYPE = "pi-codex-compaction-completed";
@@ -256,19 +256,16 @@ async function compactRemotely(
     }
     prior = checkpoint.state === "parsed" ? checkpoint.details : undefined;
     const currentMessages = projectedCurrentMessages(event, supported.identity, prior);
-    const inputs = providerRequestInputs(pi, ctx);
-    const providerRequest = providerRequestFor(snapshots, sessionId, supported, currentMessages, inputs);
-    const request = compactionRequest(snapshots, sessionId, supported, currentMessages, {
+    const request = compactionRequest(snapshots, sessionId, supported, currentMessages, providerRequestInputs(pi, ctx), {
       blockImages: settings.images?.blockImages ?? false,
-      systemPrompt: () => ctx.getSystemPrompt(),
       tools: () => activeTools(pi),
-    }, providerRequest);
+    });
     const response = await requestRemoteCompaction({
       modelRegistry: ctx.modelRegistry,
       model: supported.model,
       context: request.context,
       userItemOrigins: userItemOrigins(request.messages),
-      providerRequest,
+      providerRequest: request.providerRequest,
       reasoning,
       sessionId,
       thinkingBudgets: settings.thinkingBudgets,

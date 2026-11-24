@@ -53,13 +53,9 @@ export function snapshotFor<T extends SnapshotScope>(
     sameBackend(snapshot.identity, target.identity) ? snapshot : undefined;
 }
 
-function sourceHead(messages: readonly AgentMessage[]) {
-  return getCurrentSystemMessage(convertToLlm([...messages]));
-}
-
 // Collapse source system state only for matching; the snapshot keeps Pi's actual projected transcript for sending.
 function requestSource(messages: readonly AgentMessage[]): AgentMessage[] {
-  const head = sourceHead(messages);
+  const head = getCurrentSystemMessage(messages);
   const conversation = withoutSystemMessages(messages);
   return head ? [head, ...conversation] : conversation;
 }
@@ -94,7 +90,7 @@ export function capturePromptOverride(
   target: CapableModel,
   text: string,
 ): PromptOverride | undefined {
-  const head = sourceHead(canonical);
+  const head = getCurrentSystemMessage(canonical);
   if (!head || text === getSystemMessageText(head)) return undefined;
   return { sessionId, identity: target.identity, sourceFingerprint: fingerprintMessage(head), text };
 }
@@ -107,7 +103,7 @@ export function promptOverrideFor(
   currentPrompt: string,
 ): PromptOverride | undefined {
   const scoped = snapshotFor(override, sessionId, target);
-  const head = scoped && sourceHead(messages);
+  const head = scoped && getCurrentSystemMessage(messages);
   return head && fingerprintMessage(head) === scoped.sourceFingerprint &&
     (currentPrompt === scoped.text || currentPrompt === getSystemMessageText(head)) ? scoped : undefined;
 }
@@ -237,18 +233,6 @@ function captureProviderRequest(
       input: structuredClone(payload.input), contextual: payload.input.map((item) => contextual.has(item)),
     },
   };
-}
-
-/** Reuse the wire prompt and request parameters only with an unchanged source prefix and configuration. */
-export function providerRequestFor(
-  snapshots: RequestSnapshots, sessionId: string, target: CapableModel, current: readonly AgentMessage[], inputs: ProviderRequestInputs,
-): ProviderRequestSnapshot | undefined {
-  const snapshot = snapshotFor(snapshots.providerRequest, sessionId, target);
-  const override = promptOverrideFor(snapshots.promptOverride, sessionId, target, current, inputs.systemPrompt);
-  const effectiveInputs = override ? { ...inputs, systemPrompt: override.text } : inputs;
-  const key = requestInputsKey(target, effectiveInputs);
-  return snapshot && matchingProjectionSource(current, snapshot) &&
-    (snapshot.inputsKey === key || snapshot.settledInputsKey === key) ? snapshot : undefined;
 }
 
 /** Marks the end of the transcript; Pi serializes request-level items after it. */
@@ -398,9 +382,8 @@ export class RequestSnapshotTracker {
 }
 
 /** Pi's internal declarations let the provider serialize historical grammar tool calls correctly. */
-export interface RequestDeclarations {
+interface RequestDeclarations {
   readonly blockImages: boolean;
-  readonly systemPrompt: () => string;
   readonly tools: () => Tool[];
 }
 
@@ -426,10 +409,16 @@ export function compactionRequest(
   sessionId: string,
   target: CapableModel,
   current: AgentMessage[],
+  inputs: ProviderRequestInputs,
   declarations: RequestDeclarations,
-  providerRequest?: ProviderRequestSnapshot,
-): { readonly context: Context; readonly messages: AgentMessage[] } {
-  const override = snapshots.promptOverride && promptOverrideFor(snapshots.promptOverride, sessionId, target, current, declarations.systemPrompt());
+): { readonly context: Context; readonly messages: AgentMessage[]; readonly providerRequest: ProviderRequestSnapshot | undefined } {
+  const snapshot = snapshotFor(snapshots.providerRequest, sessionId, target);
+  const override = promptOverrideFor(snapshots.promptOverride, sessionId, target, current, inputs.systemPrompt);
+  const effectiveInputs = override ? { ...inputs, systemPrompt: override.text } : inputs;
+  const key = requestInputsKey(target, effectiveInputs);
+  const providerRequest = snapshot && matchingProjectionSource(current, snapshot) &&
+    (snapshot.inputsKey === key || snapshot.settledInputsKey === key) ? snapshot : undefined;
+
   const reused = reuseContextSnapshot(current, snapshotFor(snapshots.context, sessionId, target));
   // The provider serializes the full transcript so grammar declarations and historical IDs keep their context.
   // Private user items mark the join and the transcript end; applyProviderRequest removes both,
@@ -444,10 +433,11 @@ export function compactionRequest(
   const converted = convertToLlm(messages);
   const llmMessages = declarations.blockImages ? withoutImages(converted) : converted;
   const overridden = override && applyPromptOverride(llmMessages, override);
-  if (overridden) return { context: { messages: overridden }, messages };
-  if (llmMessages.some((message) => message.role === "system")) return { context: { messages: llmMessages }, messages };
+  if (overridden) return { context: { messages: overridden }, messages, providerRequest };
+  if (llmMessages.some((message) => message.role === "system")) return { context: { messages: llmMessages }, messages, providerRequest };
   return {
-    context: { systemPrompt: declarations.systemPrompt(), messages: llmMessages, tools: declarations.tools() },
+    context: { systemPrompt: inputs.systemPrompt, messages: llmMessages, tools: declarations.tools() },
     messages,
+    providerRequest,
   };
 }

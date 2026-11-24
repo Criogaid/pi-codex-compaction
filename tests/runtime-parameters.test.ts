@@ -10,7 +10,7 @@ import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-code
 import { closeOpenAICodexWebSocketSessions } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { capableModel } from "../src/capability.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
-import { compactionRequest, providerRequestFor, RequestSnapshotTracker, type ProviderRequestInputs } from "../src/request-snapshot.js";
+import { compactionRequest, RequestSnapshotTracker, type ProviderRequestInputs } from "../src/request-snapshot.js";
 import { requestRemoteCompaction } from "../src/remote.js";
 import { testRegistry } from "./helpers.js";
 
@@ -138,13 +138,11 @@ test("V2 preserves Pi effort updates in checkpoint input and across retries", as
   assert.ok(observed && Array.isArray(observed.input));
   assert.deepEqual(observed.input.at(-1), update);
   const current = [...canonical, { ...assistant, content: [{ type: "text" as const, text: "reply" }], timestamp: 2 }];
-  const snapshot = providerRequestFor(tracker.current(), sessionId, target, current, inputs);
-  assert.ok(snapshot?.prefix);
-  const request = compactionRequest(tracker.current(), sessionId, target, current,
-    { blockImages: false, systemPrompt: () => inputs.systemPrompt, tools: () => [] }, snapshot);
+  const request = compactionRequest(tracker.current(), sessionId, target, current, inputs, { blockImages: false, tools: () => [] });
+  assert.ok(request.providerRequest?.prefix);
   const attempts: JsonObject[] = [];
   const result = await requestRemoteCompaction({
-    modelRegistry: registry, model, context: request.context, providerRequest: snapshot,
+    modelRegistry: registry, model, context: request.context, providerRequest: request.providerRequest,
     reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 1, maxRetryDelayMs: 1,
     fetch: async (input, init) => {
       const request = new Request(input, init);
