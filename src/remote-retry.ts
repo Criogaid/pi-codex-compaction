@@ -112,11 +112,10 @@ class SseEvidenceObserver {
   private oversized = false;
   constructor(private readonly attempt: CompactionAttempt, private readonly api: Api) {}
 
-  feed(bytes: Uint8Array): number[] | undefined {
-    let cuts: number[] | undefined;
-    let start = 0;
-    if (bytes.length && this.skipLf) {
-      if (bytes[0] === LF) start++;
+  recordEnd(bytes: Uint8Array, offset: number): number {
+    let start = offset;
+    if (start < bytes.length && this.skipLf) {
+      if (bytes[start] === LF) start++;
       this.skipLf = false;
     }
     for (let i = start; i < bytes.length; i++) {
@@ -131,13 +130,13 @@ class SseEvidenceObserver {
         else this.skipLf = i + 1 === bytes.length;
       }
       start = i + 1;
-      if (blank && start < bytes.length) (cuts ??= []).push(start);
+      if (blank) return start;
     }
     if (start < bytes.length) {
       this.lineHasBytes = true;
       this.append(bytes.subarray(start), false);
     }
-    return cuts;
+    return bytes.length;
   }
 
   private append(bytes: Uint8Array, endsLine: boolean): void {
@@ -266,9 +265,7 @@ export class CompactionAttempt {
       } else errorBody += text;
     };
     let chunk: Uint8Array | undefined;
-    let cuts: number[] | undefined;
     let offset = 0;
-    let nextCut = 0;
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         abort = () => {
@@ -309,19 +306,15 @@ export class CompactionAttempt {
               return;
             }
             chunk = result.value;
-            // Keep retry evidence at the network-chunk boundary, even when the SDK throws before Pi sees the event.
-            if (sse) cuts = sse.feed(chunk);
-            else inspectErrorBody(decoder.decode(chunk, { stream: true }));
+            if (!sse) inspectErrorBody(decoder.decode(chunk, { stream: true }));
           }
-          const cut = cuts?.[nextCut++];
-          if (cut !== undefined) {
-            controller.enqueue(chunk.subarray(offset, cut));
-            offset = cut;
-            return;
-          }
-          controller.enqueue(offset ? chunk.subarray(offset) : chunk);
-          chunk = undefined;
-          offset = nextCut = 0;
+          // Observe each record before delivery: the SDK can intercept named errors before Pi sees them.
+          const end = sse?.recordEnd(chunk, offset) ?? chunk.length;
+          controller.enqueue(offset === 0 && end === chunk.length ? chunk : chunk.subarray(offset, end));
+          if (end === chunk.length) {
+            chunk = undefined;
+            offset = 0;
+          } else offset = end;
         } catch (error) {
           if (closed) return;
           this.fetchFailed(error);
