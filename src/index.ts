@@ -217,7 +217,6 @@ async function compactRemotely(
   ctx: ExtensionContext,
   run: CompactionRun,
   supported: CapableModel,
-  fetch: typeof globalThis.fetch | undefined,
   snapshots: RequestSnapshots,
 ) {
   const { sessionId, signal } = run;
@@ -272,7 +271,6 @@ async function compactRemotely(
             contextualFrom: prior.replacementHistory.length,
           }
         : undefined,
-      fetch,
     });
     if (!run.owned()) return { cancel: true };
     const retention = prepareRetention(response.promptInput, signal, {
@@ -316,187 +314,180 @@ async function compactRemotely(
   }
 }
 
-export function createCodexCompactionExtension(
-  options: { fetch?: typeof globalThis.fetch } = {},
-): (pi: ExtensionAPI) => void {
-  return (pi) => {
-    const compactionSettingsPath = resolve(getAgentDir(), COMPACTION_SETTINGS_RELATIVE_PATH);
-    registerCompactionCommand(pi, compactionSettingsPath);
-    const warnings = new Set<string>();
-    const snapshots = new RequestSnapshotTracker();
-    let latestRun = 0;
-    let live = true;
-    const warnOnce = (ctx: ExtensionContext, key: string, message: string) => {
-      const scoped = `${ctx.sessionManager.getSessionId()}:${key}`;
-      if (warnings.has(scoped)) return;
-      warnings.add(scoped);
-      if (ctx.hasUI) ctx.ui.notify(message, "warning");
-    };
-
-    pi.registerEntryRenderer<CompletionEntryData>(
-      COMPLETION_ENTRY_TYPE,
-      (entry, _options, theme) => {
-        const message = entry.data?.message;
-        return typeof message === "string"
-          ? new Text(theme.fg("success", message), 1, 0)
-          : undefined;
-      },
-    );
-
-    pi.on("session_start", () => {
-      warnings.clear();
-      snapshots.reset();
-    });
-
-    pi.on("session_before_compact", async (event, ctx) => {
-      if (!live) return { cancel: true };
-      const runNumber = ++latestRun;
-      const sessionId = ctx.sessionManager.getSessionId();
-      const { signal } = event;
-      const sameSession = () => live && ctx.sessionManager.getSessionId() === sessionId;
-      const ownsStatus = () => runNumber === latestRun && sameSession();
-      // A model switch leaves the run on its starting model, as in Pi's compaction.
-      const owned = () => !signal.aborted && sameSession();
-      try {
-        const { fetch } = options;
-        const requestSnapshots = snapshots.current();
-        const supported = capableModel(ctx.model);
-        if (!owned()) return { cancel: true };
-        let configuration: CompactionConfiguration;
-        try {
-          configuration = (await loadCompactionSettings(compactionSettingsPath)).configuration;
-        } catch (error) {
-          if (owned() && ctx.hasUI) {
-            ctx.ui.notify(`Could not read compaction settings; compaction stopped. ${errorMessage(error)}`, "error");
-          }
-          return { cancel: true };
-        }
-        if (!owned()) return { cancel: true };
-
-        const run: CompactionRun = {
-          sessionId,
-          signal,
-          owned,
-          setStatus(message) {
-            if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, message);
-          },
-          summarize(input, remoteError) {
-            let announced = false;
-            return requestFallbackCompaction({
-              ...input,
-              summaryModel: configuration.summaryModel,
-              modelRegistry: ctx.modelRegistry,
-              settings: pi.getSettings(),
-              customInstructions: event.customInstructions,
-              signal,
-              sessionId,
-              onPrepared: ({ model, thinkingLevel }) => {
-                if (!run.owned()) throw new Error("Compaction session changed");
-                if (announced) return;
-                announced = true;
-                run.setStatus("Pi fallback compaction...");
-                if (!ctx.hasUI) return;
-                if (remoteError !== undefined) {
-                  ctx.ui.notify(`Codex remote compaction failed; using the configured summary model. ${errorMessage(remoteError)}`, "warning");
-                }
-                ctx.ui.notify(`Using Pi text compaction with ${model.provider}/${model.id} (${thinkingLevel}).`, "info");
-              },
-            });
-          },
-        };
-
-        const result = configuration.remoteCompactionEnabled && supported
-          ? await compactRemotely(pi, event, ctx, run, supported, fetch, requestSnapshots)
-          : await compactFallback(event, ctx, run, undefined);
-        return owned() ? result : { cancel: true };
-      } finally {
-        if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, undefined);
-      }
-    });
-
-    pi.on("session_compact", async (event, ctx) => {
-      if (!event.fromExtension) return;
-      const details = parseCheckpointDetails(event.compactionEntry.details);
-      if (!details) return;
-      pi.appendEntry<CompletionEntryData>(COMPLETION_ENTRY_TYPE, {
-        message: details.version === 2
-          ? `Layered text fallback completed for ${details.provider}/${details.modelId}.`
-          : `Codex Remote Compaction V2 completed for ${details.provider}/${details.modelId}.`,
-        protocol: REMOTE_COMPACTION_PROTOCOL,
-        checkpointId: details.checkpointId,
-      });
-      // The model may have switched to another backend while compaction ran.
-      if (await compatibleIdentity(details, ctx)) return;
-      warnOnce(ctx, `${details.checkpointId}:backend`, INCOMPATIBLE_BACKEND_WARNING);
-    });
-
-    pi.on("context", (_event, ctx) => {
-      snapshots.recordContext(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => canonicalMessages(ctx));
-    });
-
-    // Pi runs every extension's `context` handlers first, so none of them sees the marker and load order cannot
-    // change the projection. Later `context_with_system` handlers still see and can change it.
-    pi.on("context_with_system", async (event, ctx) => {
-      let messages: AgentMessage[] | undefined;
-      const checkpoint = activeCheckpoint(ctx);
-      if (checkpoint && await compatibleIdentity(checkpoint, ctx)) {
-        messages = projectCheckpointTranscript(event.messages, canonicalMessages(ctx), checkpoint);
-        if (!messages) {
-          snapshots.reset();
-          warnOnce(ctx, `${checkpoint.checkpointId}:projection`,
-            "The active Codex checkpoint no longer matches this request's retained messages, so its opaque history is not replayed.");
-        }
-      }
-      snapshots.recordProjectedRequest(
-        ctx.sessionManager.getSessionId(),
-        capableModel(ctx.model),
-        () => canonicalMessages(ctx),
-        () => activeCheckpoint(ctx),
-        messages ?? event.messages,
-        messages !== undefined,
-      );
-      return messages ? { messages } : undefined;
-    });
-
-    pi.on("before_provider_request", async (event, ctx) => {
-      let replay: "applied" | "skipped" | "failed" = "failed";
-      try {
-        const payload = await replayCheckpoint(event.payload, ctx, pi.getSettings().images?.blockImages ?? false);
-        replay = payload === undefined ? "skipped" : "applied";
-        return payload;
-      } finally {
-        // Pi continues the ordinary request after a hook throws, so publish this turn even on replay failure.
-        try {
-          snapshots.recordProviderRequest(
-            ctx.sessionManager.getSessionId(),
-            capableModel(ctx.model),
-            () => canonicalMessages(ctx),
-            () => ctx.getSystemPrompt(),
-            () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx), replay }),
-          );
-        } catch (error) {
-          warnOnce(ctx, "request-snapshot", `Could not record the provider request snapshot. ${errorMessage(error)}`);
-        }
-      }
-    });
-
-    pi.on("agent_settled", (_event, ctx) => {
-      snapshots.recordSettledRun(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => providerRequestInputs(pi, ctx));
-    });
-
-    pi.on("model_select", async (event, ctx) => {
-      const checkpoint = activeCheckpoint(ctx);
-      if (!checkpoint || await compatibleIdentity(checkpoint, ctx, event.model)) return;
-      warnOnce(ctx, `${checkpoint.checkpointId}:${event.model.provider}:${event.model.id}`, INCOMPATIBLE_BACKEND_WARNING);
-    });
-
-    pi.on("session_shutdown", (_event, ctx) => {
-      live = false;
-      warnings.clear();
-      snapshots.reset();
-      ctx.ui.setStatus(STATUS_KEY, undefined);
-    });
+export default function codexCompaction(pi: ExtensionAPI): void {
+  const compactionSettingsPath = resolve(getAgentDir(), COMPACTION_SETTINGS_RELATIVE_PATH);
+  registerCompactionCommand(pi, compactionSettingsPath);
+  const warnings = new Set<string>();
+  const snapshots = new RequestSnapshotTracker();
+  let latestRun = 0;
+  let live = true;
+  const warnOnce = (ctx: ExtensionContext, key: string, message: string) => {
+    const scoped = `${ctx.sessionManager.getSessionId()}:${key}`;
+    if (warnings.has(scoped)) return;
+    warnings.add(scoped);
+    if (ctx.hasUI) ctx.ui.notify(message, "warning");
   };
-}
 
-export default createCodexCompactionExtension();
+  pi.registerEntryRenderer<CompletionEntryData>(
+    COMPLETION_ENTRY_TYPE,
+    (entry, _options, theme) => {
+      const message = entry.data?.message;
+      return typeof message === "string"
+        ? new Text(theme.fg("success", message), 1, 0)
+        : undefined;
+    },
+  );
+
+  pi.on("session_start", () => {
+    warnings.clear();
+    snapshots.reset();
+  });
+
+  pi.on("session_before_compact", async (event, ctx) => {
+    if (!live) return { cancel: true };
+    const runNumber = ++latestRun;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const { signal } = event;
+    const sameSession = () => live && ctx.sessionManager.getSessionId() === sessionId;
+    const ownsStatus = () => runNumber === latestRun && sameSession();
+    // A model switch leaves the run on its starting model, as in Pi's compaction.
+    const owned = () => !signal.aborted && sameSession();
+    try {
+      const requestSnapshots = snapshots.current();
+      const supported = capableModel(ctx.model);
+      if (!owned()) return { cancel: true };
+      let configuration: CompactionConfiguration;
+      try {
+        configuration = (await loadCompactionSettings(compactionSettingsPath)).configuration;
+      } catch (error) {
+        if (owned() && ctx.hasUI) {
+          ctx.ui.notify(`Could not read compaction settings; compaction stopped. ${errorMessage(error)}`, "error");
+        }
+        return { cancel: true };
+      }
+      if (!owned()) return { cancel: true };
+
+      const run: CompactionRun = {
+        sessionId,
+        signal,
+        owned,
+        setStatus(message) {
+          if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, message);
+        },
+        summarize(input, remoteError) {
+          let announced = false;
+          return requestFallbackCompaction({
+            ...input,
+            summaryModel: configuration.summaryModel,
+            modelRegistry: ctx.modelRegistry,
+            settings: pi.getSettings(),
+            customInstructions: event.customInstructions,
+            signal,
+            sessionId,
+            onPrepared: ({ model, thinkingLevel }) => {
+              if (!run.owned()) throw new Error("Compaction session changed");
+              if (announced) return;
+              announced = true;
+              run.setStatus("Pi fallback compaction...");
+              if (!ctx.hasUI) return;
+              if (remoteError !== undefined) {
+                ctx.ui.notify(`Codex remote compaction failed; using the configured summary model. ${errorMessage(remoteError)}`, "warning");
+              }
+              ctx.ui.notify(`Using Pi text compaction with ${model.provider}/${model.id} (${thinkingLevel}).`, "info");
+            },
+          });
+        },
+      };
+
+      const result = configuration.remoteCompactionEnabled && supported
+        ? await compactRemotely(pi, event, ctx, run, supported, requestSnapshots)
+        : await compactFallback(event, ctx, run, undefined);
+      return owned() ? result : { cancel: true };
+    } finally {
+      if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, undefined);
+    }
+  });
+
+  pi.on("session_compact", async (event, ctx) => {
+    if (!event.fromExtension) return;
+    const details = parseCheckpointDetails(event.compactionEntry.details);
+    if (!details) return;
+    pi.appendEntry<CompletionEntryData>(COMPLETION_ENTRY_TYPE, {
+      message: details.version === 2
+        ? `Layered text fallback completed for ${details.provider}/${details.modelId}.`
+        : `Codex Remote Compaction V2 completed for ${details.provider}/${details.modelId}.`,
+      protocol: REMOTE_COMPACTION_PROTOCOL,
+      checkpointId: details.checkpointId,
+    });
+    // The model may have switched to another backend while compaction ran.
+    if (await compatibleIdentity(details, ctx)) return;
+    warnOnce(ctx, `${details.checkpointId}:backend`, INCOMPATIBLE_BACKEND_WARNING);
+  });
+
+  pi.on("context", (_event, ctx) => {
+    snapshots.recordContext(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => canonicalMessages(ctx));
+  });
+
+  // Pi runs every extension's `context` handlers first, so none of them sees the marker and load order cannot
+  // change the projection. Later `context_with_system` handlers still see and can change it.
+  pi.on("context_with_system", async (event, ctx) => {
+    let messages: AgentMessage[] | undefined;
+    const checkpoint = activeCheckpoint(ctx);
+    if (checkpoint && await compatibleIdentity(checkpoint, ctx)) {
+      messages = projectCheckpointTranscript(event.messages, canonicalMessages(ctx), checkpoint);
+      if (!messages) {
+        snapshots.reset();
+        warnOnce(ctx, `${checkpoint.checkpointId}:projection`,
+          "The active Codex checkpoint no longer matches this request's retained messages, so its opaque history is not replayed.");
+      }
+    }
+    snapshots.recordProjectedRequest(
+      ctx.sessionManager.getSessionId(),
+      capableModel(ctx.model),
+      () => canonicalMessages(ctx),
+      () => activeCheckpoint(ctx),
+      messages ?? event.messages,
+      messages !== undefined,
+    );
+    return messages ? { messages } : undefined;
+  });
+
+  pi.on("before_provider_request", async (event, ctx) => {
+    let replay: "applied" | "skipped" | "failed" = "failed";
+    try {
+      const payload = await replayCheckpoint(event.payload, ctx, pi.getSettings().images?.blockImages ?? false);
+      replay = payload === undefined ? "skipped" : "applied";
+      return payload;
+    } finally {
+      // Pi continues the ordinary request after a hook throws, so publish this turn even on replay failure.
+      try {
+        snapshots.recordProviderRequest(
+          ctx.sessionManager.getSessionId(),
+          capableModel(ctx.model),
+          () => canonicalMessages(ctx),
+          () => ctx.getSystemPrompt(),
+          () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx), replay }),
+        );
+      } catch (error) {
+        warnOnce(ctx, "request-snapshot", `Could not record the provider request snapshot. ${errorMessage(error)}`);
+      }
+    }
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    snapshots.recordSettledRun(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => providerRequestInputs(pi, ctx));
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    const checkpoint = activeCheckpoint(ctx);
+    if (!checkpoint || await compatibleIdentity(checkpoint, ctx, event.model)) return;
+    warnOnce(ctx, `${checkpoint.checkpointId}:${event.model.provider}:${event.model.id}`, INCOMPATIBLE_BACKEND_WARNING);
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    live = false;
+    warnings.clear();
+    snapshots.reset();
+    ctx.ui.setStatus(STATUS_KEY, undefined);
+  });
+}

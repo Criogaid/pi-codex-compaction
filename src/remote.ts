@@ -47,7 +47,6 @@ export interface RemoteCompactionRequest {
   };
   providerRequest?: ProviderRequestSnapshot;
   onPrepared?: () => void;
-  fetch?: typeof globalThis.fetch;
 }
 
 export interface RemoteCompactionResponse {
@@ -92,7 +91,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   const retries = compactionRetryLimit(request.maxRetries);
   let prepared: (Pick<RemoteCompactionResponse, "promptInput" | "images" | "contextual"> & { readonly body: CompactionPayload }) | undefined;
   let identity: ProviderIdentity | undefined;
-  const baseFetch = request.fetch ?? globalThis.fetch;
+  const baseFetch = globalThis.fetch;
   for (let retry = 0; ; retry++) {
     request.signal.throwIfAborted();
     const attempt = new CompactionAttempt(model.api);
