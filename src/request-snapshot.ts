@@ -105,7 +105,14 @@ function matchingProjectionSuffix(messages: readonly AgentMessage[], snapshot: P
 function reuseContextSnapshot(
   messages: AgentMessage[], snapshot: ContextSnapshot | undefined, suffix: AgentMessage[] | undefined, forced: string | undefined,
 ): AgentMessage[] {
-  if (!snapshot || !suffix) return messages;
+  if (!snapshot) return messages;
+  if (!suffix) {
+    if (forced === undefined) return messages;
+    // The projection overlaps the new tail, so rebuild from the transcript and fold only its validated prefix.
+    const prefix = messages.slice(0, snapshot.sourceFingerprints.length);
+    const head = forcedSystemHead(getCurrentSystemMessage(prefix), forced);
+    return [head, ...withoutSystemMessages(prefix), ...messages.slice(prefix.length)];
+  }
   if (forced !== undefined) {
     const head = forcedSystemHead(getCurrentSystemMessage(snapshot.messages), forced);
     return [...structuredClone([head, ...withoutSystemMessages(snapshot.messages)]), ...suffix];
@@ -447,7 +454,7 @@ export function compactionRequest(
 ): { readonly context: Context; readonly messages: AgentMessage[]; readonly providerRequest: ProviderRequestSnapshot | undefined } {
   const contextSnapshot = snapshotFor(snapshots.context, sessionId, target);
   const contextSuffix = contextSnapshot && matchingProjectionSuffix(current, contextSnapshot);
-  const sampled = contextSuffix && snapshots.promptOverride;
+  const sampled = contextSnapshot && matchesSourcePrefix(current, contextSnapshot) ? snapshots.promptOverride : undefined;
   const forced = sampled && (inputs.systemPrompt === sampled.text || inputs.systemPrompt === sampled.sourcePrompt)
     ? sampled.text : undefined;
   const reused = reuseContextSnapshot(current, contextSnapshot, contextSuffix, forced);
