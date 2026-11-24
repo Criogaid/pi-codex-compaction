@@ -23,18 +23,18 @@ for (const { name, value } of [
   test(`save without a summaryModel field preserves the ${name} value verbatim`, async () => {
     await writeSettings({ version: 2, summaryModel: value });
     const settings = await loadCompactionSettings(settingsPath);
-    await settings.save({ remoteCompactionEnabled: false });
+    await settings.save({ remoteCompactionEnabled: false, reasoningEffortUpdatesEnabled: true });
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-      version: 2, remoteCompaction: { enabled: false }, summaryModel: value,
+      version: 2, remoteCompaction: { enabled: false }, reasoningEffortUpdates: { enabled: true }, summaryModel: value,
     });
   });
 
   test(`save with explicit undefined removes the ${name} summaryModel`, async () => {
     await writeSettings({ version: 2, summaryModel: value });
     const settings = await loadCompactionSettings(settingsPath);
-    await settings.save({ remoteCompactionEnabled: false, summaryModel: undefined });
+    await settings.save({ remoteCompactionEnabled: false, reasoningEffortUpdatesEnabled: false, summaryModel: undefined });
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-      version: 2, remoteCompaction: { enabled: false },
+      version: 2, remoteCompaction: { enabled: false }, reasoningEffortUpdates: { enabled: false },
     });
     assert.equal((await loadCompactionSettings(settingsPath)).configuration.summaryModel, undefined);
   });
@@ -53,20 +53,23 @@ test("lazy summary-model validation does not prevent preserving the invalid fiel
       return true;
     });
   }
-  await settings.save({ remoteCompactionEnabled: false });
+  await settings.save({ remoteCompactionEnabled: false, reasoningEffortUpdatesEnabled: false });
   assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-    version: 2, remoteCompaction: { enabled: false }, summaryModel: invalid,
+    version: 2, remoteCompaction: { enabled: false }, reasoningEffortUpdates: { enabled: false }, summaryModel: invalid,
   });
 });
 
 for (const remoteCompactionEnabled of [true, false]) {
-  test(`v2 summary model round-trips independently of V2 enabled=${remoteCompactionEnabled}`, async () => {
+  test(`v2 switches and summary model round-trip with V2 enabled=${remoteCompactionEnabled}`, async () => {
+    const reasoningEffortUpdatesEnabled = !remoteCompactionEnabled;
     const settings = await loadCompactionSettings(settingsPath);
-    assert.deepEqual(settings.configuration, { remoteCompactionEnabled: true, summaryModel: undefined });
-    await settings.save({ remoteCompactionEnabled, summaryModel });
-    assert.deepEqual((await loadCompactionSettings(settingsPath)).configuration, { remoteCompactionEnabled, summaryModel });
+    assert.deepEqual(settings.configuration, { remoteCompactionEnabled: true, reasoningEffortUpdatesEnabled: false, summaryModel: undefined });
+    const selection = { remoteCompactionEnabled, reasoningEffortUpdatesEnabled, summaryModel };
+    await settings.save(selection);
+    assert.deepEqual((await loadCompactionSettings(settingsPath)).configuration, selection);
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-      version: 2, remoteCompaction: { enabled: remoteCompactionEnabled }, summaryModel,
+      version: 2, remoteCompaction: { enabled: remoteCompactionEnabled },
+      reasoningEffortUpdates: { enabled: reasoningEffortUpdatesEnabled }, summaryModel,
     });
     assert.deepEqual(await readdir(dirname(settingsPath)), ["config.json"]);
   });
@@ -85,12 +88,13 @@ for (const { name, fallback, expected } of [
   test(`v1 ${name} migrates on the next save without retaining fallback`, async () => {
     await writeSettings({ version: 1, remoteCompaction: { enabled: false }, fallback });
     const settings = await loadCompactionSettings(settingsPath);
-    assert.deepEqual(settings.configuration, { remoteCompactionEnabled: false, summaryModel: expected });
-    await settings.save({ remoteCompactionEnabled: true });
+    assert.deepEqual(settings.configuration, { remoteCompactionEnabled: false, reasoningEffortUpdatesEnabled: false, summaryModel: expected });
+    await settings.save({ remoteCompactionEnabled: true, reasoningEffortUpdatesEnabled: false });
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-      version: 2, remoteCompaction: { enabled: true }, ...(expected === undefined ? {} : { summaryModel: expected }),
+      version: 2, remoteCompaction: { enabled: true }, reasoningEffortUpdates: { enabled: false },
+      ...(expected === undefined ? {} : { summaryModel: expected }),
     });
-    assert.deepEqual((await loadCompactionSettings(settingsPath)).configuration, { remoteCompactionEnabled: true, summaryModel: expected });
+    assert.deepEqual((await loadCompactionSettings(settingsPath)).configuration, { remoteCompactionEnabled: true, reasoningEffortUpdatesEnabled: false, summaryModel: expected });
   });
 }
 
@@ -100,11 +104,11 @@ for (const fallback of [null, "invalid", { enabled: "yes", ...summaryModel }, { 
     const settings = await loadCompactionSettings(settingsPath);
     assert.equal(settings.configuration.remoteCompactionEnabled, true);
     assert.throws(() => settings.configuration.summaryModel);
-    await settings.save({ remoteCompactionEnabled: false });
+    await settings.save({ remoteCompactionEnabled: false, reasoningEffortUpdatesEnabled: false });
     const raw = typeof fallback === "object" && fallback !== null && fallback.enabled === true
       ? { provider: fallback.provider } : fallback;
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-      version: 2, remoteCompaction: { enabled: false }, summaryModel: raw,
+      version: 2, remoteCompaction: { enabled: false }, reasoningEffortUpdates: { enabled: false }, summaryModel: raw,
     });
     const migrated = await loadCompactionSettings(settingsPath);
     assert.throws(() => migrated.configuration.summaryModel);
@@ -126,3 +130,31 @@ for (const invalid of [
     assert.equal(await readFile(settingsPath, "utf8"), original);
   });
 }
+
+test("omitting the effort switch from v2 defaults it to Off", async () => {
+  await writeSettings({ version: 2 });
+  assert.equal((await loadCompactionSettings(settingsPath)).configuration.reasoningEffortUpdatesEnabled, false);
+});
+
+for (const value of [true, null, [], {}, { enabled: "yes" }, { enabled: true, extra: false }]) {
+  test(`v2 rejects malformed reasoningEffortUpdates ${JSON.stringify(value)}`, async () => {
+    await writeSettings({ version: 2, reasoningEffortUpdates: value });
+    await assert.rejects(loadCompactionSettings(settingsPath), /reasoningEffortUpdates must be an object with a boolean enabled field/);
+  });
+}
+
+for (const [version, error] of [
+  [1, /Version 1.*version and optional remoteCompaction and fallback fields/],
+  [3, /version must be 2/],
+  [undefined, /version must be 2/],
+] as const) {
+  test(`reasoningEffortUpdates rejects version ${version}`, async () => {
+    await writeSettings({ version, reasoningEffortUpdates: { enabled: true } });
+    await assert.rejects(loadCompactionSettings(settingsPath), error);
+  });
+}
+
+test("the v2 unknown-key error lists reasoningEffortUpdates among the allowed fields", async () => {
+  await writeSettings({ version: 2, extra: true });
+  await assert.rejects(loadCompactionSettings(settingsPath), /version.*remoteCompaction.*reasoningEffortUpdates.*summaryModel/);
+});

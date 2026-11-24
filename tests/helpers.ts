@@ -10,7 +10,7 @@ import { InMemoryCredentialStore, InMemoryModelsStore, type Api, type AuthResult
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { isObject, type JsonObject } from "../src/protocol.js";
+import { isObject, isObjectArray, type CompactionPayload, type JsonObject } from "../src/protocol.js";
 
 export const fixtureImage: ImageContent = { type: "image", mimeType: "image/png",
   data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==" };
@@ -22,6 +22,24 @@ export async function testRegistry(provider: Provider, resolve: () => Promise<Au
   });
   runtime.registerNativeProvider({ ...provider, auth: { apiKey: { name: "Fixture", resolve } } });
   return new ModelRegistry(runtime);
+}
+
+// Pi 1.0.4 predates the effort updates emitted by newer Responses adapters.
+export function withResponsesPayloadHook(
+  provider: Provider,
+  simulate: (payload: CompactionPayload, effort: string | undefined) => CompactionPayload,
+): Provider {
+  return { ...provider,
+    streamSimple(model, context, options) {
+      return provider.streamSimple(model, context, { ...options,
+        onPayload: async (payload, preparedModel) => {
+          assert.ok(isObject(payload) && isObjectArray(payload.input));
+          const simulated = simulate({ ...payload, input: payload.input }, options?.reasoning);
+          return await options?.onPayload?.(simulated, preparedModel) ?? simulated;
+        },
+      });
+    },
+  };
 }
 
 // Overlapping overrides in one process must be disposed in reverse order.
@@ -46,6 +64,7 @@ export function isolateAgentConfig(): string {
 
 export interface SessionRequest {
   readonly payload: JsonObject;
+  readonly bodyBytes: Buffer;
   readonly headers: Headers;
   readonly url: string;
 }
@@ -54,6 +73,7 @@ export interface SessionRequest {
 export async function sessionFixture(options: {
   readonly api?: "openai-responses" | "openai-codex-responses";
   readonly extensions: readonly ExtensionFactory[];
+  readonly serializePayload?: Parameters<typeof withResponsesPayloadHook>[1];
   readonly models?: (base: Model<Api>) => readonly Model<Api>[];
   readonly settings?: Parameters<typeof SettingsManager.inMemory>[0];
   readonly respond?: (request: SessionRequest) => Response | undefined | Promise<Response | undefined>;
@@ -78,7 +98,7 @@ export async function sessionFixture(options: {
     const body = request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
     const payload: unknown = JSON.parse(body.toString("utf8"));
     assert.ok(isObject(payload));
-    const recorded = { payload, headers: request.headers, url: request.url };
+    const recorded = { payload, bodyBytes: bytes, headers: request.headers, url: request.url };
     requests.push(recorded);
     const response = await options.respond?.(recorded);
     if (response) return response;
@@ -108,8 +128,9 @@ export async function sessionFixture(options: {
     modelsPath: null, refreshOnCreate: false,
   });
   const accessToken = `fixture.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.signature`;
+  const adapter = options.serializePayload ? withResponsesPayloadHook(provider, options.serializePayload) : provider;
   runtime.registerNativeProvider({
-    ...provider, getModels: () => [...models], getAllModels: () => [...models],
+    ...adapter, getModels: () => [...models], getAllModels: () => [...models],
     auth: { apiKey: { name: "Fixture", resolve: async () => ({ auth: { apiKey: accessToken } }) } },
   });
   const settingsManager = SettingsManager.inMemory({

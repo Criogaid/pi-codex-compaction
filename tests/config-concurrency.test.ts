@@ -18,7 +18,7 @@ const settings = await loadCompactionSettings(process.argv[2]);
 const model = process.argv[3];
 process.once("message", async () => {
   try {
-    await settings.save({ remoteCompactionEnabled: false,
+    await settings.save({ remoteCompactionEnabled: false, reasoningEffortUpdatesEnabled: false,
       summaryModel: { provider: "fixture", model, thinkingLevel: "off" } });
     process.send({ ok: true, model });
   } catch (error) {
@@ -100,7 +100,7 @@ for (const existing of [true, false]) {
     assert.equal(conflicted.length, 1, JSON.stringify(results));
     assert.match(conflicted[0].error ?? "", /changed while the menu was open/);
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
-      version: 2, remoteCompaction: { enabled: false },
+      version: 2, remoteCompaction: { enabled: false }, reasoningEffortUpdates: { enabled: false },
       summaryModel: { provider: "fixture", model: saved[0].model, thinkingLevel: "off" },
     });
     if (process.platform !== "win32") assert.equal((await stat(settingsPath)).mode & 0o777, originalMode);
@@ -123,7 +123,7 @@ test("a lock held by another process makes saving fail without altering the file
     await release();
   }
   // A failed acquisition must neither remove someone else's lock nor prevent a later save.
-  await (await loadCompactionSettings(settingsPath)).save({ remoteCompactionEnabled: false });
+  await (await loadCompactionSettings(settingsPath)).save({ remoteCompactionEnabled: false, reasoningEffortUpdatesEnabled: false });
   assert.equal((await loadCompactionSettings(settingsPath)).configuration.remoteCompactionEnabled, false);
   assert.deepEqual(await readdir(settingsDirectory), ["config.json"]);
 });

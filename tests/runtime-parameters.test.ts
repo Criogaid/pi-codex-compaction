@@ -9,10 +9,10 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { closeOpenAICodexWebSocketSessions } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { capableModel } from "../src/capability.js";
-import { isObject, isObjectArray, type CompactionPayload, type JsonObject } from "../src/protocol.js";
+import { isObject, isObjectArray, type JsonObject } from "../src/protocol.js";
 import { compactionRequest, RequestSnapshotTracker, type ProviderRequestInputs } from "../src/request-snapshot.js";
 import { requestRemoteCompaction } from "../src/remote.js";
-import { assertTrimmedOutput, mockFetch, testRegistry } from "./helpers.js";
+import { assertTrimmedOutput, mockFetch, testRegistry, withResponsesPayloadHook } from "./helpers.js";
 
 const apiKey = `fixture.${Buffer.from(JSON.stringify({
   "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
@@ -89,22 +89,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   }
 }
 
-function withResponsesPayloadHook(provider: Provider, simulate: (payload: CompactionPayload) => CompactionPayload): Provider {
-  return { ...provider,
-    streamSimple(model, context, options) {
-      return provider.streamSimple(model, context, { ...options,
-        onPayload: async (payload, preparedModel) => {
-          assert.ok(isObject(payload) && isObjectArray(payload.input));
-          // Pi 1.0.4 lacks the effort updates emitted by newer Responses adapters.
-          const simulated = simulate({ ...payload, input: payload.input });
-          return await options?.onPayload?.(simulated, preparedModel) ?? simulated;
-        },
-      });
-    },
-  };
-}
-
-test("V2 preserves Pi effort updates in checkpoint input and across retries", async () => {
+test("V2 rewrites only the sent body, preserving Pi effort updates in the checkpoint input", async () => {
   const provider = openaiProvider();
   const compat = { supportsLongCacheRetention: true, supportsMidConvoEffort: true };
   const model: Model<"openai-responses"> = {
@@ -142,35 +127,43 @@ test("V2 preserves Pi effort updates in checkpoint input and across retries", as
   const current = [...canonical, { ...assistant, content: [{ type: "text" as const, text: "reply" }], timestamp: 2 }];
   const request = compactionRequest(tracker.current(), sessionId, target, current, inputs, { blockImages: false, tools: () => [] });
   assert.ok(request.providerRequest?.prefix);
-  const attempts: JsonObject[] = [];
-  using _fetchScope = mockFetch(async (input, init) => {
-    const request = new Request(input, init);
-    const bytes = Buffer.from(await request.arrayBuffer());
-    const decoded = request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
-    const payload: unknown = JSON.parse(decoded.toString("utf8"));
-    assert.ok(isObject(payload));
-    attempts.push(payload);
-    return attempts.length === 1
-      ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } })
-      : response();
-  });
-  const result = await requestRemoteCompaction({
-    modelRegistry: registry, model, context: request.context, providerRequest: request.providerRequest,
-    reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 1, maxRetryDelayMs: 1,
-  });
-  assert.equal(attempts.length, 2);
-  assert.deepEqual(attempts[1], attempts[0]);
-  const sent = attempts[0];
-  assert.ok(Array.isArray(sent.input) && sent.input.every(isObject));
-  assert.deepEqual(sent.input.at(-1), { type: "compaction_trigger" });
-  const wireInput = sent.input.slice(0, -1);
-  assert.deepEqual(JSON.parse(JSON.stringify(result.promptInput)), wireInput);
-  assert.equal(result.contextual.length, wireInput.length);
-  assert.deepEqual(wireInput.slice(0, observed.input.length - 1), observed.input.slice(0, -1));
-  assert.equal(wireInput.filter((item) => item.type === "configuration_update").length, 2);
-  assert.ok(wireInput.some((item) => item.role === "assistant"));
-  for (let index = 1; index < wireInput.length; index++) {
-    assert.ok(wireInput[index - 1].type !== "configuration_update" || wireInput[index].type !== "configuration_update");
+  for (const reasoningEffortUpdates of [undefined, true]) {
+    const attempts: JsonObject[] = [];
+    using _fetchScope = mockFetch(async (input, init) => {
+      const request = new Request(input, init);
+      const bytes = Buffer.from(await request.arrayBuffer());
+      const decoded = request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes;
+      const payload: unknown = JSON.parse(decoded.toString("utf8"));
+      assert.ok(isObject(payload));
+      attempts.push(payload);
+      return attempts.length === 1
+        ? new Response("busy", { status: 503, headers: { "retry-after-ms": "1" } })
+        : response();
+    });
+    const result = await requestRemoteCompaction({
+      modelRegistry: registry, model, context: request.context, providerRequest: request.providerRequest,
+      reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 1, maxRetryDelayMs: 1,
+      reasoningEffortUpdates,
+    });
+    assert.equal(attempts.length, 2);
+    assert.deepEqual(attempts[1], attempts[0]);
+    const sent = attempts[0];
+    assert.ok(isObjectArray(sent.input));
+    assert.deepEqual(sent.input.at(-1), { type: "compaction_trigger" });
+    const wireInput = sent.input.slice(0, -1);
+    const { promptInput } = result;
+    assert.equal(result.contextual.length, promptInput.length);
+    assert.deepEqual(JSON.parse(JSON.stringify(promptInput.slice(0, observed.input.length - 1))),
+      JSON.parse(JSON.stringify(observed.input.slice(0, -1))));
+    assert.ok(promptInput.some((item) => item.role === "assistant"));
+    assert.deepEqual(promptInput.filter((item) => item.type === "configuration_update"), [update, update]);
+    assert.notEqual(promptInput.at(-1)?.type, "compaction_trigger");
+    for (let index = 1; index < promptInput.length; index++) {
+      assert.ok(promptInput[index - 1].type !== "configuration_update" || promptInput[index].type !== "configuration_update");
+    }
+    const expectedInput = reasoningEffortUpdates ? promptInput.slice(0, -1) : promptInput;
+    assert.equal(promptInput.at(-1)?.type, "configuration_update");
+    assert.deepEqual(wireInput, JSON.parse(JSON.stringify(expectedInput)));
   }
 });
 
