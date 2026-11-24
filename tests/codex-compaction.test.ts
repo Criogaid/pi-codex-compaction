@@ -670,16 +670,18 @@ async function providerCompaction(messages: SessionMessage[], options: {
   retryOrdinaryPayload?: boolean;
   compactionResponses?: readonly Response[];
   afterOrdinary?: (session: SessionManager, mock: ReturnType<typeof mockPi>, current: Awaited<ReturnType<typeof context>>, requestModel: Model<"openai-responses">) => void | Promise<void>;
+  reloadAfterOrdinary?: boolean;
 } = {}) {
-  const mock = mockPi("high", options.settings, options.tools);
+  let mock = mockPi("high", options.settings, options.tools);
   let payload: unknown;
   const requests: JsonObject[] = [];
-  createCodexCompactionExtension({ fetch: async (input, init) => {
+  const extension = createCodexCompactionExtension({ fetch: async (input, init) => {
     payload = await new Request(input, init).json();
     assert.ok(isObject(payload));
     requests.push(structuredClone(payload));
     return options.compactionResponses?.[requests.length - 1] ?? sseResponse();
-  } })(mock.pi);
+  } });
+  extension(mock.pi);
   const sessionManager = SessionManager.inMemory();
   const entries = messages.map((message) => sessionManager.appendMessage(message));
   const firstUser = messages.findIndex((message) => message.role === "user");
@@ -704,7 +706,8 @@ async function providerCompaction(messages: SessionMessage[], options: {
   };
   const requestModel: Model<"openai-responses"> = { ...model, input: ["text", "image"] };
   let runtimePrompt = options.ordinaryPrompt ?? "system";
-  const current = await context({ sessionManager, modelRegistry, model: requestModel, getSystemPrompt: () => runtimePrompt });
+  const contextOverrides = { sessionManager, modelRegistry, model: requestModel, getSystemPrompt: () => runtimePrompt };
+  let current = await context(contextOverrides);
   let ordinaryPayload: JsonObject | undefined;
   if (options.ordinaryPrompt !== undefined || options.ordinaryProjection) {
     const canonical = sessionManager.buildSessionContext().messages;
@@ -740,6 +743,19 @@ async function providerCompaction(messages: SessionMessage[], options: {
     }
     runtimePrompt = getSystemMessageText(head);
     await options.afterOrdinary?.(sessionManager, mock, current, requestModel);
+  }
+  if (options.reloadAfterOrdinary) {
+    const shutdown = mock.events.get("session_shutdown")?.[0];
+    const compact = mock.events.get("session_before_compact")?.[0];
+    assert.ok(shutdown && compact);
+    const queued = compactEvent();
+    await shutdown({ type: "session_shutdown", reason: "reload" }, current.ctx);
+    assert.deepEqual(await compact(queued, current.ctx), { cancel: true });
+    assert.equal(requests.length, 0);
+    // Keep the transcript and session ID so a snapshot leak would still match.
+    mock = mockPi("high", options.settings, options.tools);
+    extension(mock.pi);
+    current = await context(contextOverrides);
   }
   const details = await compactSession(mock, sessionManager, entries[firstUser], current, options.customInstructions);
   assert.ok(isObject(payload));
@@ -837,7 +853,7 @@ test("compaction reuses request-local messages while their canonical source stay
   assert.doesNotMatch(JSON.stringify(result.payload.input), /Original tool output/);
 });
 
-for (const change of ["edit", "system", "session-start", "session-shutdown", "session-id", "model", "backend"] as const) {
+for (const change of ["edit", "system", "session-start", "session-id", "model", "backend"] as const) {
   test(`compaction discards its ordinary context projection after ${change} changes`, async () => {
     const result = await providerCompaction(toolHistory(), { ordinaryProjection: packToolHistory,
       async afterOrdinary(session, mock, current, requestModel) {
@@ -848,7 +864,6 @@ for (const change of ["edit", "system", "session-start", "session-shutdown", "se
         }
         if (change === "system") session.appendMessage({ role: "system", content: "new instructions", timestamp: 4 });
         if (change === "session-start") await mock.events.get("session_start")?.[0]?.({ type: "session_start" }, current.ctx);
-        if (change === "session-shutdown") await mock.events.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, current.ctx);
         if (change === "session-id") session.getSessionId = () => "replacement-session";
         if (change === "model") requestModel.id = "other-model";
         if (change === "backend") {
@@ -864,6 +879,15 @@ for (const change of ["edit", "system", "session-start", "session-shutdown", "se
   });
 }
 
+test("compaction after reload does not reuse the old extension instance's context projection", async () => {
+  const result = await providerCompaction(toolHistory(), { ordinaryProjection: packToolHistory, reloadAfterOrdinary: true });
+  assert.ok(result.ordinaryPayload && Array.isArray(result.ordinaryPayload.input));
+  assert.ok(Array.isArray(result.payload.input));
+  assert.match(JSON.stringify(result.ordinaryPayload.input), /obs_fixture/);
+  assert.match(JSON.stringify(result.payload.input), /Original tool output/);
+  assert.doesNotMatch(JSON.stringify(result.payload.input), /obs_fixture/);
+});
+
 test("compaction reuses the effective ordinary prompt after Pi clears its run override", async () => {
   const tool: Tool = { name: "read", description: "Read", parameters: { type: "object", properties: {} } };
   const messages: SessionMessage[] = [
@@ -877,7 +901,7 @@ test("compaction reuses the effective ordinary prompt after Pi clears its run ov
   assert.deepEqual(messages, saved);
 });
 
-for (const change of ["system", "session-start", "session-shutdown", "session-id", "model"] as const) {
+for (const change of ["system", "session-start", "session-id", "model"] as const) {
   test(`compaction discards an ordinary prompt override after ${change} changes`, async () => {
     const messages: SessionMessage[] = [
       { role: "system", content: "canonical prompt", timestamp: 0 },
@@ -887,7 +911,6 @@ for (const change of ["system", "session-start", "session-shutdown", "session-id
       async afterOrdinary(session, mock, current, requestModel) {
         if (change === "system") session.appendMessage({ role: "system", content: "new instructions", timestamp: 2 });
         if (change === "session-start") await mock.events.get("session_start")?.[0]?.({ type: "session_start" }, current.ctx);
-        if (change === "session-shutdown") await mock.events.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, current.ctx);
         if (change === "session-id") session.getSessionId = () => "replacement-session";
         if (change === "model") requestModel.id = "other-model";
       },
@@ -897,6 +920,17 @@ for (const change of ["system", "session-start", "session-shutdown", "session-id
     assert.deepEqual(result.payload.input[0], { role: "developer", content: expected });
   });
 }
+
+test("compaction after reload does not reuse the old extension instance's prompt override", async () => {
+  const result = await providerCompaction([
+    { role: "system", content: "canonical prompt", timestamp: 0 },
+    { role: "user", content: "request", timestamp: 1 },
+  ], { ordinaryPrompt: "per-run override", reloadAfterOrdinary: true });
+  assert.ok(result.ordinaryPayload && Array.isArray(result.ordinaryPayload.input));
+  assert.ok(Array.isArray(result.payload.input));
+  assert.deepEqual(result.ordinaryPayload.input[0], { role: "developer", content: "per-run override" });
+  assert.deepEqual(result.payload.input[0], { role: "developer", content: "canonical prompt" });
+});
 
 for (const withSystem of [true, false]) {
   test(`sends one system prompt and tool declarations with transcript system messages ${withSystem}`, async () => {
