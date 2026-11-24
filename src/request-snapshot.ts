@@ -359,7 +359,7 @@ export class RequestSnapshotTracker {
     target: CapableModel | undefined,
     canonical: () => AgentMessage[],
     systemPrompt: () => string,
-    observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs; readonly replay: "applied" | "skipped" },
+    observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs; readonly replay: "applied" | "skipped" | "failed" },
   ): void {
     const messages = target ? canonical() : undefined;
     this.state.promptOverride = target && messages && capturePromptOverride(messages, sessionId, target, systemPrompt());
@@ -373,7 +373,8 @@ export class RequestSnapshotTracker {
     this.state.providerRequest = undefined;
     if (!matched || !target) return;
     const { payload, inputs, replay } = observation();
-    this.state.providerRequest = captureProviderRequest(matched.context, target, payload, inputs, matched.requiresReplay && replay === "skipped");
+    const replayMissing = replay !== "applied" && (matched.requiresReplay || replay === "failed");
+    this.state.providerRequest = captureProviderRequest(matched.context, target, payload, inputs, replayMissing);
   }
 
   /**

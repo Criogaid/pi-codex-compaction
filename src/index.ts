@@ -459,16 +459,21 @@ export function createCodexCompactionExtension(
     });
 
     pi.on("before_provider_request", async (event, ctx) => {
-      const payload = await replayCheckpoint(event.payload, ctx, pi.getSettings().images?.blockImages ?? false);
-      snapshots.recordProviderRequest(
-        ctx.sessionManager.getSessionId(),
-        capableModel(ctx.model),
-        () => canonicalMessages(ctx),
-        () => ctx.getSystemPrompt(),
-        // Keep the wire marker in the snapshot; ordinary requests and V2 each replay it exactly once.
-        () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx), replay: payload === undefined ? "skipped" : "applied" }),
-      );
-      return payload;
+      let replay: "applied" | "skipped" | "failed" = "failed";
+      try {
+        const payload = await replayCheckpoint(event.payload, ctx, pi.getSettings().images?.blockImages ?? false);
+        replay = payload === undefined ? "skipped" : "applied";
+        return payload;
+      } finally {
+        // Pi continues the ordinary request after a hook throws, so publish this turn even on replay failure.
+        snapshots.recordProviderRequest(
+          ctx.sessionManager.getSessionId(),
+          capableModel(ctx.model),
+          () => canonicalMessages(ctx),
+          () => ctx.getSystemPrompt(),
+          () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx), replay }),
+        );
+      }
     });
 
     pi.on("agent_settled", (_event, ctx) => {
