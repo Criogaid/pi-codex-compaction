@@ -1,17 +1,35 @@
 // Own compaction settings interaction; use Pi widgets without changing the session's model or thinking level.
 import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
 import { getSelectListTheme, getSettingsListTheme, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { Container, fuzzyFilter, Input, SelectList, SettingsList, Text } from "@earendil-works/pi-tui";
-import { loadCompactionSettings, type SummaryModel } from "./fallback-settings.js";
+import { Container, fuzzyFilter, Input, SelectList, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
+import { type CompactionConfiguration, loadCompactionSettings, type SummaryModel } from "./fallback-settings.js";
 
 const COMMAND_NAME = "codex-compaction";
 const REMOTE_LABEL = "Remote Compaction V2";
+const EFFORT_LABEL = "Codex reasoning effort updates";
 const SUMMARY_MODEL_LABEL = "Summary model";
 const CHAT_MODEL_LABEL = "Chat model";
 const USE_CHAT_MODEL = "Use the chat model";
 const TEXT_SUMMARY_DESCRIPTION = "Text summaries are used when V2 is off, unsupported, or fails.";
 const MAX_VISIBLE_MODELS = 10;
-type SettingsAction = "remote" | "model";
+type SettingsAction = "remote" | "effort" | "model";
+/** The On/Off settings, each a configuration field the menu toggles. */
+const SWITCHES = {
+  remote: {
+    field: "remoteCompactionEnabled",
+    on: "Remote Compaction V2 is On. Supported models try V2 before text summaries.",
+    off: "Remote Compaction V2 is Off. Compaction writes text summaries.",
+  },
+  effort: {
+    field: "reasoningEffortUpdatesEnabled",
+    on: "Codex reasoning effort updates are On for chat requests and V2.",
+    off: "Codex reasoning effort updates are Off. Requests keep Pi's reasoning effort updates.",
+  },
+} as const satisfies Record<Exclude<SettingsAction, "model">, {
+  readonly field: Exclude<keyof CompactionConfiguration, "summaryModel">;
+  readonly on: string;
+  readonly off: string;
+}>;
 /** The chat model is the absence of a summary model, offered as the first choice. */
 type ModelChoice = Model<Api> | typeof USE_CHAT_MODEL;
 
@@ -35,28 +53,30 @@ function describeSummaryModel(summary: SummaryModel | undefined): string {
 
 async function chooseAction(
   ctx: ExtensionCommandContext,
-  remoteCompactionEnabled: boolean,
+  configuration: CompactionConfiguration,
   summary: SummaryState,
   selected: SettingsAction,
 ): Promise<SettingsAction | undefined> {
   const description = summary.error ?? `${TEXT_SUMMARY_DESCRIPTION} ${describeSummaryModel(summary.value)}`;
-  const remoteValue = remoteCompactionEnabled ? "On" : "Off";
+  const switchValue = (action: keyof typeof SWITCHES) => configuration[SWITCHES[action].field] ? "On" : "Off";
   const modelValue = summary.error !== undefined ? "Invalid"
     : summary.value === undefined ? CHAT_MODEL_LABEL : `${summary.value.provider}/${summary.value.model} (${summary.value.thinkingLevel})`;
+  const items: (SettingItem & { readonly id: SettingsAction })[] = [
+    { id: "remote", label: REMOTE_LABEL, currentValue: switchValue("remote"), values: ["Off", "On"], description: "When On, try V2 with the chat model. When Off, unsupported, or failed, use text summaries. Turning V2 off does not affect previously compressed chat history." },
+    { id: "effort", label: EFFORT_LABEL, currentValue: switchValue("effort"), values: ["Off", "On"], description: "When On, send reasoning-effort changes the way Codex does, for chat requests and V2 alike. Replaces the separate pi-codex-reasoning-effort extension; do not enable both." },
+    { id: "model", label: SUMMARY_MODEL_LABEL, currentValue: modelValue, values: ["Choose"], description },
+  ];
   if (ctx.mode !== "tui") {
-    const remoteLabel = `${REMOTE_LABEL}: ${remoteValue}`;
-    const modelLabel = `${SUMMARY_MODEL_LABEL}: ${modelValue}`;
-    const action = await ctx.ui.select(description, [remoteLabel, modelLabel]);
+    const labels = items.map((item) => `${item.label}: ${item.currentValue}`);
+    const action = await ctx.ui.select(description, labels);
     if (action === undefined) return undefined;
-    if (action === remoteLabel) return "remote";
-    if (action === modelLabel) return "model";
-    throw new Error("Select a listed compaction setting");
+    const index = labels.indexOf(action);
+    if (index < 0) throw new Error("Select a listed compaction setting");
+    return items[index].id;
   }
   return ctx.ui.custom<SettingsAction | undefined>((tui, _theme, _keys, done) => {
-    const list = new SettingsList([
-      { id: "remote", label: REMOTE_LABEL, currentValue: remoteValue, values: ["Off", "On"], description: "When On, try V2 with the chat model. When Off, unsupported, or failed, use text summaries. Turning V2 off does not affect previously compressed chat history." },
-      { id: "model", label: SUMMARY_MODEL_LABEL, currentValue: modelValue, values: ["Choose"], description },
-    ], 2, getSettingsListTheme(), (id) => done(id === "remote" ? "remote" : "model"), () => done(undefined));
+    const list = new SettingsList(items, items.length, getSettingsListTheme(),
+      (id) => done(items.find((item) => item.id === id)?.id), () => done(undefined));
     list.selectItem(selected);
     return {
       render: (width) => list.render(width),
@@ -136,7 +156,11 @@ async function chooseSummaryModel(ctx: ExtensionCommandContext): Promise<{ reado
   return { value: { provider: model.provider, model: model.id, thinkingLevel } };
 }
 
-async function configureCompaction(path: string, ctx: ExtensionCommandContext): Promise<void> {
+async function configureCompaction(
+  path: string,
+  ctx: ExtensionCommandContext,
+  onReasoningEffortUpdatesChange: (enabled: boolean) => void,
+): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify(`/${COMMAND_NAME} requires interactive or RPC mode; edit ${path} directly.`, "warning");
     return;
@@ -146,35 +170,43 @@ async function configureCompaction(path: string, ctx: ExtensionCommandContext): 
     const settings = await loadCompactionSettings(path);
     const configuration = settings.configuration;
     const summary = readSummaryModel(() => configuration.summaryModel);
-    const action = await chooseAction(ctx, configuration.remoteCompactionEnabled, summary, selected);
+    const action = await chooseAction(ctx, configuration, summary, selected);
     if (action === undefined) return;
     selected = action;
-    if (action === "remote") {
-      const remoteCompactionEnabled = !configuration.remoteCompactionEnabled;
-      // Omitting summaryModel keeps the file's value as written, including one that fails validation.
-      await settings.save({ remoteCompactionEnabled });
-      ctx.ui.notify(remoteCompactionEnabled
-        ? "Remote Compaction V2 is On. Supported models try V2 before text summaries."
-        : "Remote Compaction V2 is Off. Compaction writes text summaries.", "info");
-    } else {
+    const switches = {
+      remoteCompactionEnabled: configuration.remoteCompactionEnabled,
+      reasoningEffortUpdatesEnabled: configuration.reasoningEffortUpdatesEnabled,
+    };
+    if (action === "model") {
       const choice = await chooseSummaryModel(ctx);
       if (choice !== undefined) {
-        await settings.save({ remoteCompactionEnabled: configuration.remoteCompactionEnabled, summaryModel: choice.value });
+        await settings.save({ ...switches, summaryModel: choice.value });
         ctx.ui.notify(describeSummaryModel(choice.value), "info");
       }
+    } else {
+      const { field, on, off } = SWITCHES[action];
+      const enabled = !switches[field];
+      // Omitting summaryModel keeps the file's value as written, including one that fails validation.
+      await settings.save({ ...switches, [field]: enabled });
+      if (action === "effort") onReasoningEffortUpdatesChange(enabled);
+      ctx.ui.notify(enabled ? on : off, "info");
     }
     // TUI keeps the same row selected so repeated Enter presses toggle in place.
     if (ctx.mode !== "tui") return;
   }
 }
 
-export function registerCompactionCommand(pi: ExtensionAPI, path: string): void {
+export function registerCompactionCommand(
+  pi: ExtensionAPI,
+  path: string,
+  onReasoningEffortUpdatesChange: (enabled: boolean) => void,
+): void {
   pi.registerCommand(COMMAND_NAME, {
-    description: "Configure V2 and summary model settings",
+    description: "Configure V2, reasoning effort updates, and summary model settings",
     handler: async (args, ctx) => {
       try {
         if (args.trim()) throw new Error(`Usage: /${COMMAND_NAME}`);
-        await configureCompaction(path, ctx);
+        await configureCompaction(path, ctx, onReasoningEffortUpdatesChange);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : "Could not configure compaction settings", "error");
       }

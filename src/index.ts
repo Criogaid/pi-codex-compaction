@@ -35,10 +35,16 @@ import {
   prepareCheckpointLayer,
   resolveLatestCheckpoint,
 } from "./checkpoint.js";
+import { applyCodexEffortUpdates } from "./effort-updates.js";
 import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker, withoutInputImages } from "./protocol.js";
 import { requestRemoteCompaction, RemoteCompactionTransientError } from "./remote.js";
 import { requestFallbackCompaction, type FallbackCompactionRequest } from "./fallback.js";
-import { COMPACTION_SETTINGS_RELATIVE_PATH, loadCompactionSettings, type CompactionConfiguration } from "./fallback-settings.js";
+import {
+  COMPACTION_SETTINGS_RELATIVE_PATH,
+  DEFAULT_REASONING_EFFORT_UPDATES_ENABLED,
+  loadCompactionSettings,
+  type CompactionConfiguration,
+} from "./fallback-settings.js";
 import { registerCompactionCommand } from "./fallback-command.js";
 import { compactionRequest, RequestSnapshotTracker, type ProviderRequestInputs, type RequestSnapshots } from "./request-snapshot.js";
 
@@ -130,6 +136,8 @@ function errorMessage(error: unknown): string {
 interface CompactionRun {
   readonly sessionId: string;
   readonly signal: AbortSignal;
+  /** Send V2 with Codex's sparse reasoning-effort updates, as ordinary requests are sent. */
+  readonly reasoningEffortUpdates: boolean;
   owned(): boolean;
   setStatus(message: string): void;
   summarize(
@@ -250,6 +258,7 @@ async function compactRemotely(
       sessionId,
       thinkingBudgets: settings.thinkingBudgets,
       blockImages: settings.images?.blockImages ?? false,
+      reasoningEffortUpdates: run.reasoningEffortUpdates,
       maxRetries: settings.retry?.provider?.maxRetries,
       maxRetryDelayMs: settings.retry?.provider?.maxRetryDelayMs,
       signal,
@@ -316,7 +325,9 @@ async function compactRemotely(
 
 export default function codexCompaction(pi: ExtensionAPI): void {
   const compactionSettingsPath = resolve(getAgentDir(), COMPACTION_SETTINGS_RELATIVE_PATH);
-  registerCompactionCommand(pi, compactionSettingsPath);
+  // Ordinary requests read the switch from the latest settings this process loaded or saved.
+  let reasoningEffortUpdates = DEFAULT_REASONING_EFFORT_UPDATES_ENABLED;
+  registerCompactionCommand(pi, compactionSettingsPath, (enabled) => { reasoningEffortUpdates = enabled; });
   const warnings = new Set<string>();
   const snapshots = new RequestSnapshotTracker();
   let latestRun = 0;
@@ -338,9 +349,15 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     },
   );
 
-  pi.on("session_start", () => {
+  pi.on("session_start", async (_event, ctx) => {
     warnings.clear();
     snapshots.reset();
+    try {
+      reasoningEffortUpdates = (await loadCompactionSettings(compactionSettingsPath)).configuration.reasoningEffortUpdatesEnabled;
+    } catch (error) {
+      reasoningEffortUpdates = DEFAULT_REASONING_EFFORT_UPDATES_ENABLED;
+      if (ctx.hasUI) ctx.ui.notify(`Could not read compaction settings; Codex reasoning effort updates are Off. ${errorMessage(error)}`, "warning");
+    }
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
@@ -366,10 +383,12 @@ export default function codexCompaction(pi: ExtensionAPI): void {
         return { cancel: true };
       }
       if (!owned()) return { cancel: true };
+      reasoningEffortUpdates = configuration.reasoningEffortUpdatesEnabled;
 
       const run: CompactionRun = {
         sessionId,
         signal,
+        reasoningEffortUpdates,
         owned,
         setStatus(message) {
           if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, message);
@@ -457,7 +476,10 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     try {
       const payload = await replayCheckpoint(event.payload, ctx, pi.getSettings().images?.blockImages ?? false);
       replay = payload === undefined ? "skipped" : "applied";
-      return payload;
+      if (!reasoningEffortUpdates) return payload;
+      // Replay first: the rewrite recognizes a compacted window by the replayed compaction item.
+      const rewritten = applyCodexEffortUpdates(payload ?? event.payload);
+      return rewritten === event.payload ? undefined : rewritten;
     } finally {
       // Pi continues the ordinary request after a hook throws, so publish this turn even on replay failure.
       try {

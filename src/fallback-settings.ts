@@ -4,10 +4,11 @@ import { lstat, mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
-import { isObject } from "./protocol.js";
+import { isObject, type JsonObject } from "./protocol.js";
 
 export const COMPACTION_SETTINGS_RELATIVE_PATH = "extensions/pi-codex-compaction/config.json";
 export const DEFAULT_REMOTE_COMPACTION_ENABLED = true;
+export const DEFAULT_REASONING_EFFORT_UPDATES_ENABLED = false;
 const SETTINGS_VERSION = 2;
 const LEGACY_SETTINGS_VERSION = 1;
 const MAX_SETTINGS_BYTES = 16 * 1024;
@@ -23,6 +24,8 @@ export interface SummaryModel {
 
 export interface CompactionConfiguration {
   readonly remoteCompactionEnabled: boolean;
+  /** Rewrite ordinary and V2 requests with Codex's sparse reasoning-effort updates. */
+  readonly reasoningEffortUpdatesEnabled: boolean;
   readonly summaryModel: SummaryModel | undefined;
 }
 
@@ -101,32 +104,37 @@ interface ParsedSettings {
 
 function parseSettings(bytes: Buffer | undefined, path: string): ParsedSettings {
   if (bytes === undefined) {
-    return { configuration: { remoteCompactionEnabled: DEFAULT_REMOTE_COMPACTION_ENABLED, summaryModel: undefined }, rawSummaryModel: undefined };
+    return {
+      configuration: {
+        remoteCompactionEnabled: DEFAULT_REMOTE_COMPACTION_ENABLED,
+        reasoningEffortUpdatesEnabled: DEFAULT_REASONING_EFFORT_UPDATES_ENABLED,
+        summaryModel: undefined,
+      },
+      rawSummaryModel: undefined,
+    };
   }
   // Accept a UTF-8 BOM, reject invalid bytes, and never echo file contents in errors.
   const settings: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   if (!isObject(settings)) throw new Error("Compaction settings must be an object");
   const legacy = settings.version === LEGACY_SETTINGS_VERSION;
   const modelKey = legacy ? "fallback" : "summaryModel";
-  if (Object.keys(settings).some((key) => !["version", "remoteCompaction", modelKey].includes(key))) {
-    throw new Error("Compaction settings must be an object with version and optional remoteCompaction and summaryModel fields");
+  const keys = legacy ? ["version", "remoteCompaction", modelKey] : ["version", "remoteCompaction", "reasoningEffortUpdates", modelKey];
+  if (Object.keys(settings).some((key) => !keys.includes(key))) {
+    throw new Error(legacy
+      ? "Version 1 compaction settings must be an object with version and optional remoteCompaction and fallback fields"
+      : "Compaction settings must be an object with version and optional remoteCompaction, reasoningEffortUpdates, and summaryModel fields");
   }
-  if ((modelKey in settings || "remoteCompaction" in settings) && !legacy && settings.version !== SETTINGS_VERSION) {
+  if (keys.slice(1).some((key) => key in settings) && !legacy && settings.version !== SETTINGS_VERSION) {
     throw new Error(`version must be ${SETTINGS_VERSION} when compaction settings are configured`);
   }
-  let remoteCompactionEnabled = DEFAULT_REMOTE_COMPACTION_ENABLED;
-  if ("remoteCompaction" in settings) {
-    const remote = settings.remoteCompaction;
-    if (!isObject(remote) || Object.keys(remote).some((key) => key !== "enabled") || typeof remote.enabled !== "boolean") {
-      throw new Error("remoteCompaction must be an object with a boolean enabled field");
-    }
-    remoteCompactionEnabled = remote.enabled;
-  }
+  const remoteCompactionEnabled = parseSwitch(settings, "remoteCompaction", DEFAULT_REMOTE_COMPACTION_ENABLED);
+  const reasoningEffortUpdatesEnabled = parseSwitch(settings, "reasoningEffortUpdates", DEFAULT_REASONING_EFFORT_UPDATES_ENABLED);
   const raw = legacy ? fromLegacyFallback(settings.fallback) : settings.summaryModel;
   let resolved: { readonly value: SummaryModel | undefined } | undefined;
   return {
     configuration: {
       remoteCompactionEnabled,
+      reasoningEffortUpdatesEnabled,
       // Successful V2 requests do not need to resolve or validate the summary model.
       get summaryModel() {
         try {
@@ -139,6 +147,15 @@ function parseSettings(bytes: Buffer | undefined, path: string): ParsedSettings 
     },
     rawSummaryModel: raw === undefined ? undefined : { value: raw },
   };
+}
+
+function parseSwitch(settings: JsonObject, key: string, defaultValue: boolean): boolean {
+  if (!(key in settings)) return defaultValue;
+  const value = settings[key];
+  if (!isObject(value) || Object.keys(value).some((field) => field !== "enabled") || typeof value.enabled !== "boolean") {
+    throw new Error(`${key} must be an object with a boolean enabled field`);
+  }
+  return value.enabled;
 }
 
 /**
@@ -183,7 +200,11 @@ export async function loadCompactionSettings(path: string) {
   const { configuration, rawSummaryModel } = parsed;
   return {
     configuration,
-    async save(selection: { readonly remoteCompactionEnabled: boolean; readonly summaryModel?: SummaryModel | undefined }): Promise<void> {
+    async save(selection: {
+      readonly remoteCompactionEnabled: boolean;
+      readonly reasoningEffortUpdatesEnabled: boolean;
+      readonly summaryModel?: SummaryModel | undefined;
+    }): Promise<void> {
       const summaryModel = "summaryModel" in selection ? selection.summaryModel : rawSummaryModel?.value;
       await withFileMutationQueue(path, async () => {
         await mkdir(dirname(path), { recursive: true });
@@ -192,6 +213,7 @@ export async function loadCompactionSettings(path: string) {
           const bytes = Buffer.from(`${JSON.stringify({
             version: SETTINGS_VERSION,
             remoteCompaction: { enabled: selection.remoteCompactionEnabled },
+            reasoningEffortUpdates: { enabled: selection.reasoningEffortUpdatesEnabled },
             ...(summaryModel === undefined ? {} : { summaryModel }),
           }, null, 2)}\n`);
           if (bytes.length > MAX_SETTINGS_BYTES) throw new Error(`Compaction settings must not exceed ${MAX_SETTINGS_BYTES} bytes`);

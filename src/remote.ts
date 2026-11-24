@@ -4,6 +4,7 @@ import type { Api, Context, Model, ProviderHeaders, ThinkingBudgets, Usage } fro
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { capableModel, deriveEndpoint, normalizeUrl, sameBackend, sameModel, type ProviderIdentity } from "./capability.js";
 import { trimToolOutputsToContextWindow } from "./context-window.js";
+import { applyCodexEffortUpdates } from "./effort-updates.js";
 import { estimateImages, type ImageEstimates } from "./image-budget.js";
 import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
 import { CodexCompactionProtocolError, type CompactionPayload, createCompactionCollector, isObject, isObjectArray, type JsonObject, normalizeCompactionEvent, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
@@ -32,6 +33,8 @@ export interface RemoteCompactionRequest {
   thinkingBudgets?: ThinkingBudgets;
   /** Apply the current Pi image policy to both fresh input and replayed opaque checkpoint history. */
   blockImages?: boolean;
+  /** Send Codex's sparse reasoning-effort updates; V2 bypasses the request hook that rewrites ordinary requests. */
+  reasoningEffortUpdates?: boolean;
   /** Pi's provider retry setting; Codex caps compaction retries below it. */
   maxRetries?: number;
   maxRetryDelayMs?: number;
@@ -92,6 +95,8 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   let prepared: (Pick<RemoteCompactionResponse, "promptInput" | "images" | "contextual"> & { readonly body: CompactionPayload }) | undefined;
   let identity: ProviderIdentity | undefined;
   const baseFetch = globalThis.fetch;
+  // The stored body stays Pi's serialization: the rewrite marks its own result, but a copy would be rewritten again.
+  const wire = (body: CompactionPayload) => request.reasoningEffortUpdates ? applyCodexEffortUpdates(body) : body;
   for (let retry = 0; ; retry++) {
     request.signal.throwIfAborted();
     const attempt = new CompactionAttempt(model.api);
@@ -164,7 +169,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
               }
               // Re-authenticate each attempt, but never let a new serialization change the compacted input.
               request.onPrepared?.();
-              return structuredClone(prepared.body);
+              return wire(structuredClone(prepared.body));
             }
             const parsed = parseCompactionPayload(payload, request.providerRequest);
             const applied = applyProviderRequest(parsed, resolved, request.providerRequest,
@@ -198,7 +203,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
             const contextual = sent.map((item) => contextItems.has(item));
             prepared = { promptInput: structuredClone(sent), images: estimates, contextual, body: structuredClone(body) };
             request.onPrepared?.();
-            return body;
+            return wire(body);
           } catch (error) {
             attempt.blockRetry(error);
             throw error;

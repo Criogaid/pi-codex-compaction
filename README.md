@@ -7,6 +7,7 @@
 - **装上即用：** 对 Codex 模型默认启用 V2 远程压缩，无需任何配置。
 - **失败自动退回：** 当前模型不支持 V2，或 V2 请求失败时，改用 Pi 原生的文字摘要压缩。
 - **独立摘要模型（可选）：** 退回 Pi 原生压缩时，可以使用你指定的模型和思考等级生成摘要。它只接管这一步，不影响 V2 远程压缩，也不改变当前对话模型。
+- **Codex 式思考等级更新（可选，默认关闭）：** 开启后，普通请求和 V2 请求都按 Codex 的方式发送思考等级变化，压缩请求因此能沿用普通请求的缓存前缀。
 
 [安装](#安装) · [工作方式](#工作方式) · [独立摘要模型](#独立摘要模型) · [配置](#配置) · [自定义网关](#自定义网关) · [注意事项](#注意事项)
 
@@ -64,7 +65,13 @@ Codex Responses 跳过空 `data:` 帧，V2 根据后续记录判断是否重试�
 
 建议等待超过上限、容量故障缺少建议或次数用尽时，已确认的暂时故障仍可使用上表中的分层恢复。
 
-压缩插件不改写普通请求或 V2 请求的思考等级基线和 `configuration_update` 记录。不安装独立的思考等级插件时，这些字段沿用 Pi 的原生行为。
+### 思考等级更新
+
+Pi 对支持对话中途调整思考等级的模型固定发送 `"effort": "medium"`，并在每段助手回复前和请求末尾各加一条 `configuration_update`。Codex 的做法不同：请求级 effort 是当前窗口的基线，历史中只保留等级真正变化的记录；压缩后第一条记录成为新基线，不再出现在历史中；V2 请求省略紧挨在压缩触发项前的一串记录。
+
+`Codex reasoning effort updates` 默认关闭，此时两类请求都沿用 Pi 的原生行为。开启后，压缩插件在重放检查点之后改写普通请求，V2 请求（包括重试）在发送前做同样的改写，两者的前缀保持一致。
+
+这项设置取代独立的 `@criogaid/pi-codex-reasoning-effort` 扩展，开启前请先卸载它。两者同时安装时，独立扩展若先于本扩展执行，会在检查点重放之前改写请求，压缩后的窗口划分会出错。不开启这项设置而单独使用独立扩展时，它只改写普通请求；V2 请求不经过 Pi 的请求钩子，仍按 Pi 原生格式发送思考等级，压缩请求因此无法命中普通请求的缓存。
 
 ## 独立摘要模型
 
@@ -95,6 +102,7 @@ Codex Responses 跳过空 `data:` 帧，V2 根据后续记录判断是否重试�
 | 设置 | 默认 | 用途 |
 | --- | --- | --- |
 | `Remote Compaction V2` | On | 是否优先尝试 V2 远程压缩 |
+| `Codex reasoning effort updates` | Off | 是否按 Codex 的方式发送思考等级变化，见[思考等级更新](#思考等级更新) |
 | `Summary model` | `Chat model` | 生成文字摘要的模型及其思考等级；`Chat model` 表示使用当前对话模型 |
 
 - 终端菜单中按回车或空格切换开关，修改立即保存，光标停留在原来的行。选中一项时，列表下方会说明它的用途及与其他设置的关系。
@@ -112,6 +120,9 @@ Codex Responses 跳过空 `data:` 帧，V2 根据后续记录判断是否重试�
   "remoteCompaction": {
     "enabled": true
   },
+  "reasoningEffortUpdates": {
+    "enabled": false
+  },
   "summaryModel": {
     "provider": "openai-codex",
     "model": "gpt-6.1-sol",
@@ -123,6 +134,7 @@ Codex Responses 跳过空 `data:` 帧，V2 根据后续记录判断是否重试�
 | 字段 | 对应菜单项 | 说明 |
 | --- | --- | --- |
 | `remoteCompaction.enabled` | `Remote Compaction V2` | 省略 `remoteCompaction` 时默认开启 |
+| `reasoningEffortUpdates.enabled` | `Codex reasoning effort updates` | 省略 `reasoningEffortUpdates` 时默认关闭 |
 | `summaryModel.provider`、`summaryModel.model`、`summaryModel.thinkingLevel` | `Summary model` | 使用 Pi 中的实际 ID 和该模型支持的思考等级；三项须同时提供 |
 
 省略整个 `summaryModel` 表示使用当前对话模型生成文字摘要。V2 开关与摘要模型互不影响。
@@ -133,8 +145,8 @@ Codex Responses 跳过空 `data:` 帧，V2 根据后续记录判断是否重试�
 <summary><strong>读取时机与校验规则</strong></summary>
 
 - 配置文件须为 UTF-8 JSON，大小不超过 16 KiB。
-- 每次压缩开始时读取一次配置，压缩途中的修改在下次生效。
-- 文件无法读取、JSON 格式错误或 V2 设置无效时，停止压缩。
+- 每次压缩开始时读取一次配置，压缩途中的修改在下次生效。思考等级更新的开关还会在会话开始时读取，通过菜单修改后立即作用于之后的普通请求；直接编辑文件则在下次会话开始或压缩时生效。
+- 文件无法读取、JSON 格式错误或开关设置无效时，停止压缩；会话开始时读取失败会提示，并关闭思考等级更新。
 - `summaryModel` 只在需要原生压缩时校验，因此它填错不会影响成功的 V2 压缩。
 - `summaryModel` 无效时菜单显示 `Invalid`。你仍可切换 V2，已填写的内容会原样保留；重新选择模型或 `Use the chat model` 即可修复。
 - 多个 Pi 进程保存同一个配置时会互斥；同一旧版本只能有一个修改成功，其他菜单须重新打开。直接编辑文件时仍会在保存前检查版本；外部编辑器不参与 Pi 的保存锁。
