@@ -361,6 +361,7 @@ export class RequestSnapshotTracker {
     systemPrompt: () => string,
     observation: () => { readonly payload: unknown; readonly inputs: ProviderRequestInputs; readonly replay: "applied" | "skipped" | "failed" },
   ): void {
+    this.state.providerRequest = undefined;
     const messages = target ? canonical() : undefined;
     this.state.promptOverride = target && messages && capturePromptOverride(messages, sessionId, target, systemPrompt());
     // Keep a valid pending snapshot for retries that do not run context hooks again. Any source change
@@ -370,7 +371,6 @@ export class RequestSnapshotTracker {
     if (!source || source.length !== pending?.source.sourceFingerprints.length) this.state.pendingContext = undefined;
     const matched = this.state.pendingContext;
     this.state.context = matched?.context;
-    this.state.providerRequest = undefined;
     if (!matched || !target) return;
     const { payload, inputs, replay } = observation();
     const replayMissing = replay !== "applied" && (matched.requiresReplay || replay === "failed");

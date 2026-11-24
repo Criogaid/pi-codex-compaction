@@ -466,13 +466,17 @@ export function createCodexCompactionExtension(
         return payload;
       } finally {
         // Pi continues the ordinary request after a hook throws, so publish this turn even on replay failure.
-        snapshots.recordProviderRequest(
-          ctx.sessionManager.getSessionId(),
-          capableModel(ctx.model),
-          () => canonicalMessages(ctx),
-          () => ctx.getSystemPrompt(),
-          () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx), replay }),
-        );
+        try {
+          snapshots.recordProviderRequest(
+            ctx.sessionManager.getSessionId(),
+            capableModel(ctx.model),
+            () => canonicalMessages(ctx),
+            () => ctx.getSystemPrompt(),
+            () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx), replay }),
+          );
+        } catch (error) {
+          warnOnce(ctx, "request-snapshot", `Could not record the provider request snapshot. ${errorMessage(error)}`);
+        }
       }
     });
 
