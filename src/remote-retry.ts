@@ -11,14 +11,10 @@ const CAPACITY_CODES = new Set(["server_is_overloaded", "policy_capacity_unavail
 const RATE_LIMIT_CODES = new Set(["rate_limit_exceeded", "slow_down"]);
 const HTTP_429_PERMANENT_TYPES = new Set(["usage_limit_reached", "usage_not_included", "insufficient_quota"]);
 const HTTP_PERMANENT_CODES = new Set([
-  "insufficient_quota", "credit_balance_exhausted", "organization_usage_limit_exceeded",
-  "api_key_spend_limit_exceeded", "organization_spend_limit_exceeded", "project_spend_limit_exceeded",
-  "flex_unavailable", "context_length_exceeded", "invalid_prompt", "invalid_api_key", "authentication_error",
-  "permission_denied", "access_denied", "cyber_policy", "bio_policy", "misalignment_policy_violation",
-  "content_filter", "content_policy_violation", "inference_hook_denied", "invalid_access_program",
-  "unsupported_access_program", "access_program_not_enabled", "budget_reached", "audio_too_large",
-  "audio_too_short", "invalid_audio", "invalid_audio_data", "invalid_audio_format",
-  "missing_audio_sample_rate", "model_not_found",
+  "insufficient_quota", "credit_balance_exhausted", "organization_spend_limit_exceeded",
+  "project_spend_limit_exceeded", "usage_limit_reached", "usage_not_included", "context_length_exceeded",
+  "invalid_prompt", "invalid_api_key", "authentication_error", "permission_denied", "access_denied",
+  "cyber_policy", "bio_policy", "misalignment_policy_violation", "content_filter",
 ]);
 const TRANSIENT_NETWORK = new Set([
   "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH",
