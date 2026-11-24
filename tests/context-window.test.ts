@@ -39,13 +39,26 @@ for (const [name, item, tokens] of itemCases) {
   test(`estimates ${name}`, () => assert.equal(itemTokenCount(item, images), tokens));
 }
 
-for (const type of ["reasoning", "compaction", "compaction_summary", "context_compaction"]) {
-  test(`estimates ${type} after removing the encrypted envelope`, () => {
-    for (const [encrypted_content, tokens] of [["", 0], ["a".repeat(866), 0], ["a".repeat(868), 1], ["a".repeat(872), 1], ["a".repeat(874), 2], ["😀".repeat(218), 1]] as const) {
+test("estimates reasoning after removing the encrypted envelope", () => {
+  for (const [encrypted_content, tokens] of [["", 0], ["a".repeat(866), 0], ["a".repeat(868), 1], ["a".repeat(872), 1], ["a".repeat(874), 2], ["😀".repeat(218), 1]] as const) {
+    assert.equal(itemTokenCount({ type: "reasoning", encrypted_content }, images), tokens);
+  }
+});
+
+for (const type of ["compaction", "compaction_summary", "context_compaction"]) {
+  test(`estimates ${type} at one token per 12 UTF-8 ciphertext bytes, rounded up`, () => {
+    for (const [encrypted_content, tokens] of [["", 0], ["a", 1], ["a".repeat(12), 1], ["a".repeat(13), 2], ["😀".repeat(4), 2]] as const) {
       assert.equal(itemTokenCount({ type, encrypted_content }, images), tokens);
     }
   });
 }
+
+test("keeps a trailing tool output when the compaction ciphertext estimate fits the window", () => {
+  const compaction = { type: "compaction", encrypted_content: "a".repeat(12_000) };
+  const output = { type: "function_call_output", output: "x".repeat(4_000) };
+  // The two items occupy 2,000 tokens in a 2,565-token usable window.
+  assert.deepEqual(trimToolOutputsToContextWindow([compaction, output], "", 2_700, images), [compaction, output]);
+});
 
 test("trims only above the floored 95 percent window including instructions", () => {
   const output = { type: "function_call_output", output: "x".repeat(72) };
