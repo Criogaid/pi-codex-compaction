@@ -472,10 +472,13 @@ export function compactionRequest(
   const effectiveInputs = override ? { ...inputs, systemPrompt: override.text } : inputs;
   const key = requestInputsKey(target, effectiveInputs);
   const suffix = snapshot && matchingProjectionSuffix(current, snapshot);
-  // Responses resolves prompt and tool deltas against the whole transcript. Let Pi serialize it
-  // when a new system message could change items on either side of the wire splice.
-  const providerRequest = suffix && !suffix.some((message) => message.role === "system") &&
-    (snapshot.inputsKey === key || snapshot.settledInputsKey === key) ? snapshot : undefined;
+  // A new system message can change items on either side of the splice. Keep matching fields,
+  // but let Pi serialize the input as a whole in that case.
+  const providerRequest = suffix && (snapshot.inputsKey === key || snapshot.settledInputsKey === key)
+    ? snapshot.prefix && suffix.some((message) => message.role === "system")
+      ? { ...snapshot, prefix: undefined }
+      : snapshot
+    : undefined;
 
   const contextSnapshot = snapshotFor(snapshots.context, sessionId, target);
   const reused = reuseContextSnapshot(current, contextSnapshot);
