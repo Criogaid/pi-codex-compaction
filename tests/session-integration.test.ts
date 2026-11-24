@@ -86,12 +86,13 @@ function requestTransform(onReady?: (pi: ExtensionAPI) => void): ExtensionFactor
 }
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
-  test(`real ${api} compaction reuses observed declarations and cache fields without old response state`, { timeout: 20_000 }, async () => {
+  test(`real ${api} compaction rebuilds local declarations and reuses cache fields after a server reference`, { timeout: 20_000 }, async () => {
     const fixture = await sessionFixture({ api, extensions: [requestTransform(), codexCompaction] });
     try {
       for (let turn = 1; turn <= 3; turn++) await fixture.session.prompt(`Task ${turn}. ${"Preserve the implementation constraints. ".repeat(60)}`);
       const ordinary = fixture.requests.at(-1)?.payload;
       assert.ok(ordinary);
+      assert.equal(ordinary.previous_response_id, "fixture-response-anchor");
       await fixture.session.compact();
       const compacting = fixture.requests.at(-1)?.payload;
       assert.ok(compacting && Array.isArray(compacting.input));
@@ -99,10 +100,16 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       for (const field of ["instructions", "reasoning", "prompt_cache_key", "prompt_cache_retention", "service_tier", "text"]) {
         assert.deepEqual(compacting[field], ordinary[field], `Compaction must preserve the observed ${field}`);
       }
-      assert.ok(Array.isArray(ordinary.tools) && ordinary.tools.length > 0);
-      assert.deepEqual(compacting.tools, ordinary.tools, "V2 preserves the ordinary request's tool prefix");
+      assert.equal(ordinary.tools, undefined);
+      assert.equal(compacting.tools, undefined);
       assert.ok(Array.isArray(ordinary.input));
-      assert.deepEqual(compacting.input.slice(0, ordinary.input.length), ordinary.input);
+      for (const [payload, names] of [[ordinary, ["router"]], [compacting, ["router", "internal_read"]]] as const) {
+        assert.ok(Array.isArray(payload.input));
+        const initialTools: unknown = payload.input[0];
+        assert.ok(isObject(initialTools) && initialTools.type === "additional_tools" && Array.isArray(initialTools.tools));
+        assert.deepEqual(initialTools.tools.map((tool: unknown) => isObject(tool) && tool.name), names);
+      }
+      assert.deepEqual(compacting.input.slice(1, ordinary.input.length), ordinary.input.slice(1));
       assert.equal(compacting.previous_response_id, undefined);
       assert.notEqual(compacting.max_output_tokens, ordinary.max_output_tokens);
       assert.deepEqual(fixture.errors, []);

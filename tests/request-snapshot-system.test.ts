@@ -180,8 +180,8 @@ async function compactInput(fixture: Fixture): Promise<JsonObject[]> {
 test("V2 treats an empty forced prompt as an override of Pi's persisted sections", async (t) => {
   const forcedTurn = "Continue with no system text.";
   const fixture = await sessionFixture({ extensions: [codexCompaction, (pi) => {
-    pi.on("before_agent_start", ({ prompt }) => {
-      if (prompt === forcedTurn) return { systemPrompt: "" };
+    pi.on("before_agent_start", (event) => {
+      if (event.messageType === "user" && event.prompt === forcedTurn) return { systemPrompt: "" };
     });
   }] });
   t.after(() => fixture.close());
@@ -203,14 +203,18 @@ test("V2 scopes a same-text forced prompt sample to one Pi run", async (t) => {
   const continuation = "Complete the queued follow-up.";
   const fixtureSection = "Temporary instructions used during warmup.";
   let forcedPrompt: string | undefined;
-  const starts: string[] = [];
+  const starts: [type: "user" | "custom", promptOrCustomType: string][] = [];
   const attempts: JsonObject[][] = [];
   let queueFollowUp: (() => Promise<void>) | undefined;
   const fixture = await sessionFixture({
     settings: { retry: { enabled: false, provider: { maxRetries: 1, maxRetryDelayMs: 1 } } },
     extensions: [codexCompaction, (pi) => {
       pi.on("before_agent_start", (event) => {
-        starts.push(event.prompt);
+        if (event.messageType === "custom") {
+          starts.push(["custom", event.message.customType]);
+          return;
+        }
+        starts.push(["user", event.prompt]);
         if (event.prompt === warmup) event.systemPromptOptions.sections.fixture = fixtureSection;
         if (event.prompt === forcedTurn) {
           forcedPrompt = event.systemPrompt;
@@ -243,7 +247,8 @@ test("V2 scopes a same-text forced prompt sample to one Pi run", async (t) => {
   await fixture.session.prompt(forcedTurn);
   queueFollowUp = undefined;
 
-  assert.deepEqual(starts, [warmup, warmup, forcedTurn]);
+  const expectedUserStarts = [["user", warmup], ["user", warmup], ["user", forcedTurn]];
+  assert.deepEqual(starts, expectedUserStarts);
   assert.equal(attempts.length, 3);
   assert.ok(forcedPrompt);
   const head = { role: "developer", content: forcedPrompt };
@@ -274,7 +279,7 @@ test("V2 scopes a same-text forced prompt sample to one Pi run", async (t) => {
       customType: "idle-follow-up", content: "Review the transcript as recorded.", display: true,
     }, { triggerTurn: true });
     assert.equal(fixture.requests.length, beforeIdle + 1);
-    assert.deepEqual(starts, [warmup, warmup, forcedTurn]);
+    assert.deepEqual(starts, [...expectedUserStarts, ["custom", "idle-follow-up"]]);
     const inPlaceItems = (item: JsonObject) => isInstruction(item) || hasUserText(item, warmup) || hasUserText(item, forcedTurn);
     const ordinary = inputItems(lastPayload(fixture)).filter(inPlaceItems);
     assert.deepEqual(ordinary.map((item) => item.role), ["developer", "user", "user", "developer", "user"]);
@@ -291,10 +296,12 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     test(`V2 rebuilds the ${api} folded prompt when the same-text hook runs ${order} capture`, async (t) => {
       const forcedTurn = "Continue with the unchanged prompt explicitly returned.";
       const persistSection: ExtensionFactory = (pi) => void pi.on("before_agent_start", (event) => {
-        if (event.prompt === warmup) event.systemPromptOptions.sections.fixture = "Temporary instructions for warmup.";
+        if (event.messageType === "user" && event.prompt === warmup) {
+          event.systemPromptOptions.sections.fixture = "Temporary instructions for warmup.";
+        }
       });
       const forceSameText: ExtensionFactory = (pi) => void pi.on("before_agent_start", (event) => {
-        if (event.prompt === forcedTurn) return { systemPrompt: event.systemPrompt };
+        if (event.messageType === "user" && event.prompt === forcedTurn) return { systemPrompt: event.systemPrompt };
       });
       const fixture = await sessionFixture({ api, extensions: [persistSection,
         ...(order === "before" ? [forceSameText, codexCompaction] : [codexCompaction, forceSameText]),
@@ -437,6 +444,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
         models: (base) => [{ ...base, compat: { ...base.compat, supportsMidConvoSystemMessages: true } }],
         extensions: [codexCompaction, (pi) => {
           pi.on("before_agent_start", (event) => {
+            if (event.messageType !== "user") return;
             if (event.prompt === warmup) return { systemPrompt: forcedPrompt };
             if (event.prompt === abortedTurn) event.systemPromptOptions.sections.fixture = section;
           });
@@ -485,6 +493,7 @@ for (const sameText of [true, false]) {
     const editedWarmup = "Follow the corrected background decisions.";
     const fixture = await sessionFixture({ extensions: [codexCompaction, (pi) => {
       pi.on("before_agent_start", (event) => {
+        if (event.messageType !== "user") return;
         if (event.prompt === warmup) event.systemPromptOptions.sections.fixture = "Warmup instructions.";
         if (event.prompt === forcedTurn) return { systemPrompt: sameText ? event.systemPrompt : "FORCE" };
       });
