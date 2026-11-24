@@ -69,24 +69,19 @@ export interface CompactionCollector {
 }
 
 /**
- * Count only output-item completion events. A successful terminal event ends collection,
- * and the response that completed must already have supplied the one compaction item.
+ * V2 uses one SSE response per attempt. As in Codex, count only completed compaction items
+ * before the first successful completion; a response.created event does not restart collection.
  */
 export function createCompactionCollector(): CompactionCollector {
-  let outputs = 0;
   let item: JsonObject | undefined;
   let completedItem: JsonObject | undefined;
   return {
     get completed() { return completedItem !== undefined; },
     observe(event) {
       if (completedItem || !isObject(event)) return;
-      // A provider may restart its response when falling back from WebSocket to HTTP.
-      if (event.type === "response.created") {
-        item = undefined;
-      }
       if (event.type === "response.output_item.done" && isObject(event.item) &&
           isCompactionType(event.item.type)) {
-        if (++outputs > 1) {
+        if (item) {
           throw new CodexCompactionProtocolError("Remote compaction returned duplicate compaction output events");
         }
         item = validateCompactionItem(event.item);
