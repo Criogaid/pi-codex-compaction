@@ -2,8 +2,8 @@
 // and build compaction's provider context the way Pi 0.99 builds an ordinary request.
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { getCurrentSystemMessage, getSystemMessageText, type Context, type Message, type Tool } from "@earendil-works/pi-ai";
-import { convertToLlm, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
+import { getCurrentSystemMessage, getSystemMessageText, type Context, type Message, type SystemMessage, type Tool } from "@earendil-works/pi-ai";
+import { convertToLlm, type BuildSystemPromptOptions, type ExtensionAPI, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { RESPONSES_APIS, sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
 import { type CodexCheckpointDetails, fingerprintMessage, projectCheckpointRequest, withoutSystemMessages } from "./checkpoint.js";
 import { BLOCKED_IMAGE_TEXT, CodexCompactionProtocolError, type CompactionPayload, isObject, isObjectArray, type JsonObject } from "./protocol.js";
@@ -41,6 +41,8 @@ interface ProjectedSourceSnapshot extends SourceSnapshot {
 
 export interface ContextSnapshot extends ProjectedSourceSnapshot {
   readonly messages: readonly AgentMessage[];
+  /** A forced prompt that matches persisted text but collapses the observed prefix's system layout. */
+  readonly forcedSystemPrompt?: string;
 }
 
 /** Snapshots apply only to the session, model, and backend that produced them. */
@@ -73,9 +75,8 @@ function projectionOnlyFingerprints(source: readonly AgentMessage[], projected: 
 }
 
 /**
- * Pi does not expose a run's forced prompt, so a difference between `ctx.getSystemPrompt()` and the
- * persisted head counts as one. A stale head only drops the override later, because compaction
- * requires the head fingerprint to match again.
+ * Bind a different effective prompt to its persisted source. A stale head drops the override later,
+ * because compaction requires the head fingerprint to match again.
  */
 export function capturePromptOverride(
   canonical: readonly AgentMessage[],
@@ -135,6 +136,10 @@ function matchingProjectionSuffix(messages: readonly AgentMessage[], snapshot: P
 export function reuseContextSnapshot(messages: AgentMessage[], snapshot: ContextSnapshot | undefined): AgentMessage[] {
   const suffix = snapshot && matchingProjectionSuffix(messages, snapshot);
   if (!snapshot || !suffix) return messages;
+  if (snapshot.forcedSystemPrompt !== undefined) {
+    const head = forcedSystemHead(getCurrentSystemMessage(snapshot.messages), snapshot.forcedSystemPrompt);
+    return [...structuredClone([head, ...withoutSystemMessages(snapshot.messages)]), ...suffix];
+  }
   if (suffix.some((message) => message.role === "system")) {
     const source = messages.slice(0, snapshot.sourceFingerprints.length).filter((message) => message.role === "system");
     const observed = snapshot.messages.filter((message) => message.role === "system");
@@ -153,12 +158,14 @@ export function reuseContextSnapshot(messages: AgentMessage[], snapshot: Context
   return [...structuredClone(snapshot.messages), ...suffix];
 }
 
-/** Pi 0.99 applies per-run prompt overrides after context hooks by collapsing system messages into one head. */
+/** Pi projects a forced prompt as one system head with the tools active at the end of the projection. */
+function forcedSystemHead(head: SystemMessage | undefined, text: string): SystemMessage {
+  return { role: "system", content: text, ...(head?.toolsAdded ? { toolsAdded: head.toolsAdded } : {}), timestamp: head?.timestamp ?? 0 };
+}
+
 export function applyPromptOverride(messages: Message[], override: PromptOverride): Message[] | undefined {
   const head = getCurrentSystemMessage(messages);
-  if (!head) return undefined;
-  const { sections: _sections, ...declarations } = head;
-  return [{ ...declarations, content: override.text }, ...withoutSystemMessages(messages)];
+  return head && [forcedSystemHead(head, override.text), ...withoutSystemMessages(messages)];
 }
 
 /** Public Pi state that can change declarations or request parameters without changing the conversation. */
@@ -312,6 +319,11 @@ interface TrackedSnapshots {
   providerRequest?: ProviderRequestSnapshot;
 }
 
+type RunPrompt = { readonly sessionId: string } & (
+  | { readonly options: Readonly<BuildSystemPromptOptions> }
+  | { readonly forced: string | undefined }
+);
+
 /**
  * Follow one ordinary request through Pi's hooks: `context`, then `context_with_system`, then
  * `before_provider_request` for each provider attempt, then `agent_settled` when its run ends.
@@ -319,9 +331,16 @@ interface TrackedSnapshots {
  */
 export class RequestSnapshotTracker {
   private state: TrackedSnapshots = {};
+  private runPrompt?: RunPrompt;
 
   /** Forget every snapshot; a compaction that already started keeps the state it captured. */
   reset(): void {
+    this.runPrompt = undefined;
+    this.discardSnapshots();
+  }
+
+  /** Drop invalid request state without losing the current run's prompt sample. */
+  discardSnapshots(): void {
     this.state = {};
   }
 
@@ -330,8 +349,17 @@ export class RequestSnapshotTracker {
     return this.state;
   }
 
+  recordRunStart(sessionId: string, options: Readonly<BuildSystemPromptOptions>): void {
+    // Pi shares the options across before_agent_start handlers and writes the forced text back there.
+    this.runPrompt = { sessionId, options };
+  }
+
   /** `context`: bind to canonical history independently of earlier request-local transformations. */
   recordContext(sessionId: string, target: CapableModel | undefined, canonical: () => readonly AgentMessage[]): void {
+    const run = this.runPrompt;
+    if (run && "options" in run) {
+      this.runPrompt = run.sessionId === sessionId ? { sessionId, forced: run.options.forceSystemPrompt } : undefined;
+    }
     this.state.pendingSource = target ? { sessionId, identity: target.identity,
       sourceFingerprints: canonical().map(fingerprintMessage) } : undefined;
     this.state.pendingContext = undefined;
@@ -369,17 +397,24 @@ export class RequestSnapshotTracker {
   ): void {
     this.state.providerRequest = undefined;
     const messages = target ? canonical() : undefined;
-    this.state.promptOverride = target && messages && capturePromptOverride(messages, sessionId, target, systemPrompt());
+    const prompt = target && messages ? systemPrompt() : undefined;
+    const override = target && messages && prompt !== undefined ? capturePromptOverride(messages, sessionId, target, prompt) : undefined;
+    this.state.promptOverride = override;
     // Keep a valid pending snapshot for retries that do not run context hooks again. Any source change
     // invalidates that binding before publishing, including changes made by later context handlers.
-    const pending = this.state.pendingContext;
-    if (!target || !messages || !pending || !snapshotFor(pending.source, sessionId, target) ||
-        messages.length !== pending.source.sourceFingerprints.length || !matchesSourcePrefix(messages, pending.source)) {
-      this.state.pendingContext = undefined;
-    }
     const matched = this.state.pendingContext;
-    this.state.context = matched?.context;
-    if (!matched || !target) return;
+    if (!target || !messages || !matched || !snapshotFor(matched.source, sessionId, target) ||
+        messages.length !== matched.source.sourceFingerprints.length || !matchesSourcePrefix(messages, matched.source)) {
+      this.state.pendingContext = undefined;
+      this.state.context = undefined;
+      return;
+    }
+    const run = this.runPrompt;
+    const forced = run?.sessionId === sessionId && "forced" in run ? run.forced : undefined;
+    // An equal effective prompt with no override means the persisted text matched, provided it has a head.
+    const sameText = forced !== undefined && forced === prompt && !override &&
+      (forced === "" || messages.some((message) => message.role === "system"));
+    this.state.context = sameText ? { ...matched.context, forcedSystemPrompt: forced } : matched.context;
     const { payload, inputs, replay } = observation();
     const replayMissing = replay !== "applied" && (matched.requiresReplay || replay === "failed");
     this.state.providerRequest = captureProviderRequest(matched.context, target, payload, inputs, replayMissing);
@@ -391,6 +426,7 @@ export class RequestSnapshotTracker {
    * the request prefix still comes from the transcript the snapshot's source fingerprints bind.
    */
   recordSettledRun(sessionId: string, target: CapableModel | undefined, inputs: () => ProviderRequestInputs): void {
+    this.runPrompt = undefined;
     if (!target) return;
     const snapshot = snapshotFor(this.state.providerRequest, sessionId, target);
     if (!snapshot || snapshot.settledInputsKey !== undefined) return;
@@ -441,15 +477,19 @@ export function compactionRequest(
   const providerRequest = suffix && !suffix.some((message) => message.role === "system") &&
     (snapshot.inputsKey === key || snapshot.settledInputsKey === key) ? snapshot : undefined;
 
-  const reused = reuseContextSnapshot(current, snapshotFor(snapshots.context, sessionId, target));
+  const contextSnapshot = snapshotFor(snapshots.context, sessionId, target);
+  const reused = reuseContextSnapshot(current, contextSnapshot);
   // The provider serializes the full transcript so grammar declarations and historical IDs keep their context.
   // Private user items mark the join and the transcript end; applyProviderRequest removes both,
   // replaces everything before the join, and keeps the request-level items Pi serializes after the end.
   const prefix = providerRequest?.prefix;
-  const messages: AgentMessage[] = prefix ? [
-    ...reused.slice(0, prefix.contextLength),
+  const join = contextSnapshot?.forcedSystemPrompt !== undefined && suffix
+    ? reused.length - suffix.length
+    : prefix?.contextLength;
+  const messages: AgentMessage[] = prefix && join !== undefined ? [
+    ...reused.slice(0, join),
     { role: "user", content: prefix.boundary, timestamp: 0 },
-    ...reused.slice(prefix.contextLength),
+    ...reused.slice(join),
     { role: "user", content: transcriptEndBoundary(prefix.boundary), timestamp: 0 },
   ] : reused;
   const converted = convertToLlm(messages);

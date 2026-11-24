@@ -447,6 +447,10 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     warnOnce(ctx, `${details.checkpointId}:backend`, INCOMPATIBLE_BACKEND_WARNING);
   });
 
+  pi.on("before_agent_start", (event, ctx) => {
+    snapshots.recordRunStart(ctx.sessionManager.getSessionId(), event.systemPromptOptions);
+  });
+
   pi.on("context", (_event, ctx) => {
     snapshots.recordContext(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => canonicalMessages(ctx));
   });
@@ -459,7 +463,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     if (checkpoint && await compatibleIdentity(checkpoint, ctx)) {
       messages = projectCheckpointTranscript(event.messages, canonicalMessages(ctx), checkpoint);
       if (!messages) {
-        snapshots.reset();
+        snapshots.discardSnapshots();
         warnOnce(ctx, `${checkpoint.checkpointId}:projection`,
           "The active Codex checkpoint no longer matches this request's retained messages, so its opaque history is not replayed.");
       }
