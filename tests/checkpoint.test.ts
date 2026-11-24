@@ -17,7 +17,6 @@ import {
   fingerprintMessage,
   keptMessages,
   parseCheckpointDetails,
-  projectCheckpointContext,
   projectCheckpointRequest,
   projectCheckpointTranscript,
   resolveLatestCheckpoint,
@@ -115,10 +114,10 @@ test("projects exact retained messages for resume and rejects corrupt state", ()
     timestamp: 1,
   };
   const after = user("after", 3);
-  const projected = projectCheckpointContext([summary, kept, after], details);
+  const projected = projectCheckpointRequest([summary, kept, after], details);
   assert.equal(projected?.length, 2);
   assert.match(JSON.stringify(projected?.[0]), /PI_CODEX_REMOTE_CHECKPOINT/);
-  assert.equal(projectCheckpointContext([summary, user("changed", 2), after], details), undefined);
+  assert.equal(projectCheckpointRequest([summary, user("changed", 2), after], details), undefined);
   assert.equal(parseCheckpointDetails({ ...details, replacementHistory: [] }), undefined);
 });
 
@@ -285,7 +284,7 @@ for (const scenario of ["replacement", "omission", "older checkpoints", "system 
     const savedEntries = structuredClone(session.getEntries());
     const active = resolveLatestCheckpoint(session.getBranch());
     assert.equal(active.state, "parsed");
-    const projected = projectCheckpointContext(session.buildSessionProjection().messages, active.details);
+    const projected = projectCheckpointRequest(session.buildSessionProjection().messages, active.details);
     assert.ok(projected, "legacy checkpoint must replay against Pi's canonical messages");
     assert.notDeepEqual(active.details.keptMessageFingerprints, details.keptMessageFingerprints);
     assert.deepEqual(active.details.replacementHistory, details.replacementHistory);
@@ -303,7 +302,7 @@ test("does not reinterpret later edits as a legacy fingerprint repair", () => {
   assert.equal(fingerprintMessage(restored), details.keptMessageFingerprints.at(-1));
   const active = resolveLatestCheckpoint(session.getBranch());
   assert.equal(active.state, "parsed");
-  assert.equal(projectCheckpointContext(projected.messages, active.details), undefined);
+  assert.equal(projectCheckpointRequest(projected.messages, active.details), undefined);
 });
 
 test("does not normalize corrupt legacy fingerprints", () => {
@@ -312,7 +311,7 @@ test("does not normalize corrupt legacy fingerprints", () => {
   const active = resolveLatestCheckpoint(session.getBranch());
   assert.equal(active.state, "parsed");
   assert.deepEqual(active.details.keptMessageFingerprints, details.keptMessageFingerprints);
-  assert.equal(projectCheckpointContext(session.buildSessionProjection().messages, active.details), undefined);
+  assert.equal(projectCheckpointRequest(session.buildSessionProjection().messages, active.details), undefined);
 });
 
 test("requires the creation-time retained entries to repair legacy fingerprints", () => {
@@ -321,7 +320,7 @@ test("requires the creation-time retained entries to repair legacy fingerprints"
   const active = resolveLatestCheckpoint(incomplete);
   assert.equal(active.state, "parsed");
   assert.deepEqual(active.details.keptMessageFingerprints, details.keptMessageFingerprints);
-  assert.equal(projectCheckpointContext(session.buildSessionProjection().messages, active.details), undefined);
+  assert.equal(projectCheckpointRequest(session.buildSessionProjection().messages, active.details), undefined);
 });
 
 test("repairs only the selected checkpoint branch after navigating back", () => {
@@ -330,7 +329,7 @@ test("repairs only the selected checkpoint branch after navigating back", () => 
   session.branch(entryId);
   const active = resolveLatestCheckpoint(session.getBranch());
   assert.equal(active.state, "parsed");
-  assert.ok(projectCheckpointContext(session.buildSessionProjection().messages, active.details));
+  assert.ok(projectCheckpointRequest(session.buildSessionProjection().messages, active.details));
 });
 
 test("caches a fingerprint per immutable message object without conflating equal copies", () => {
@@ -407,7 +406,7 @@ test("new checkpoints replay unchanged across default collation changes", (t) =>
   const entries: SessionEntry[] = JSON.parse(saved);
   const restored = resolveLatestCheckpoint(entries);
   assert.equal(restored.state, "parsed");
-  assert.ok(projectCheckpointContext(buildSessionProjection(entries).messages, restored.details));
+  assert.ok(projectCheckpointRequest(buildSessionProjection(entries).messages, restored.details));
   assert.equal(fingerprintMessage(localizedToolMessage()), details.keptMessageFingerprints[0]);
   assert.equal(JSON.stringify(entries), saved);
 });
@@ -439,7 +438,7 @@ for (const fixture of localeFingerprints) {
         const active = resolveLatestCheckpoint(session.getBranch());
         assert.equal(active.state, "parsed");
         assert.notEqual(active.details.keptMessageFingerprints[0], fixture.edited, "normalize to locale-independent hashes");
-        const projected = projectCheckpointContext(session.buildSessionProjection().messages, active.details);
+        const projected = projectCheckpointRequest(session.buildSessionProjection().messages, active.details);
         assert.equal(projected !== undefined, !editedAfterCheckpoint);
         assert.deepEqual(session.getEntries(), saved);
         assert.equal(active.details.version, 1);
@@ -460,7 +459,7 @@ test("does not guess an unverifiable legacy locale or rewrite its checkpoint", (
   const active = resolveLatestCheckpoint(session.getBranch());
   assert.equal(active.state, "parsed");
   assert.deepEqual(active.details.keptMessageFingerprints, details.keptMessageFingerprints);
-  assert.equal(projectCheckpointContext(session.buildSessionProjection().messages, active.details), undefined);
+  assert.equal(projectCheckpointRequest(session.buildSessionProjection().messages, active.details), undefined);
   assert.deepEqual(session.getEntries(), saved);
 });
 
@@ -497,7 +496,7 @@ test("persisted legacy summaries restore only their own unchanged checkpoint his
   const kept = user("kept", 2);
   const details = checkpoint([kept]);
   const summary: AgentMessage = { role: "compactionSummary", summary: legacyCheckpointSummary(details.checkpointId), tokensBefore: 100, timestamp: 1 };
-  assert.ok(projectCheckpointContext([summary, kept], details));
-  assert.equal(projectCheckpointContext([summary, user("edited", 2)], details), undefined);
-  assert.equal(projectCheckpointContext([{ ...summary, summary: legacyCheckpointSummary("different-checkpoint") }, kept], details), undefined);
+  assert.ok(projectCheckpointRequest([summary, kept], details));
+  assert.equal(projectCheckpointRequest([summary, user("edited", 2)], details), undefined);
+  assert.equal(projectCheckpointRequest([{ ...summary, summary: legacyCheckpointSummary("different-checkpoint") }, kept], details), undefined);
 });
