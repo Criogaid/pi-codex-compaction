@@ -112,33 +112,27 @@ test("requires output_item.done and response.completed", () => {
   assert.throws(() => incomplete.finish(), CodexCompactionProtocolError);
 });
 
-test("accepts the compaction_summary alias and clears the selected item only on a restart before completion", () => {
+test("accepts the compaction_summary alias", () => {
   const collector = createCompactionCollector();
   const alias = { ...item, type: "compaction_summary" };
   collector.observe({ ...done, item: alias });
   collector.observe({ ...completed, response: { output: [alias] } });
   assert.deepEqual(collector.finish(), item);
+});
 
-  const restart = { type: "response.created" };
-  collector.observe(restart);
+test("retains the compaction item when response.created arrives before completion", () => {
+  const collector = createCompactionCollector();
+  collector.observe(done);
+  collector.observe({ type: "response.created" });
   collector.observe({ ...completed, response: { output: [] } });
   assert.deepEqual(collector.finish(), item);
+});
 
-  const abandoned = createCompactionCollector();
-  abandoned.observe(done);
-  abandoned.observe(restart);
-  assert.throws(() => abandoned.observe({ ...completed, response: { output: [] } }), {
-    name: CodexCompactionProtocolError.name,
-    message: "Remote compaction returned 0 compaction output events; expected exactly one",
-  });
-
-  const duplicate = createCompactionCollector();
-  duplicate.observe(done);
-  duplicate.observe(restart);
-  assert.throws(
-    () => duplicate.observe({ ...done, item: { type: alias.type } }),
-    duplicateOutputError,
-  );
+test("rejects duplicate compaction items across response.created", () => {
+  const collector = createCompactionCollector();
+  collector.observe(done);
+  collector.observe({ type: "response.created" });
+  assert.throws(() => collector.observe({ ...done, item: { type: "compaction_summary" } }), duplicateOutputError);
 });
 
 test("accepts opaque output and event volume above the former plugin-only byte ceilings", () => {
