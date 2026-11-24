@@ -20,8 +20,8 @@ import {
   type ProviderIdentity,
 } from "./capability.js";
 import {
+  type CheckpointResolution,
   type CodexCheckpointDetails,
-  CHECKPOINT_KIND,
   checkpointMarker,
   checkpointHistory,
   createCheckpointDetails,
@@ -29,13 +29,13 @@ import {
   fallbackSummary,
   fingerprintMessage,
   keptMessages,
-  latestCheckpoint,
   parseCheckpointDetails,
   projectCheckpointRequest,
   projectCheckpointTranscript,
   prepareCheckpointLayer,
+  resolveLatestCheckpoint,
 } from "./checkpoint.js";
-import { hasCheckpointMarker, isObject, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker, withoutInputImages } from "./protocol.js";
+import { hasCheckpointMarker, type JsonObject, REMOTE_COMPACTION_PROTOCOL, rewriteCheckpointMarker, withoutInputImages } from "./protocol.js";
 import { requestRemoteCompaction, RemoteCompactionTransientError } from "./remote.js";
 import { requestFallbackCompaction } from "./fallback.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH, loadCompactionSettings, type CompactionConfiguration } from "./fallback-settings.js";
@@ -53,8 +53,9 @@ interface CompletionEntryData {
   checkpointId: string;
 }
 
-function activeCheckpoint(ctx: ExtensionContext) {
-  return latestCheckpoint(ctx.sessionManager.getBranch());
+function activeCheckpoint(ctx: ExtensionContext): CodexCheckpointDetails | undefined {
+  const checkpoint = resolveLatestCheckpoint(ctx.sessionManager.getBranch());
+  return checkpoint.state === "parsed" ? checkpoint.details : undefined;
 }
 
 async function compatibleIdentity(
@@ -97,28 +98,28 @@ function canonicalMessages(ctx: ExtensionContext): AgentMessage[] {
 function projectedCurrentMessages(
   event: SessionBeforeCompactEvent,
   identity: ProviderIdentity,
-): { messages: AgentMessage[]; prior?: CodexCheckpointDetails } {
+  prior: CodexCheckpointDetails | undefined,
+): AgentMessage[] {
   const leafId = event.branchEntries.at(-1)?.id ?? null;
   const session = buildSessionContext(event.branchEntries, leafId);
-  const prior = latestCheckpoint(event.branchEntries)?.details;
-  if (!prior) return { messages: session.messages };
+  if (!prior) return session.messages;
   if (!sameProvider(prior, identity)) {
     throw new Error("The active opaque checkpoint belongs to a different provider backend");
   }
   const projected = projectCheckpointRequest(session.messages, prior);
   if (!projected) throw new Error("The previous opaque checkpoint could not be projected safely");
-  return { messages: projected, prior };
+  return projected;
 }
 
 async function replayCheckpoint(payload: unknown, ctx: ExtensionContext, blockImages: boolean): Promise<JsonObject | undefined> {
   const checkpoint = activeCheckpoint(ctx);
   if (!checkpoint) return undefined;
-  const marker = checkpointMarker(checkpoint.details.checkpointId);
+  const marker = checkpointMarker(checkpoint.checkpointId);
   if (!hasCheckpointMarker(payload, marker)) return undefined;
-  if (!await compatibleIdentity(checkpoint.details, ctx)) {
+  if (!await compatibleIdentity(checkpoint, ctx)) {
     throw new Error("The active opaque checkpoint no longer matches the resolved provider endpoint");
   }
-  const history = checkpointHistory(checkpoint.details);
+  const history = checkpointHistory(checkpoint);
   return rewriteCheckpointMarker(payload, marker, blockImages ? withoutInputImages(history) : history);
 }
 
@@ -240,25 +241,24 @@ async function compactRemotely(
   if (!configuration.remoteCompactionEnabled || !supported) return compactFallback(pi, event, ctx, sessionId, configuration, undefined);
   const reasoning = pi.getThinkingLevel();
   const settings = pi.getSettings();
-  const previousCompaction = [...event.branchEntries].reverse().find((entry) => entry.type === "compaction");
-  const hasPriorCheckpoint = previousCompaction?.type === "compaction" &&
-    isObject(previousCompaction.details) && previousCompaction.details.kind === CHECKPOINT_KIND;
+  let checkpoint: CheckpointResolution | undefined;
   let prior: CodexCheckpointDetails | undefined;
   let announced = false;
   ctx.ui.setStatus(STATUS_KEY, "Codex remote compaction...");
   try {
     if (!owned()) return { cancel: true };
-    if (hasPriorCheckpoint && !latestCheckpoint(event.branchEntries)) {
+    checkpoint = resolveLatestCheckpoint(event.branchEntries);
+    if (checkpoint.state === "invalid") {
       throw new Error("The previous checkpoint format is invalid or unsupported");
     }
     if (event.customInstructions?.trim() && ctx.hasUI) {
       ctx.ui.notify("Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", "warning");
     }
-    const current = projectedCurrentMessages(event, supported.identity);
-    prior = current.prior;
+    prior = checkpoint.state === "parsed" ? checkpoint.details : undefined;
+    const currentMessages = projectedCurrentMessages(event, supported.identity, prior);
     const inputs = providerRequestInputs(pi, ctx);
-    const providerRequest = providerRequestFor(snapshots, sessionId, supported, current.messages, inputs);
-    const request = compactionRequest(snapshots, sessionId, supported, current.messages, {
+    const providerRequest = providerRequestFor(snapshots, sessionId, supported, currentMessages, inputs);
+    const request = compactionRequest(snapshots, sessionId, supported, currentMessages, {
       blockImages: settings.images?.blockImages ?? false,
       systemPrompt: () => ctx.getSystemPrompt(),
       tools: () => activeTools(pi),
@@ -286,12 +286,12 @@ async function compactRemotely(
           "info",
         );
       },
-      priorCheckpoint: current.prior
+      priorCheckpoint: prior
         ? {
-            identity: current.prior,
-            marker: checkpointMarker(current.prior.checkpointId),
-            replacementHistory: checkpointHistory(current.prior),
-            contextualFrom: current.prior.replacementHistory.length,
+            identity: prior,
+            marker: checkpointMarker(prior.checkpointId),
+            replacementHistory: checkpointHistory(prior),
+            contextualFrom: prior.replacementHistory.length,
           }
         : undefined,
       fetch,
@@ -320,21 +320,20 @@ async function compactRemotely(
     if (!owned()) {
       return { cancel: true };
     }
-    if (hasPriorCheckpoint) {
-      try {
-        if (!prior || !(error instanceof RemoteCompactionTransientError) ||
-            !await compatibleIdentity(prior, ctx, supported.model)) {
-          throw new Error("The failed remote request is not eligible for safe layered recovery", { cause: error });
-        }
-        return await compactFallback(pi, event, ctx, sessionId, configuration, error, {
-          prior, selection: { model: supported.model, thinkingLevel: reasoning },
-        });
-      } catch (failure) {
-        if (owned() && ctx.hasUI) ctx.ui.notify(`Compaction stopped; previous history was preserved. ${errorMessage(failure)}`, "error");
-        return { cancel: true };
+    // A failure during checkpoint resolution cannot establish that native fallback is safe.
+    if (checkpoint?.state === "none") return await compactFallback(pi, event, ctx, sessionId, configuration, error);
+    try {
+      if (!prior || !(error instanceof RemoteCompactionTransientError) ||
+          !await compatibleIdentity(prior, ctx, supported.model)) {
+        throw new Error("The failed remote request is not eligible for safe layered recovery", { cause: error });
       }
+      return await compactFallback(pi, event, ctx, sessionId, configuration, error, {
+        prior, selection: { model: supported.model, thinkingLevel: reasoning },
+      });
+    } catch (failure) {
+      if (owned() && ctx.hasUI) ctx.ui.notify(`Compaction stopped; previous history was preserved. ${errorMessage(failure)}`, "error");
+      return { cancel: true };
     }
-    return await compactFallback(pi, event, ctx, sessionId, configuration, error);
   } finally {
     if (ctx.sessionManager.getSessionId() === sessionId) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -401,11 +400,11 @@ export function createCodexCompactionExtension(
     pi.on("context_with_system", async (event, ctx) => {
       let messages: AgentMessage[] | undefined;
       const checkpoint = activeCheckpoint(ctx);
-      if (checkpoint && await compatibleIdentity(checkpoint.details, ctx)) {
-        messages = projectCheckpointTranscript(event.messages, canonicalMessages(ctx), checkpoint.details);
+      if (checkpoint && await compatibleIdentity(checkpoint, ctx)) {
+        messages = projectCheckpointTranscript(event.messages, canonicalMessages(ctx), checkpoint);
         if (!messages) {
           snapshots.reset();
-          warnOnce(ctx, `${checkpoint.details.checkpointId}:projection`,
+          warnOnce(ctx, `${checkpoint.checkpointId}:projection`,
             "The active Codex checkpoint no longer matches this request's retained messages, so its opaque history is not replayed.");
         }
       }
@@ -413,7 +412,7 @@ export function createCodexCompactionExtension(
         ctx.sessionManager.getSessionId(),
         capableModel(ctx.model),
         () => canonicalMessages(ctx),
-        () => activeCheckpoint(ctx)?.details,
+        () => activeCheckpoint(ctx),
         messages ?? event.messages,
       );
       return messages ? { messages } : undefined;
@@ -438,8 +437,8 @@ export function createCodexCompactionExtension(
 
     pi.on("model_select", async (event, ctx) => {
       const checkpoint = activeCheckpoint(ctx);
-      if (!checkpoint || await compatibleIdentity(checkpoint.details, ctx, event.model)) return;
-      warnOnce(ctx, `${checkpoint.details.checkpointId}:${event.model.provider}:${event.model.id}`, INCOMPATIBLE_BACKEND_WARNING);
+      if (!checkpoint || await compatibleIdentity(checkpoint, ctx, event.model)) return;
+      warnOnce(ctx, `${checkpoint.checkpointId}:${event.model.provider}:${event.model.id}`, INCOMPATIBLE_BACKEND_WARNING);
     });
 
     pi.on("session_shutdown", (_event, ctx) => {

@@ -6,6 +6,7 @@ import { getCurrentSystemMessage, type Message } from "@earendil-works/pi-ai";
 import {
   buildSessionProjection,
   buildSessionContext,
+  getLatestCompactionEntry,
   sessionEntryToContextMessages,
   type CompactionEntry,
   type ProjectedSessionEntry,
@@ -17,7 +18,7 @@ import {
   type ProviderIdentity,
 } from "./capability.js";
 
-export const CHECKPOINT_KIND = "pi-codex-compaction";
+const CHECKPOINT_KIND = "pi-codex-compaction";
 export const CHECKPOINT_VERSION = 1;
 const EXTENSION_PACKAGE = "@criogaid/pi-codex-compaction";
 
@@ -198,22 +199,23 @@ function normalizeLegacyFingerprints(
   return { ...details, keptMessageFingerprints: canonical.map(fingerprintMessage) };
 }
 
-export function latestCheckpoint(
-  entries: readonly SessionEntry[],
-): { entry: CompactionEntry<CodexCheckpointDetails>; details: CodexCheckpointDetails } | undefined {
-  for (let index = entries.length - 1; index >= 0; index--) {
-    const entry = entries[index];
-    if (entry.type !== "compaction") continue;
-    // A checkpoint's ancestors are immutable, so its normalized details are stable per entry.
-    let details = checkpoints.get(entry);
-    if (details === undefined) {
-      const parsed = parseCheckpointDetails(entry.details);
-      details = parsed ? normalizeLegacyFingerprints(entries, entry, parsed) : null;
-      checkpoints.set(entry, details);
-    }
-    return details ? { entry: entry as CompactionEntry<CodexCheckpointDetails>, details } : undefined;
+export type CheckpointResolution =
+  | { readonly state: "none" }
+  | { readonly state: "invalid" }
+  | { readonly state: "parsed"; readonly details: CodexCheckpointDetails };
+
+export function resolveLatestCheckpoint(entries: SessionEntry[]): CheckpointResolution {
+  const entry = getLatestCompactionEntry(entries);
+  if (!entry || !isObject(entry.details) || entry.details.kind !== CHECKPOINT_KIND) return { state: "none" };
+
+  // A checkpoint's ancestors are immutable, so its normalized details are stable per entry.
+  let details = checkpoints.get(entry);
+  if (details === undefined) {
+    const parsed = parseCheckpointDetails(entry.details);
+    details = parsed ? normalizeLegacyFingerprints(entries, entry, parsed) : null;
+    checkpoints.set(entry, details);
   }
-  return undefined;
+  return details ? { state: "parsed", details } : { state: "invalid" };
 }
 
 /** Locate the checkpoint summary and its exact retained messages in a conversation without system messages. */

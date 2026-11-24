@@ -2,8 +2,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { latestCheckpoint } from "../src/checkpoint.js";
+import { getLatestCompactionEntry, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { resolveLatestCheckpoint } from "../src/checkpoint.js";
 import { createCodexCompactionExtension } from "../src/index.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, sessionFixture } from "./helpers.js";
@@ -24,10 +24,12 @@ async function seed(fixture: Awaited<ReturnType<typeof sessionFixture>>) {
     await fixture.session.prompt(`Decision ${turn}: ${"Keep every approved interface and data handling requirement. ".repeat(160)}`);
   }
   await fixture.session.compact();
-  const checkpoint = latestCheckpoint(fixture.session.sessionManager.getBranch());
-  assert.ok(checkpoint);
+  const entries = fixture.session.sessionManager.getBranch();
+  assert.equal(resolveLatestCheckpoint(entries).state, "parsed");
+  const entry = getLatestCompactionEntry(entries);
+  assert.ok(entry);
   await fixture.session.prompt("Continue implementing the approved plan. ".repeat(80));
-  return checkpoint;
+  return entry;
 }
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
@@ -39,14 +41,14 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     });
     try {
       const original = await seed(fixture);
-      const saved = structuredClone(original.entry.details);
+      const saved = structuredClone(original.details);
       const count = fixture.requests.length;
       await fixture.session.setModel(fixture.models[1]);
       assert.equal(fixture.requests.length, count);
       await fixture.session.prompt("Continue using the available recent context.");
       assert.equal(fixture.requests.length, count + 1);
       assert.ok(!hasItem(fixture.requests.at(-1)!.payload, "compaction"));
-      assert.deepEqual(original.entry.details, saved);
+      assert.deepEqual(original.details, saved);
       await fixture.session.setModel(fixture.model);
       await fixture.session.prompt("Continue on the original backend.");
       assert.ok(hasItem(fixture.requests.at(-1)!.payload, "compaction"));
@@ -80,14 +82,16 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       const count = fixture.requests.length;
       await fixture.session.setModel(fixture.models[1]);
       assert.equal(fixture.requests.length, count, "Selection must not send preparatory compaction requests");
-      assert.equal(latestCheckpoint(fixture.session.sessionManager.getBranch())?.entry.id, original.entry.id);
+      assert.equal(getLatestCompactionEntry(fixture.session.sessionManager.getBranch())?.id, original.id);
       await fixture.session.prompt("Continue on the smaller model. ".repeat(2_000));
       assert.equal(fixture.requests.length, count + 1, "Pi and the provider retain ordinary context-window handling");
       assert.ok(hasItem(fixture.requests.at(-1)!.payload, "compaction"));
       await fixture.session.compact();
       assert.equal(fixture.requests.at(-1)!.payload.model, fixture.models[1].id);
       assert.ok(hasItem(fixture.requests.at(-1)!.payload, "compaction_trigger"));
-      assert.equal(latestCheckpoint(fixture.session.sessionManager.getBranch())?.details.modelId, fixture.models[1].id);
+      const checkpoint = resolveLatestCheckpoint(fixture.session.sessionManager.getBranch());
+      assert.equal(checkpoint.state, "parsed");
+      assert.equal(checkpoint.details.modelId, fixture.models[1].id);
       assert.equal(fixture.session.model?.id, fixture.models[1].id);
       assert.deepEqual(fixture.errors, []);
     } finally { await fixture.close(); }
@@ -110,19 +114,22 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
     });
     try {
       const original = await seed(fixture);
-      const saved = structuredClone(original.entry.details);
+      const saved = structuredClone(original.details);
       const count = fixture.requests.length;
       failNext = true;
       await fixture.session.compact();
       const attempts = fixture.requests.slice(count);
       assert.equal(attempts.length, 2);
       assert.deepEqual(attempts[0].payload, attempts[1].payload);
-      const successful = latestCheckpoint(fixture.session.sessionManager.getBranch());
-      assert.ok(successful);
-      assert.notEqual(successful.entry.id, original.entry.id);
+      const entries = fixture.session.sessionManager.getBranch();
+      const successful = resolveLatestCheckpoint(entries);
+      assert.equal(successful.state, "parsed");
+      const entry = getLatestCompactionEntry(entries);
+      assert.ok(entry);
+      assert.notEqual(entry.id, original.id);
       assert.doesNotMatch(JSON.stringify(successful.details), /discarded-attempt-opaque/);
       assert.equal(successful.details.replacementHistory.filter((item) => item.type === "compaction").length, 1);
-      assert.deepEqual(original.entry.details, saved);
+      assert.deepEqual(original.details, saved);
       assert.deepEqual(fixture.errors, []);
     } finally { await fixture.close(); }
   });
@@ -182,8 +189,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
             assert.ok(ordinary && Array.isArray(ordinary.input));
             const count = fixture.requests.length;
             await fixture.session.compact();
-            const checkpoint = latestCheckpoint(fixture.session.sessionManager.getBranch());
-            assert.ok(checkpoint);
+            const checkpoint = resolveLatestCheckpoint(fixture.session.sessionManager.getBranch());
+            assert.equal(checkpoint.state, "parsed");
             assert.equal(checkpoint.details.modelId, fixture.model.id);
             assert.equal(checkpoint.details.baseUrl, fixture.model.baseUrl);
             assert.equal(checkpoint.details.provider, fixture.model.provider);
@@ -245,7 +252,7 @@ test("a context handler that drops the checkpoint summary continues the ordinary
     await fixture.session.prompt("Continue without the compaction summary.");
     assert.equal(fixture.requests.length, count + 1);
     assert.ok(!hasItem(fixture.requests.at(-1)!.payload, "compaction"));
-    assert.equal(latestCheckpoint(fixture.session.sessionManager.getBranch())?.entry.id, original.entry.id);
+    assert.equal(getLatestCompactionEntry(fixture.session.sessionManager.getBranch())?.id, original.id);
     assert.deepEqual(fixture.errors, []);
   } finally { await fixture.close(); }
 });

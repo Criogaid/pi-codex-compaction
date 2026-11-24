@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { latestCheckpoint } from "../src/checkpoint.js";
+import { getLatestCompactionEntry } from "@earendil-works/pi-coding-agent";
+import { resolveLatestCheckpoint } from "../src/checkpoint.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
 import { createCodexCompactionExtension } from "../src/index.js";
 import { isObject, type JsonObject } from "../src/protocol.js";
@@ -19,11 +20,13 @@ async function seedHistory(fixture: Awaited<ReturnType<typeof sessionFixture>>) 
   await fixture.session.prompt("Discuss the implementation. ".repeat(80));
   await fixture.session.prompt("Continue the agreed task. ".repeat(80));
   await fixture.session.compact();
-  const checkpoint = latestCheckpoint(fixture.session.sessionManager.getBranch());
-  assert.ok(checkpoint);
+  const entries = fixture.session.sessionManager.getBranch();
+  assert.equal(resolveLatestCheckpoint(entries).state, "parsed");
+  const entry = getLatestCompactionEntry(entries);
+  assert.ok(entry);
   await fixture.session.prompt("Continue from the saved checkpoint. ".repeat(80));
   assert.ok(hasItem(fixture.requests.at(-1)!.payload, "compaction"));
-  return checkpoint;
+  return entry;
 }
 
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
@@ -37,8 +40,8 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
             ? new Response("Temporary service outage", { status: 503 }) : undefined,
         });
         try {
-          const checkpoint = await seedHistory(fixture);
-          const saved = structuredClone(checkpoint.entry.details);
+          const entry = await seedHistory(fixture);
+          const saved = structuredClone(entry.details);
           await mkdir(dirname(configPath), { recursive: true });
           await writeFile(configPath, JSON.stringify({
             version: 1, remoteCompaction: { enabled: reason !== "V2 disabled" },
@@ -56,13 +59,10 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
           const summaries = attempted.filter(({ payload }) => !hasItem(payload, "compaction_trigger"));
           assert.ok(summaries.length > 0, "Native summaries remain available after an opaque checkpoint");
           assert.ok(summaries.every(({ payload }) => !hasItem(payload, "compaction")));
-          if (reason === "remote failure") {
-            assert.ok(latestCheckpoint(fixture.session.sessionManager.getBranch()), "Transient V2 failure preserves the opaque base");
-          } else {
-            assert.equal(latestCheckpoint(fixture.session.sessionManager.getBranch()), undefined);
-          }
+          const active = resolveLatestCheckpoint(fixture.session.sessionManager.getBranch());
+          assert.equal(active.state, reason === "remote failure" ? "parsed" : "none");
           assert.equal(fixture.session.sessionManager.getBranch().filter((entry) => entry.type === "compaction").length, 2);
-          assert.deepEqual(checkpoint.entry.details, saved, "The persisted V2 entry remains unchanged");
+          assert.deepEqual(entry.details, saved, "The persisted V2 entry remains unchanged");
 
           failRemote = false;
           await fixture.session.prompt("Continue after the text summary.");
@@ -82,16 +82,18 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       await fixture.session.prompt("Preserve the constraints in this image. ".repeat(80), { images: [image] });
       for (let turn = 0; turn < 2; turn++) await fixture.session.prompt("Continue the implementation. ".repeat(80));
       await fixture.session.compact();
-      const checkpoint = latestCheckpoint(fixture.session.sessionManager.getBranch());
-      assert.ok(checkpoint);
-      const saved = structuredClone(checkpoint.entry.details);
+      const entries = fixture.session.sessionManager.getBranch();
+      assert.equal(resolveLatestCheckpoint(entries).state, "parsed");
+      const entry = getLatestCompactionEntry(entries);
+      assert.ok(entry);
+      const saved = structuredClone(entry.details);
       assert.ok(JSON.stringify(saved).includes(image.data));
 
       fixture.session.settingsManager.setBlockImages(true);
       await fixture.session.prompt("Continue with image reading disabled. ".repeat(80));
       assert.doesNotMatch(JSON.stringify(fixture.requests.at(-1)!.payload), /"type":"input_image"/);
       assert.ok(!JSON.stringify(fixture.requests.at(-1)!.payload).includes(image.data));
-      assert.deepEqual(checkpoint.entry.details, saved);
+      assert.deepEqual(entry.details, saved);
 
       fixture.session.settingsManager.setBlockImages(false);
       await fixture.session.prompt("Read the saved image again.");
@@ -103,7 +105,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       assert.ok(hasItem(recompacted, "compaction_trigger"));
       assert.doesNotMatch(JSON.stringify(recompacted), /"type":"input_image"/);
       assert.ok(!JSON.stringify(recompacted).includes(image.data));
-      assert.deepEqual(checkpoint.entry.details, saved);
+      assert.deepEqual(entry.details, saved);
       assert.deepEqual(fixture.errors, []);
     } finally {
       await fixture.close();
