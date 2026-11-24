@@ -1246,6 +1246,97 @@ test("an older compaction's Pi fallback cannot overwrite or clear the newer comp
   }
 });
 
+test("reload shutdown keeps the footer cleared when a pending V2 request fails", async () => {
+  await configureFallback();
+  const { ctx, event, mock } = await fallbackFixture({ currentModel: model });
+  const entered = Promise.withResolvers<void>();
+  const reply = Promise.withResolvers<Response>();
+  mock.events.clear();
+  createCodexCompactionExtension({ fetch: async () => {
+    entered.resolve();
+    return reply.promise;
+  } })(mock.pi);
+
+  const statusKey = "codex-compaction";
+  const statusWrites: Array<[key: string, value: string | undefined]> = [];
+  ctx.ui.setStatus = (key, value) => { statusWrites.push([key, value]); };
+  const compact = mock.events.get("session_before_compact")?.[0];
+  const shutdown = mock.events.get("session_shutdown")?.[0];
+  assert.ok(compact && shutdown);
+  const pending = Promise.resolve(compact(event, ctx));
+  try {
+    await Promise.race([entered.promise, pending.then(() => { throw new Error("Compaction ended before its V2 request"); })]);
+    assert.equal(statusWrites.at(-1)?.[0], statusKey);
+    assert.ok(statusWrites.at(-1)?.[1], "V2 must show its footer status before shutdown");
+    const shutdownIndex = statusWrites.length;
+    await shutdown({ type: "session_shutdown", reason: "reload" }, ctx);
+    assert.deepEqual(statusWrites.slice(shutdownIndex), [[statusKey, undefined]]);
+
+    reply.resolve(new Response("", { headers: { "content-type": "text/event-stream" } }));
+    await pending;
+    assert.deepEqual(statusWrites.slice(shutdownIndex + 1), [], "Shutdown must be the final footer write");
+  } finally {
+    reply.resolve(sseResponse());
+    await Promise.allSettled([pending]);
+  }
+});
+
+test("reload shutdown cancels a failed V2 request over an opaque checkpoint with a stale context", async () => {
+  await configureFallback();
+  const fixture = await fallbackFixture({ currentModel: model });
+  const { ctx, event, mock, sessionManager, calls } = fixture;
+  const checkpoint = await compactSession(mock, sessionManager, event.preparation.firstKeptEntryId, fixture);
+  const previous = sessionManager.getLeafEntry();
+  assert.ok(previous?.type === "compaction");
+  event.preparation.previousSummary = previous.summary;
+  event.preparation.messagesToSummarize = sessionManager.buildSessionContext().messages.slice(1);
+  event.preparation.firstKeptEntryId = sessionManager.appendMessage({ role: "user", content: "next task", timestamp: 3 });
+  event.branchEntries = sessionManager.getBranch();
+  const originalBranch = structuredClone(event.branchEntries);
+
+  const native = openaiProvider();
+  ctx.modelRegistry.registerProvider({ ...native, id: model.provider, getModels: () => [model],
+    auth: { apiKey: { name: "Fixture", resolve: async () => ({ auth: { apiKey: "fixture-key" } }) } },
+  });
+  const entered = Promise.withResolvers<JsonObject>();
+  const reply = Promise.withResolvers<Response>();
+  let requests = 0;
+  mock.events.clear();
+  createCodexCompactionExtension({ fetch: async (input, init) => {
+    assert.equal(++requests, 1, "Expected one V2 request after seeding the checkpoint");
+    const payload: unknown = await new Request(input, init).json();
+    assert.ok(isObject(payload));
+    entered.resolve(payload);
+    return reply.promise;
+  } })(mock.pi);
+
+  const compact = mock.events.get("session_before_compact")?.[0];
+  const shutdown = mock.events.get("session_shutdown")?.[0];
+  assert.ok(compact && shutdown);
+  const pending = Promise.resolve(compact(event, ctx));
+  try {
+    const payload = await Promise.race([entered.promise, pending.then(() => { throw new Error("Compaction ended before its V2 request"); })]);
+    assert.ok(Array.isArray(payload.input));
+    const opaque = checkpoint.replacementHistory.filter((item) => item.type === "compaction");
+    assert.ok(opaque.length > 0);
+    assert.deepEqual(payload.input.filter((item) => isObject(item) && item.type === "compaction"), opaque);
+    assert.deepEqual(payload.input.at(-1), { type: "compaction_trigger" });
+
+    await shutdown({ type: "session_shutdown", reason: "reload" }, ctx);
+    for (const key of ["sessionManager", "modelRegistry", "hasUI", "ui"] as const) {
+      Object.defineProperty(ctx, key, { get() { throw new Error(`This extension ctx is stale after reload: ${key}`); } });
+    }
+    reply.resolve(new Response("Bad request", { status: 400 }));
+  } finally {
+    reply.resolve(sseResponse());
+    await Promise.allSettled([pending]);
+  }
+  assert.equal(requests, 1);
+  assert.equal(calls.length, 0);
+  assert.deepEqual(sessionManager.getBranch(), originalBranch);
+  assert.deepEqual(await pending, { cancel: true });
+});
+
 test("successful remote compaction does not validate an unused malformed fallback section", async () => {
   await writeFile(fallbackSettingsPath, JSON.stringify({ version: 1, fallback: null }));
   const fixture = await fallbackFixture({ currentModel: model });
