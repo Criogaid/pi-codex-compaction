@@ -4,6 +4,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Tool } from "@earendil-works/pi-ai";
 import {
   buildSessionProjection,
+  convertToLlm,
   getAgentDir,
   type ExtensionAPI,
   type ExtensionContext,
@@ -113,18 +114,13 @@ interface BranchSource {
   readonly fingerprints: readonly string[];
 }
 
-// Pi's convertToLlm skips only bashExecution messages marked excludeFromContext (!! prefix).
-function modelVisibleMessages(messages: readonly AgentMessage[]): AgentMessage[] {
-  return messages.filter((message) => !(message.role === "bashExecution" && message.excludeFromContext));
-}
-
 function captureBranchSource(branch: SessionEntry[]): BranchSource {
   const projection = projectBranch(branch);
   return {
     length: branch.length,
     leafId: branch.at(-1)?.id,
     projection,
-    fingerprints: modelVisibleMessages(projection.messages).map(fingerprintMessage),
+    fingerprints: convertToLlm(projection.messages).map(fingerprintMessage),
   };
 }
 
@@ -134,7 +130,7 @@ function validateUnchangedBranch(branch: SessionEntry[], source: BranchSource): 
   if (source.length > 0 && branch[source.length - 1]?.id !== source.leafId) return undefined;
   if (branch.slice(source.length).some((entry) => entry.type === "compaction")) return undefined;
   const projection = projectBranch(branch);
-  const visible = modelVisibleMessages(projection.messages);
+  const visible = convertToLlm(projection.messages);
   return visible.length === source.fingerprints.length &&
     visible.every((message, index) => fingerprintMessage(message) === source.fingerprints[index])
     ? projection : undefined;
@@ -297,8 +293,8 @@ async function recoverLayeredCheckpoint(
 ) {
   if (!run.owned()) return { cancel: true };
   const { firstKeptEntryId } = event.preparation;
-  const boundary = prepareCheckpointLayer(source.projection, firstKeptEntryId, prior);
-  if (boundary.messages.length === 0) {
+  const messagesToSummarize = prepareCheckpointLayer(source.projection, firstKeptEntryId, prior);
+  if (messagesToSummarize.length === 0) {
     throw new Error(`No messages after the active checkpoint need summarization (${errorMessage(remoteError)})`, {
       cause: remoteError,
     });
@@ -307,7 +303,7 @@ async function recoverLayeredCheckpoint(
     defaultModel: selection,
     preparation: {
       ...event.preparation,
-      messagesToSummarize: boundary.messages,
+      messagesToSummarize,
       turnPrefixMessages: [],
       isSplitTurn: false,
       previousSummary: prior.textSummary,
@@ -328,7 +324,7 @@ async function recoverLayeredCheckpoint(
   }
   const details = createLayeredCheckpointDetails(
     prior,
-    { ...boundary, retained: keptMessages(projection, firstKeptEntryId) },
+    keptMessages(projection, firstKeptEntryId),
     result.compaction.summary,
   );
   return { compaction: { ...result.compaction, summary: fallbackSummary(details.checkpointId), details } };

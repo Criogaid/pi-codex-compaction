@@ -166,10 +166,6 @@ function sliceRetainedEntries(
   return keptIndex < 0 ? undefined : entries.slice(keptIndex);
 }
 
-function asProjection(source: readonly SessionEntry[] | SessionProjection): SessionProjection {
-  return "messages" in source ? source : buildSessionProjection([...source], source.at(-1)?.id ?? null);
-}
-
 /** Pi's context handlers see only non-system messages; Pi carries system messages separately. */
 export function withoutSystemMessages<T extends { readonly role: string }>(messages: readonly T[]): T[] {
   return messages.filter((message) => message.role !== "system");
@@ -180,11 +176,8 @@ function conversationMessages(entries: readonly ProjectedSessionEntry[]): AgentM
   return withoutSystemMessages(entries.flatMap((entry) => entry.messages));
 }
 
-export function keptMessages(
-  source: readonly SessionEntry[] | SessionProjection,
-  firstKeptEntryId: string,
-): AgentMessage[] {
-  const retained = sliceRetainedEntries(asProjection(source).entries, firstKeptEntryId);
+export function keptMessages(projection: SessionProjection, firstKeptEntryId: string): AgentMessage[] {
+  const retained = sliceRetainedEntries(projection.entries, firstKeptEntryId);
   if (!retained) throw new Error("Pi compaction cut point is not present in the active context");
   return conversationMessages(retained);
 }
@@ -262,13 +255,12 @@ export function checkpointHistory(details: CodexCheckpointDetails): JsonObject[]
   }] : details.replacementHistory;
 }
 
-/** Validate the old coverage and the new cut against the same canonical projection. */
+/** Validate the old coverage and the new cut against the same canonical projection; return the newly dropped messages. */
 export function prepareCheckpointLayer(
-  source: readonly SessionEntry[] | SessionProjection,
+  projection: SessionProjection,
   firstKeptEntryId: string,
   details: CodexCheckpointDetails,
-) {
-  const projection = asProjection(source);
+): AgentMessage[] {
   const messages = withoutSystemMessages(projection.messages);
   const range = checkpointRange(messages, details);
   if (!range) throw new Error("The previous opaque checkpoint could not be projected safely");
@@ -278,20 +270,21 @@ export function prepareCheckpointLayer(
     fingerprintMessage(message) === fingerprintMessage(messages[cut + index]))) {
     throw new Error("The text layer cut is not an exact canonical suffix");
   }
-  return {
-    messages: messages.slice(range.end, cut),
-    retained,
-  };
+  return messages.slice(range.end, cut);
 }
 
-export function createLayeredCheckpointDetails(prior: CodexCheckpointDetails, layer: ReturnType<typeof prepareCheckpointLayer>, summary: string): CodexCheckpointDetails {
+export function createLayeredCheckpointDetails(
+  prior: CodexCheckpointDetails,
+  retained: readonly AgentMessage[],
+  summary: string,
+): CodexCheckpointDetails {
   const details = parseCheckpointDetails({
     ...prior,
     version: 2,
     checkpointId: randomUUID(),
     createdAt: new Date().toISOString(),
     textSummary: summary,
-    keptMessageFingerprints: layer.retained.map(fingerprintMessage),
+    keptMessageFingerprints: retained.map(fingerprintMessage),
   });
   if (!details) throw new Error("Created an invalid layered checkpoint");
   return details;

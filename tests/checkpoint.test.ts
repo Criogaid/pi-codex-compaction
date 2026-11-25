@@ -403,7 +403,7 @@ test("new checkpoints replay unchanged across default collation changes", (t) =>
   t.mock.method(String.prototype, "localeCompare", function(this: string, other: string) { return compare(String(this), other); });
   const session = SessionManager.inMemory();
   const firstKept = session.appendMessage(localizedToolMessage());
-  const details = checkpoint(keptMessages(session.getBranch(), firstKept));
+  const details = checkpoint(keptMessages(session.buildSessionProjection(), firstKept));
   session.appendCompaction(fallbackSummary(details.checkpointId), firstKept, 100, details);
   const saved = JSON.stringify(session.getBranch());
   compare = new Intl.Collator("sv-SE").compare;
@@ -432,7 +432,7 @@ for (const fixture of localeFingerprints) {
         const session = SessionManager.inMemory();
         const targetId = session.appendMessage(localizedToolMessage());
         session.appendContextEdit(targetId, { content: [{ type: "text", text: "edited output" }] });
-        const details = checkpoint(keptMessages(session.getBranch(), targetId));
+        const details = checkpoint(keptMessages(session.buildSessionProjection(), targetId));
         details.keptMessageFingerprints = [shape === "raw" ? fixture.original : fixture.edited];
         session.appendCompaction(fallbackSummary(details.checkpointId), targetId, 100, details);
         if (editedAfterCheckpoint) {
@@ -516,8 +516,9 @@ test("checkpointHistory frames a layered v2 text summary like Pi's compaction su
   const firstKeptB = session.appendMessage(user("retained-tail", 4));
 
   const rawSummary = "## Goal\nPreserve layered summary framing.";
-  const layer = prepareCheckpointLayer(session.getBranch(), firstKeptB, prior);
-  const layered = createLayeredCheckpointDetails(prior, layer, rawSummary);
+  const projection = session.buildSessionProjection();
+  assert.equal(prepareCheckpointLayer(projection, firstKeptB, prior).length, 1);
+  const layered = createLayeredCheckpointDetails(prior, keptMessages(projection, firstKeptB), rawSummary);
   assert.equal(layered.version, 2);
   assert.equal(layered.textSummary, rawSummary);
 
