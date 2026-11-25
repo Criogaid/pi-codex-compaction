@@ -217,7 +217,6 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
         },
         onProviderStreamEvent: (rawEvent) => {
           request.signal.throwIfAborted();
-          turnState.observeStreamEvent(rawEvent);
           const event = normalizeCompactionEvent(model.api, rawEvent);
           const transient = attempt.observeEvent(event);
           if (transient) throw transient;

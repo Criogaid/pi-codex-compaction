@@ -125,8 +125,13 @@ test("in-turn auto-compaction replays the active turn's x-codex-turn-state", { t
   }
 });
 
-for (const status of [503, 200] as const) {
-  test(`manual V2 retry after HTTP ${status} uses only a token from a successful response`, { timeout: 20_000 }, async () => {
+for (const { status, source } of [
+  { status: 503, source: "response headers" },
+  { status: 200, source: "response headers" },
+  { status: 200, source: "SSE metadata" },
+] as const) {
+  test(`manual V2 retry after HTTP ${status} with turn state in ${source}`, { timeout: 20_000 }, async () => {
+    const token = "manual-compact-retry-state";
     let compactAttempt = 0;
     const fixture = await sessionFixture({
       extensions: [codexCompaction],
@@ -138,12 +143,14 @@ for (const status of [503, 200] as const) {
           });
         }
         if (++compactAttempt !== 1) return undefined;
-        const headers = { [TURN_STATE_HEADER]: "manual-compact-retry-state" };
+        const headers = { [TURN_STATE_HEADER]: token };
         if (status === 200) {
+          const metadata = source === "SSE metadata" ? [{ type: "response.metadata", headers }] : [];
           return sseResponse([
             { type: "response.created", response: { id: "resp_failed" } },
+            ...metadata,
             { type: "response.failed", response: { status: "failed", error: { code: "server_error", message: "try again" } } },
-          ], headers);
+          ], source === "response headers" ? headers : undefined);
         }
         return Response.json({ error: { code: "server_is_overloaded", message: "try again" } }, {
           status,
@@ -160,7 +167,7 @@ for (const status of [503, 200] as const) {
       assert.deepEqual(fixture.errors, []);
       assert.deepEqual(fixture.requests.map(isCompactionRequest), [false, false, true, true, false]);
       assert.deepEqual(fixture.requests.map(({ headers }) => headers.get(TURN_STATE_HEADER)), [
-        null, null, null, status === 200 ? "manual-compact-retry-state" : null, null,
+        null, null, null, status === 200 && source === "response headers" ? token : null, null,
       ]);
     } finally {
       await fixture.close();
@@ -168,46 +175,111 @@ for (const status of [503, 200] as const) {
   });
 }
 
-test("latches the first nested metadata header and honors explicit header overrides and deletion", { timeout: 20_000 }, async () => {
+test("honors explicit header overrides and deletion without changing the latched response header", { timeout: 20_000 }, async () => {
   let step = 0;
   const overrideExtension: ExtensionFactory = (pi) => {
     pi.on("before_provider_headers", (event) => {
-      if (step === 3) event.headers["X-Codex-Turn-State"] = "explicit-caller-state";
-      if (step === 4) event.headers["X-Codex-Turn-State"] = null;
+      if (step === 1) event.headers["X-Codex-Turn-State"] = "explicit-caller-state";
+      if (step === 2) event.headers["X-Codex-Turn-State"] = null;
     });
   };
   const fixture = await sessionFixture({
     extensions: [pingToolExtension(), overrideExtension, codexCompaction],
     respond: () => {
       step++;
-      switch (step) {
-        case 1:
-          return sseResponse([
-            { type: "response.metadata", headers: { [TURN_STATE_HEADER]: 123 } },
-            { type: "response.metadata", headers: { [TURN_STATE_HEADER]: [false, "ignored"] } },
-            ...toolCallEvents(step, "call_meta_1"),
-          ]);
-        case 2:
-          return sseResponse([
-            { type: "response.metadata", headers: { "X-Codex-Turn-State": [["stream-meta-state", "inner-ignored"], "outer-ignored"] } },
-            ...toolCallEvents(step, "call_meta_2"),
-          ]);
-        case 3:
-        case 4:
-        case 5:
-          return sseResponse(toolCallEvents(step, `call_meta_${step}`));
-        default:
-          return sseResponse(textEvents(step, "Done."));
-      }
+      if (step === 1) return sseResponse(toolCallEvents(step, "call_override_1"), { [TURN_STATE_HEADER]: "response-state" });
+      if (step <= 3) return sseResponse(toolCallEvents(step, `call_override_${step}`));
+      return sseResponse(textEvents(step, "Done."));
     },
   });
   try {
-    await fixture.session.prompt("Run the metadata and header override steps.");
+    await fixture.session.prompt("Run the header override steps.");
     assert.deepEqual(fixture.errors, []);
     assert.deepEqual(fixture.requests.map(({ headers }) => headers.get(TURN_STATE_HEADER)), [
-      null, null, "stream-meta-state", "explicit-caller-state", null, "stream-meta-state",
+      null, "explicit-caller-state", null, "response-state",
     ]);
   } finally {
+    await fixture.close();
+  }
+});
+
+test("SSE metadata with a non-ByteString token does not block a tool continuation", { timeout: 20_000 }, async () => {
+  let step = 0;
+  const fixture = await sessionFixture({
+    api: "openai-codex-responses",
+    extensions: [pingToolExtension(), codexCompaction],
+    respond: () => {
+      if (++step === 1) {
+        return sseResponse([
+          { type: "response.metadata", headers: { [TURN_STATE_HEADER]: "路由" } },
+          ...toolCallEvents(step, "call_unicode"),
+        ]);
+      }
+      return sseResponse(textEvents(step, "Done."));
+    },
+  });
+  try {
+    await fixture.session.prompt("Run a tool after receiving SSE metadata.");
+    assert.deepEqual(fixture.errors, []);
+    assert.deepEqual(fixture.requests.map(({ headers }) => headers.get(TURN_STATE_HEADER)), [null, null]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a cache warming response during a tool call cannot seed turn state", { timeout: 20_000 }, async () => {
+  const warmed = Promise.withResolvers<void>();
+  let foregroundCalls = 0;
+  // Pi's OpenAI Responses adapter clamps the warmer's one-token limit to 16.
+  const warmOutputLimit = 16;
+  const waitForWarm: ExtensionFactory = (pi) => {
+    pi.on("tool_result", async () => {
+      // Keep the first tool step open until Pi consumes and records the warm response.
+      const deadline = setTimeout(() => warmed.reject(new Error("Pi did not record cache_warm usage")), 8_000);
+      try {
+        await warmed.promise;
+      } finally {
+        clearTimeout(deadline);
+      }
+    });
+  };
+  const fixture = await sessionFixture({
+    extensions: [pingToolExtension(), waitForWarm, codexCompaction],
+    models: (base) => [{
+      ...base,
+      // Use an API endpoint where Pi serializes the warmer's output cap with fixture credentials.
+      baseUrl: "https://fixture.example/v1",
+      promptCache: { short: 11, long: 11 },
+      // The fixture's 500 input tokens must clear Pi's five-cent savings threshold.
+      cost: { input: 200, output: 10, cacheRead: 1, cacheWrite: 0 },
+    }],
+    settings: { cacheWarming: "streaming" },
+    respond: ({ payload }) => {
+      const requestNumber = fixture.requests.length;
+      if (payload.max_output_tokens === warmOutputLimit) {
+        return sseResponse(textEvents(requestNumber, "Warm."), { [TURN_STATE_HEADER]: "warm-state" });
+      }
+      switch (++foregroundCalls) {
+        case 1: return sseResponse(toolCallEvents(requestNumber, "call_before_warm"));
+        case 2: return sseResponse(toolCallEvents(requestNumber, "call_after_warm"), { [TURN_STATE_HEADER]: "chat-state" });
+        default: return sseResponse(textEvents(requestNumber, "Done."));
+      }
+    },
+  });
+  const unsubscribe = fixture.session.subscribe((event) => {
+    if (event.type === "entry_appended" && event.entry.type === "usage" && event.entry.kind === "cache_warm") warmed.resolve();
+  });
+  try {
+    await fixture.session.prompt("Run two tool steps while Pi warms the cache.");
+    assert.deepEqual(fixture.errors, []);
+    assert.deepEqual(fixture.requests.map(({ payload }) => payload.max_output_tokens === warmOutputLimit), [
+      false, true, false, false,
+    ]);
+    assert.deepEqual(fixture.requests.map(({ headers }) => headers.get(TURN_STATE_HEADER)), [
+      null, null, null, "chat-state",
+    ]);
+  } finally {
+    unsubscribe();
     await fixture.close();
   }
 });
@@ -347,7 +419,7 @@ for (const activeToken of [undefined, "overflow-turn-state"]) {
   });
 }
 
-test("a late provider stream event from the previous model cannot seed the new model's turn state", { timeout: 20_000 }, async () => {
+test("SSE metadata cannot seed turn state on either side of a model switch", { timeout: 20_000 }, async () => {
   let step = 0;
   const switchBeforeMetadata: ExtensionFactory = (pi) => {
     pi.on("provider_stream_event", async (event) => {
@@ -376,9 +448,7 @@ test("a late provider stream event from the previous model cannot seed the new m
     const [a, b] = fixture.models;
     assert.deepEqual(fixture.errors, []);
     assert.deepEqual(fixture.requests.map(({ payload }) => payload.model), [a.id, b.id, b.id]);
-    assert.deepEqual(fixture.requests.map(({ headers }) => headers.get(TURN_STATE_HEADER)), [
-      null, null, "model-b-stream-state",
-    ]);
+    assert.deepEqual(fixture.requests.map(({ headers }) => headers.get(TURN_STATE_HEADER)), [null, null, null]);
   } finally {
     await fixture.close();
   }

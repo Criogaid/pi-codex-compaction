@@ -587,11 +587,8 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     turnState.observeResponse(event.status, event.headers);
   });
 
-  pi.on("provider_stream_event", (event, ctx) => {
-    turnState.observeStreamEvent(ctx.sessionManager.getSessionId(), capableModel(ctx.model), event);
-  });
-
   pi.on("context", (_event, ctx) => {
+    turnState.beginRequest(ctx.sessionManager.getSessionId(), capableModel(ctx.model));
     snapshots.recordContext(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => canonicalMessages(ctx.sessionManager.getBranch()));
   });
 
@@ -648,7 +645,9 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("message_end", (event) => {
-    if (event.message.role === "assistant") snapshots.endRequest();
+    if (event.message.role !== "assistant") return;
+    snapshots.endRequest();
+    turnState.endRequest();
   });
 
   pi.on("agent_settled", (_event, ctx) => {
