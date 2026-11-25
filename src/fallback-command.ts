@@ -126,7 +126,8 @@ async function chooseModel(ctx: ExtensionCommandContext, models: readonly Model<
       render: (width) => container.render(width),
       invalidate: () => container.invalidate(),
       handleInput(data) {
-        if ((["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const).some((action) => keys.matches(data, action))) {
+        if ((["tui.select.up", "tui.select.down", "tui.select.pageUp", "tui.select.pageDown", "tui.select.confirm", "tui.select.cancel"] as const)
+          .some((action) => keys.matches(data, action))) {
           list.handleInput(data);
         } else {
           input.handleInput(data);

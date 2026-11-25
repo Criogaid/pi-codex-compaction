@@ -293,6 +293,31 @@ test("TUI fuzzy search filters summary models by name", async () => {
   });
 });
 
+test("TUI model selector forwards PageDown and PageUp without resetting the selection", async () => {
+  const extraModels = Array.from({ length: 12 }, (_, index) => ({
+    ...model,
+    id: `model-${String(index + 1).padStart(2, "0")}`,
+    name: `Model ${String(index + 1).padStart(2, "0")}`,
+  }));
+  const current = await fixture(["high", "low"], extraModels[0], true, extraModels.slice(1));
+  driveTui(current, [
+    ["\u001b[B", "\u001b[B", "\r"],
+    ["\u001b[6~", "\r"],
+    ["\r"],
+    ["\u001b[6~", "\u001b[6~", "\u001b[5~", "\r"],
+    ["\u001b"],
+  ]);
+  await current.run();
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 2,
+    remoteCompaction: { enabled: true },
+    reasoningEffortUpdates: { enabled: false },
+    summaryModel: { provider: model.provider, model: "model-02", thinkingLevel: "low" },
+  });
+  assert.match(current.notices[0]?.message ?? "", /cheap\/model-10 \(high\)/);
+  assert.match(current.notices[1]?.message ?? "", /cheap\/model-02 \(low\)/);
+});
+
 test("TUI cancelling an unmatched search leaves settings unchanged", async () => {
   const current = await fixture([]);
   driveTui(current, [["\u001b[B", "\u001b[B", "\r"], ["no-such-model", "\u001b"], ["\u001b"]]);

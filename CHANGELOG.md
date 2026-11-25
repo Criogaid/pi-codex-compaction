@@ -22,7 +22,7 @@
 
 - Codex 式思考等级更新改为默认关闭的可选设置。`/codex-compaction` 新增 `Codex reasoning effort updates`，配置文件新增 `reasoningEffortUpdates.enabled`。开启后，本扩展在普通请求重放检查点之后以及 V2 请求及其重试发出前，按 Codex 规则改写请求级 effort 和等级更新。关闭只停止本扩展的改写。
 - 普通请求和 V2 共用思考等级更新开关，首次请求会等待初始化。菜单保存立即更新开关，进行中的压缩沿用启动时的值。初始化读取失败时使用 Off，有界面的会话会显示警告。
-- 摘要模型改为独立设置：配置文件升级为版本 2，`summaryModel` 存在即使用，省略即使用当前对话模型，不再有单独的开关。菜单包含 `Remote Compaction V2`、`Codex reasoning effort updates` 和 `Summary model` 三项，模型列表顶部提供 `Use the chat model`。仍可读取版本 1 的配置；已关闭的旧模型选择在下次保存时不保留。
+- 摘要模型改为独立设置：配置文件升级为版本 2，`summaryModel` 存在即使用，省略即使用当前对话模型，不再有单独的开关。菜单包含 `Remote Compaction V2`、`Codex reasoning effort updates` 和 `Summary model` 三项，模型列表顶部提供 `Use the chat model`，支持 `PageUp`/`PageDown` 翻页。仍可读取版本 1 的配置；已关闭的旧模型选择在下次保存时不保留。
 - HTTP 429 正文的永久用量或额度类型会阻止重发，包括 `"code": null` 的响应。模型切换的不兼容提示按检查点区分，新检查点会再次提示。
 - 重放检查点前先校验会话记录。其他扩展保存的编辑导致保留消息与检查点不匹配时，即使请求钩子恢复了原文，也会跳过加密历史的重放。
 - 修复普通请求的 `input` 含空槽时 V2 压缩无法发出的问题。遇到这种请求时跳过快照，压缩使用 Pi 生成的请求输入。
