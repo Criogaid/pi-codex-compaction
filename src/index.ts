@@ -3,12 +3,13 @@ import { resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Tool } from "@earendil-works/pi-ai";
 import {
-  buildSessionContext,
+  buildSessionProjection,
   getAgentDir,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
   type SessionEntry,
+  type SessionProjection,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { prepareRetention, userItemOrigins } from "./retention-input.js";
@@ -97,35 +98,40 @@ function providerRequestInputs(pi: ExtensionAPI, ctx: ExtensionContext): Provide
   };
 }
 
+function projectBranch(branch: SessionEntry[]): SessionProjection {
+  return buildSessionProjection(branch, branch.at(-1)?.id ?? null);
+}
+
 function canonicalMessages(branch: SessionEntry[]): AgentMessage[] {
-  return buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
+  return projectBranch(branch).messages;
 }
 
 interface BranchSource {
   readonly length: number;
   readonly leafId: string | undefined;
-  readonly messages: AgentMessage[];
+  readonly projection: SessionProjection;
   readonly fingerprints: readonly string[];
 }
 
 function captureBranchSource(branch: SessionEntry[]): BranchSource {
-  const messages = canonicalMessages(branch);
+  const projection = projectBranch(branch);
   return {
     length: branch.length,
     leafId: branch.at(-1)?.id,
-    messages,
-    fingerprints: messages.map(fingerprintMessage),
+    projection,
+    fingerprints: projection.messages.map(fingerprintMessage),
   };
 }
 
-function isUnchangedBranch(branch: SessionEntry[], source: BranchSource): boolean {
-  if (branch.length < source.length) return false;
+function validateUnchangedBranch(branch: SessionEntry[], source: BranchSource): SessionProjection | undefined {
+  if (branch.length < source.length) return undefined;
   // Append-only branch IDs establish ancestry. A new compaction may have the same summary but different details.
-  if (source.length > 0 && branch[source.length - 1]?.id !== source.leafId) return false;
-  if (branch.slice(source.length).some((entry) => entry.type === "compaction")) return false;
-  const messages = canonicalMessages(branch);
-  return messages.length === source.fingerprints.length &&
-    messages.every((message, index) => fingerprintMessage(message) === source.fingerprints[index]);
+  if (source.length > 0 && branch[source.length - 1]?.id !== source.leafId) return undefined;
+  if (branch.slice(source.length).some((entry) => entry.type === "compaction")) return undefined;
+  const projection = projectBranch(branch);
+  return projection.messages.length === source.fingerprints.length &&
+    projection.messages.every((message, index) => fingerprintMessage(message) === source.fingerprints[index])
+    ? projection : undefined;
 }
 
 function projectCompactionMessages(
@@ -285,7 +291,7 @@ async function recoverLayeredCheckpoint(
 ) {
   if (!run.owned()) return { cancel: true };
   const { firstKeptEntryId } = event.preparation;
-  const boundary = prepareCheckpointLayer(event.branchEntries, firstKeptEntryId, prior);
+  const boundary = prepareCheckpointLayer(source.projection, firstKeptEntryId, prior);
   if (boundary.messages.length === 0) {
     throw new Error(`No messages after the active checkpoint need summarization (${errorMessage(remoteError)})`, {
       cause: remoteError,
@@ -310,7 +316,7 @@ async function recoverLayeredCheckpoint(
   }
   if (!run.owned()) return { cancel: true };
   // Revalidate branch ancestry and canonical messages after the asynchronous summary request.
-  if (!isUnchangedBranch(ctx.sessionManager.getBranch(), source)) {
+  if (!validateUnchangedBranch(ctx.sessionManager.getBranch(), source)) {
     throw new Error("The layered compaction source changed");
   }
   const details = createLayeredCheckpointDetails(prior, boundary, result.compaction.summary);
@@ -374,7 +380,7 @@ async function compactRemotely(
       ctx.ui.notify("Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", "warning");
     }
     const prior = checkpoint.state === "parsed" ? checkpoint.details : undefined;
-    const currentMessages = projectCompactionMessages(source.messages, supported.identity, prior);
+    const currentMessages = projectCompactionMessages(source.projection.messages, supported.identity, prior);
     const request = compactionRequest(snapshots, sessionId, supported, currentMessages, providerRequestInputs(pi, ctx), {
       blockImages: settings.images?.blockImages ?? false,
       tools: () => activeTools(pi),
@@ -413,8 +419,8 @@ async function compactRemotely(
         : undefined,
     });
     if (!run.owned()) return { cancel: true };
-    const branch = ctx.sessionManager.getBranch();
-    if (!isUnchangedBranch(branch, source)) {
+    const projection = validateUnchangedBranch(ctx.sessionManager.getBranch(), source);
+    if (!projection) {
       if (ctx.hasUI) {
         ctx.ui.notify("Session history changed during V2 compaction; compaction cancelled and current history preserved.", "warning");
       }
@@ -428,7 +434,7 @@ async function compactRemotely(
     const details = createCheckpointDetails({
       identity: response.identity,
       replacementHistory,
-      keptMessages: keptMessages(branch, event.preparation.firstKeptEntryId),
+      keptMessages: keptMessages(projection, event.preparation.firstKeptEntryId),
     });
     return {
       compaction: {
@@ -554,9 +560,11 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   // change the projection. Later `context_with_system` handlers still see and can change it.
   pi.on("context_with_system", async (event, ctx) => {
     let messages: AgentMessage[] | undefined;
+    let canonical: AgentMessage[] | undefined;
+    const getCanonical = () => canonical ??= canonicalMessages(ctx.sessionManager.getBranch());
     const checkpoint = activeCheckpoint(ctx);
     if (checkpoint && await compatibleIdentity(checkpoint, ctx)) {
-      messages = projectCheckpointTranscript(event.messages, canonicalMessages(ctx.sessionManager.getBranch()), checkpoint);
+      messages = projectCheckpointTranscript(event.messages, getCanonical(), checkpoint);
       if (!messages) {
         snapshots.discardSnapshots();
         warnOnce(ctx, `${checkpoint.checkpointId}:projection`,
@@ -566,7 +574,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     snapshots.recordProjectedRequest(
       ctx.sessionManager.getSessionId(),
       capableModel(ctx.model),
-      () => canonicalMessages(ctx.sessionManager.getBranch()),
+      getCanonical,
       () => activeCheckpoint(ctx),
       messages ?? event.messages,
       messages !== undefined,

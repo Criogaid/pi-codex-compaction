@@ -4,12 +4,12 @@ import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   buildSessionProjection,
-  buildSessionContext,
   getLatestCompactionEntry,
   sessionEntryToContextMessages,
   type CompactionEntry,
   type ProjectedSessionEntry,
   type SessionEntry,
+  type SessionProjection,
 } from "@earendil-works/pi-coding-agent";
 import {
   isObject,
@@ -158,14 +158,16 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
   }
 }
 
-function retainedEntries(
-  branchEntries: readonly SessionEntry[],
-  leafId: string | null,
+function sliceRetainedEntries(
+  entries: readonly ProjectedSessionEntry[],
   firstKeptEntryId: string,
 ): ProjectedSessionEntry[] | undefined {
-  const projection = buildSessionProjection([...branchEntries], leafId);
-  const keptIndex = projection.entries.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId);
-  return keptIndex < 0 ? undefined : projection.entries.slice(keptIndex);
+  const keptIndex = entries.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId);
+  return keptIndex < 0 ? undefined : entries.slice(keptIndex);
+}
+
+function asProjection(source: readonly SessionEntry[] | SessionProjection): SessionProjection {
+  return "messages" in source ? source : buildSessionProjection([...source], source.at(-1)?.id ?? null);
 }
 
 /** Pi's context handlers see only non-system messages; Pi carries system messages separately. */
@@ -178,8 +180,11 @@ function conversationMessages(entries: readonly ProjectedSessionEntry[]): AgentM
   return withoutSystemMessages(entries.flatMap((entry) => entry.messages));
 }
 
-export function keptMessages(branchEntries: readonly SessionEntry[], firstKeptEntryId: string): AgentMessage[] {
-  const retained = retainedEntries(branchEntries, branchEntries.at(-1)?.id ?? null, firstKeptEntryId);
+export function keptMessages(
+  source: readonly SessionEntry[] | SessionProjection,
+  firstKeptEntryId: string,
+): AgentMessage[] {
+  const retained = sliceRetainedEntries(asProjection(source).entries, firstKeptEntryId);
   if (!retained) throw new Error("Pi compaction cut point is not present in the active context");
   return conversationMessages(retained);
 }
@@ -191,7 +196,10 @@ function normalizeLegacyFingerprints(
 ): CodexCheckpointDetails {
   if (details.version === 2) return details;
   // Validate at the checkpoint's parent, never against later context edits.
-  const retained = retainedEntries(entries, entry.parentId, entry.firstKeptEntryId);
+  const retained = sliceRetainedEntries(
+    buildSessionProjection([...entries], entry.parentId).entries,
+    entry.firstKeptEntryId,
+  );
   if (!retained) return details;
   const canonical = conversationMessages(retained);
   const matches = (messages: readonly AgentMessage[], fingerprint: (message: AgentMessage) => string) =>
@@ -255,11 +263,16 @@ export function checkpointHistory(details: CodexCheckpointDetails): JsonObject[]
 }
 
 /** Validate the old coverage and the new cut against the same canonical projection. */
-export function prepareCheckpointLayer(entries: readonly SessionEntry[], firstKeptEntryId: string, details: CodexCheckpointDetails) {
-  const messages = withoutSystemMessages(buildSessionContext([...entries], entries.at(-1)?.id ?? null).messages);
+export function prepareCheckpointLayer(
+  source: readonly SessionEntry[] | SessionProjection,
+  firstKeptEntryId: string,
+  details: CodexCheckpointDetails,
+) {
+  const projection = asProjection(source);
+  const messages = withoutSystemMessages(projection.messages);
   const range = checkpointRange(messages, details);
   if (!range) throw new Error("The previous opaque checkpoint could not be projected safely");
-  const retained = keptMessages(entries, firstKeptEntryId);
+  const retained = keptMessages(projection, firstKeptEntryId);
   const cut = messages.length - retained.length;
   if (cut <= range.start || !retained.every((message, index) =>
     fingerprintMessage(message) === fingerprintMessage(messages[cut + index]))) {
