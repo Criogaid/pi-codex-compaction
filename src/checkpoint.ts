@@ -11,7 +11,15 @@ import {
   type ProjectedSessionEntry,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { isObject, isObjectArray, type JsonObject, REMOTE_COMPACTION_PROTOCOL, validateCompactionItem } from "./protocol.js";
+import {
+  isObject,
+  isObjectArray,
+  type JsonObject,
+  PI_COMPACTION_SUMMARY_PREFIX,
+  PI_COMPACTION_SUMMARY_SUFFIX,
+  REMOTE_COMPACTION_PROTOCOL,
+  validateCompactionItem,
+} from "./protocol.js";
 import {
   normalizeUrl,
   type ProviderIdentity,
@@ -237,10 +245,12 @@ function checkpointRange(
   return { start, end: details.version === 2 ? start + 1 : end };
 }
 
-/** Expand the opaque base and each text layer exactly once at the private marker. */
+/** Expand the opaque base and each Pi-framed text layer once at the private marker; persisted textSummary stays raw. */
 export function checkpointHistory(details: CodexCheckpointDetails): JsonObject[] {
   return details.version === 2 ? [...details.replacementHistory, {
-    type: "message", role: "user", content: [{ type: "input_text", text: details.textSummary }],
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: `${PI_COMPACTION_SUMMARY_PREFIX}${details.textSummary}${PI_COMPACTION_SUMMARY_SUFFIX}` }],
   }] : details.replacementHistory;
 }
 

@@ -30,6 +30,11 @@ export function isInputImage(value: unknown): value is JsonObject {
 /** Pi's placeholder for a blocked image; replayed and fresh history must match it byte for byte. */
 export const BLOCKED_IMAGE_TEXT = "Image reading is disabled.";
 
+/** Mirrors COMPACTION_SUMMARY_PREFIX and COMPACTION_SUMMARY_SUFFIX from Pi's dist/core/messages.js. */
+export const PI_COMPACTION_SUMMARY_PREFIX =
+  "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+export const PI_COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+
 /** Apply Pi's current image policy to replayed Responses items without changing saved history. */
 export function withoutInputImages(items: readonly JsonObject[]): JsonObject[] {
   return items.map((item) => {

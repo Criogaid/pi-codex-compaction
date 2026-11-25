@@ -1,10 +1,5 @@
 // Own the optional Codex reasoning-effort rewrite of a finished OpenAI Responses payload.
-import { isObject, type JsonObject } from "./protocol.js";
-
-// Mirrors COMPACTION_SUMMARY_PREFIX from Pi's dist/core/messages.js.
-const PI_COMPACTION_SUMMARY_PREFIX = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
-// Mirrors COMPACTION_SUMMARY_SUFFIX from Pi's dist/core/messages.js.
-const PI_COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+import { isObject, type JsonObject, PI_COMPACTION_SUMMARY_PREFIX, PI_COMPACTION_SUMMARY_SUFFIX } from "./protocol.js";
 
 /**
  * Marks rewritten payloads. A compacted window's dropped first update survives only as the request

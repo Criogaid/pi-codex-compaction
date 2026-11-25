@@ -5,18 +5,22 @@ import type { Api, Model, ToolResultMessage, UserMessage } from "@earendil-works
 import {
   SessionManager,
   buildSessionProjection,
+  convertToLlm,
   sessionEntryToContextMessages,
   type CompactionEntry,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { capableModel, type ProviderIdentity } from "../src/capability.js";
 import {
+  checkpointHistory,
   createCheckpointDetails,
+  createLayeredCheckpointDetails,
   checkpointMarker,
   fallbackSummary,
   fingerprintMessage,
   keptMessages,
   parseCheckpointDetails,
+  prepareCheckpointLayer,
   projectCheckpointRequest,
   projectCheckpointTranscript,
   resolveLatestCheckpoint,
@@ -499,4 +503,28 @@ test("persisted legacy summaries restore only their own unchanged checkpoint his
   assert.ok(projectCheckpointRequest([summary, kept], details));
   assert.equal(projectCheckpointRequest([summary, user("edited", 2)], details), undefined);
   assert.equal(projectCheckpointRequest([{ ...summary, summary: legacyCheckpointSummary("different-checkpoint") }, kept], details), undefined);
+});
+
+test("checkpointHistory frames a layered v2 text summary like Pi's compaction summary while keeping persisted text raw", () => {
+  const session = SessionManager.inMemory();
+  session.appendMessage(user("before-a", 1));
+  const keptByA = user("kept-by-a", 2);
+  const firstKeptA = session.appendMessage(keptByA);
+  const prior = checkpoint([keptByA], "checkpoint-base");
+  session.appendCompaction(fallbackSummary(prior.checkpointId), firstKeptA, 100, prior);
+  session.appendMessage(user("dropped-after-a", 3));
+  const firstKeptB = session.appendMessage(user("retained-tail", 4));
+
+  const rawSummary = "## Goal\nPreserve layered summary framing.";
+  const layer = prepareCheckpointLayer(session.getBranch(), firstKeptB, prior);
+  const layered = createLayeredCheckpointDetails(prior, layer, rawSummary);
+  assert.equal(layered.version, 2);
+  assert.equal(layered.textSummary, rawSummary);
+
+  const [llmSummary] = convertToLlm([{ role: "compactionSummary", summary: rawSummary, tokensBefore: 100, timestamp: 5 }]);
+  assert.ok(llmSummary && llmSummary.role === "user" && Array.isArray(llmSummary.content) && llmSummary.content[0]?.type === "text");
+  assert.deepEqual(checkpointHistory(layered), [
+    ...prior.replacementHistory,
+    { type: "message", role: "user", content: [{ type: "input_text", text: llmSummary.content[0].text }] },
+  ]);
 });
