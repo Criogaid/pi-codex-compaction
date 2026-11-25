@@ -12,6 +12,14 @@ const CHAT_MODEL_LABEL = "Chat model";
 const USE_CHAT_MODEL = "Use the chat model";
 const TEXT_SUMMARY_DESCRIPTION = "Text summaries are used when V2 is off, unsupported, or fails.";
 const MAX_VISIBLE_MODELS = 10;
+const SELECT_LIST_ACTIONS = [
+  "tui.select.up",
+  "tui.select.down",
+  "tui.select.pageUp",
+  "tui.select.pageDown",
+  "tui.select.confirm",
+  "tui.select.cancel",
+] as const;
 type SettingsAction = "remote" | "effort" | "model";
 /** The On/Off settings, each a configuration field the menu toggles. */
 const SWITCHES = {
@@ -126,12 +134,12 @@ async function chooseModel(ctx: ExtensionCommandContext, models: readonly Model<
       render: (width) => container.render(width),
       invalidate: () => container.invalidate(),
       handleInput(data) {
-        if ((["tui.select.up", "tui.select.down", "tui.select.pageUp", "tui.select.pageDown", "tui.select.confirm", "tui.select.cancel"] as const)
-          .some((action) => keys.matches(data, action))) {
+        if (SELECT_LIST_ACTIONS.some((action) => keys.matches(data, action))) {
           list.handleInput(data);
         } else {
+          const previousQuery = input.getValue();
           input.handleInput(data);
-          update();
+          if (input.getValue() !== previousQuery) update();
         }
         tui.requestRender();
       },

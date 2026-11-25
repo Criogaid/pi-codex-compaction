@@ -318,6 +318,26 @@ test("TUI model selector forwards PageDown and PageUp without resetting the sele
   assert.match(current.notices[1]?.message ?? "", /cheap\/model-02 \(low\)/);
 });
 
+test("TUI model selector keeps the selection on non-editing keys", async () => {
+  const extraModels = [
+    { ...model, id: "model-01", name: "Model 01" },
+    { ...model, id: "model-02", name: "Model 02" },
+  ];
+  const current = await fixture(["high"], extraModels[0], true, extraModels.slice(1));
+  driveTui(current, [
+    ["\u001b[B", "\u001b[B", "\r"],
+    ["\u001b[B", "\u001b[B", "\u001b[D", "\u001b[C", "\u007f", "\r"],
+    ["\u001b"],
+  ]);
+  await current.run();
+  assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+    version: 2,
+    remoteCompaction: { enabled: true },
+    reasoningEffortUpdates: { enabled: false },
+    summaryModel: { provider: model.provider, model: "model-02", thinkingLevel: "high" },
+  });
+});
+
 test("TUI cancelling an unmatched search leaves settings unchanged", async () => {
   const current = await fixture([]);
   driveTui(current, [["\u001b[B", "\u001b[B", "\r"], ["no-such-model", "\u001b"], ["\u001b"]]);
