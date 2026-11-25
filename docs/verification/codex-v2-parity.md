@@ -81,11 +81,11 @@ Codex 在首个 `Completed` 停止收集，要求此前收到恰好一条 compac
 
 普通 HTTP 429 和明确的 `server_is_overloaded`、`policy_capacity_unavailable` 容量故障需要有效的服务端建议才重发。Codex 从 `Retry-After` 解析整数秒或 HTTP 日期。`response.failed` 从 `response.error.headers` 取建议，独立容量错误优先取 `error.headers`，其次取事件顶层 `headers`。已知的流内限流码先读建议头，再尝试文案里的等待时间。真正的 `response.incomplete` 若原因为 `content_filter`，可按本地退避策略重试。[HTTP 错误转换][http-errors]、[流内错误与建议][stream-errors]、[Retry-After 解析][retry-after]、[重试分类][error-policy]、[SSE 事件分派][events]。
 
-Pi 额外接受优先级更高的 `retry-after-ms`，使用先墙钟后单调钟的采样次序，建议等待高于 Pi 有效正数上限和 60 秒中的较小值时停止重发。本地退避只用于允许退避的错误。重复 HTTP 头、流内 JSON 数字、RFC 850 日期分隔符和超大秒数的表示差异见 [README 的重试说明](../../README.md#请求失败与重试)。[retry_after.rs][retry-after]、[remote-retry.ts](../../src/remote-retry.ts)。
+Pi 额外接受优先级更高的 `retry-after-ms`，使用先墙钟后单调钟的采样次序，建议等待高于 Pi 有效正数上限和 60 秒中的较小值时停止重发。本地退避只用于允许退避的错误。建议头仅接受可见 ASCII、空格和制表符，限流文案只以 ASCII 空白分隔。与 Codex 的表示差异：Fetch 合并重复 HTTP 头（Codex 取首值）；流内 JSON 数字形式的头值经 JavaScript 数字转换（例如 `0.0` 读为 `0`，超过 `2^53` 的整数会舍入）；RFC 850 日期的日期与时间之间须为空格。标准 `Retry-After` 秒数在 `2^63` 到 `2^64`（不含）之间按超出等待上限处理，不受操作系统影响；超出 `u64` 或无法表示截止时间的秒数视为缺少建议；Pi 的 `retry-after-ms` 数值溢出视为超出等待上限。[retry_after.rs][retry-after]、[remote-retry.ts](../../src/remote-retry.ts)。
 
 Pi 对 HTTP 采用 `408`、`409`、`429`、`500`、`502`、`503`、`504` 状态白名单。永久 `error.code`（包括 `usage_limit_reached` 和 `usage_not_included`）可否决白名单，429 另查 `error.type` 的用量或配额限制，并尊重 `x-should-retry: false`。Codex 按错误映射和重试策略处理状态，其中部分永久码受状态约束。Codex 将结构合法的未知 `response.failed` 码归为通用可重试错误，Pi 要求已知暂时故障证据，拒绝把未知码、限流字样或畸形失败字段用作重试依据。Pi 还使用明确的网络错误码和有进展但缺少终止事件的 EOF 作为暂时证据，取消、会话变化和无效输出会终止尝试。[Codex 永久错误映射][terminal-errors]、[HTTP 错误转换][http-errors]、[流内错误映射][stream-errors]、[Codex 重试分类][error-policy]、[remote-retry.ts](../../src/remote-retry.ts)。
 
-Pi 的两个适配器都可能在独立 `error` 帧停止，扩展按实际终止的记录判断。Rust Codex 跳过未识别的独立错误，继续读后续记录。Pi Codex Responses 适配器跳过空 `data:`，标准 Responses 的 SDK 会把空数据当作 JSON 解析错误。[独立错误分派][standalone-error]、[SSE 读取][sse-reader]、[README 的适配器说明](../../README.md#请求失败与重试)。
+Pi 的两个适配器都可能在独立 `error` 帧停止，扩展按实际终止的记录判断。Rust Codex 跳过未识别的独立错误，继续读后续记录。Pi Codex Responses 适配器跳过空 `data:`，标准 Responses 的 SDK 会把空数据当作 JSON 解析错误。[独立错误分派][standalone-error]、[SSE 读取][sse-reader]。
 
 Codex 入口按 capability 选择本地或 V2 压缩。V2 失败时，特定场景可切换到当前模型继续尝试 V2，失败路径返回错误。Pi 有意保留文字回退：当前会话在没有检查点时可调用原生摘要，已有兼容检查点时只对已确认的暂时故障做分层恢复。分层保留旧密文，文字摘要只读取本次移出的明文。关闭 V2 或模型不支持时也使用原生文字压缩。会话变化会丢弃旧请求结果，仅切换模型时则完成已启动的压缩。安装后若当前后端不兼容，扩展提示无法重放。[Codex 模式选择][task]、[模型回退][fallback-v2]、[index.ts](../../src/index.ts)。
 
