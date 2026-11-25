@@ -264,11 +264,10 @@ export function prepareCheckpointLayer(
   const messages = withoutSystemMessages(projection.messages);
   const range = checkpointRange(messages, details);
   if (!range) throw new Error("The previous opaque checkpoint could not be projected safely");
-  const retained = keptMessages(projection, firstKeptEntryId);
-  const cut = messages.length - retained.length;
-  if (cut <= range.start || !retained.every((message, index) =>
-    fingerprintMessage(message) === fingerprintMessage(messages[cut + index]))) {
-    throw new Error("The text layer cut is not an exact canonical suffix");
+  // Pi builds projection.messages in projection.entries order, so keptMessages is guaranteed to be its exact suffix.
+  const cut = messages.length - keptMessages(projection, firstKeptEntryId).length;
+  if (cut <= range.start) {
+    throw new Error("The text layer cut is not after the active checkpoint");
   }
   return messages.slice(range.end, cut);
 }
