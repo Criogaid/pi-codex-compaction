@@ -131,6 +131,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+class ConfiguredSummaryModelError extends Error {
+  constructor(cause: unknown) {
+    super(errorMessage(cause), { cause });
+  }
+}
+
 interface CompactionRun {
   readonly sessionId: string;
   readonly signal: AbortSignal;
@@ -179,42 +185,42 @@ async function recoverLayeredCheckpoint(
   prior: CodexCheckpointDetails,
   selection: NonNullable<FallbackCompactionRequest["defaultModel"]>,
 ) {
-  try {
-    if (!run.owned()) return { cancel: true };
-    const { firstKeptEntryId } = event.preparation;
-    const boundary = prepareCheckpointLayer(event.branchEntries, firstKeptEntryId, prior);
-    if (boundary.messages.length === 0) return { cancel: true };
-    const result = await run.summarize({
-      defaultModel: selection,
-      preparation: {
-        ...event.preparation,
-        messagesToSummarize: boundary.messages,
-        turnPrefixMessages: [],
-        isSplitTurn: false,
-        previousSummary: prior.textSummary,
-        // Do not leak old file operations through Pi's appended file list.
-        fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
-      },
-    }, remoteError);
-    if (!run.owned()) return { cancel: true };
-    if (!result) throw new Error("Layered compaction did not produce a summary");
-    if (!await compatibleIdentity(prior, ctx, selection.model)) {
-      throw new Error("The opaque checkpoint backend changed during layered compaction");
-    }
-    if (!run.owned()) return { cancel: true };
-    // Revalidate the source and cut after the asynchronous summary request.
-    const current = prepareCheckpointLayer(ctx.sessionManager.getBranch(), firstKeptEntryId, prior);
-    if (current.messages.length !== boundary.messages.length ||
-        current.messages.some((message, index) => fingerprintMessage(message) !== fingerprintMessage(boundary.messages[index])) ||
-        current.retained.length !== boundary.retained.length ||
-        current.retained.some((message, index) => fingerprintMessage(message) !== fingerprintMessage(boundary.retained[index]))) {
-      throw new Error("The layered compaction source changed");
-    }
-    const details = createLayeredCheckpointDetails(prior, boundary, result.compaction.summary);
-    return { compaction: { ...result.compaction, summary: fallbackSummary(details.checkpointId), details } };
-  } catch (error) {
-    return stopTextCompaction(ctx, run, error);
+  if (!run.owned()) return { cancel: true };
+  const { firstKeptEntryId } = event.preparation;
+  const boundary = prepareCheckpointLayer(event.branchEntries, firstKeptEntryId, prior);
+  if (boundary.messages.length === 0) {
+    throw new Error(`No messages after the active checkpoint need summarization (${errorMessage(remoteError)})`, {
+      cause: remoteError,
+    });
   }
+  const result = await run.summarize({
+    defaultModel: selection,
+    preparation: {
+      ...event.preparation,
+      messagesToSummarize: boundary.messages,
+      turnPrefixMessages: [],
+      isSplitTurn: false,
+      previousSummary: prior.textSummary,
+      // Do not leak old file operations through Pi's appended file list.
+      fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+    },
+  }, remoteError);
+  if (!run.owned()) return { cancel: true };
+  if (!result) throw new Error("Layered compaction did not produce a summary");
+  if (!await compatibleIdentity(prior, ctx, selection.model)) {
+    throw new Error("The opaque checkpoint backend changed during layered compaction");
+  }
+  if (!run.owned()) return { cancel: true };
+  // Revalidate the source and cut after the asynchronous summary request.
+  const current = prepareCheckpointLayer(ctx.sessionManager.getBranch(), firstKeptEntryId, prior);
+  if (current.messages.length !== boundary.messages.length ||
+      current.messages.some((message, index) => fingerprintMessage(message) !== fingerprintMessage(boundary.messages[index])) ||
+      current.retained.length !== boundary.retained.length ||
+      current.retained.some((message, index) => fingerprintMessage(message) !== fingerprintMessage(boundary.retained[index]))) {
+    throw new Error("The layered compaction source changed");
+  }
+  const details = createLayeredCheckpointDetails(prior, boundary, result.compaction.summary);
+  return { compaction: { ...result.compaction, summary: fallbackSummary(details.checkpointId), details } };
 }
 
 async function compactRemotely(
@@ -327,6 +333,7 @@ async function compactRemotely(
         thinkingLevel: reasoning,
       });
     } catch (failure) {
+      if (failure instanceof ConfiguredSummaryModelError) return stopTextCompaction(ctx, run, failure);
       if (run.owned() && ctx.hasUI) {
         ctx.ui.notify(`Compaction stopped; previous history was preserved. ${errorMessage(failure)}`, "error");
       }
@@ -409,28 +416,40 @@ export default function codexCompaction(pi: ExtensionAPI): void {
         setStatus(message) {
           if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, message);
         },
-        summarize(input, remoteError) {
+        async summarize(input, remoteError) {
+          // Validate lazily so unused malformed fallback settings never fail a remote compaction run.
+          let summaryModel: CompactionConfiguration["summaryModel"];
+          try {
+            summaryModel = configuration.summaryModel;
+          } catch (error) {
+            throw new ConfiguredSummaryModelError(error);
+          }
           let announced = false;
-          return requestFallbackCompaction({
-            ...input,
-            summaryModel: configuration.summaryModel,
-            modelRegistry: ctx.modelRegistry,
-            settings: pi.getSettings(),
-            customInstructions: event.customInstructions,
-            signal,
-            sessionId,
-            onPrepared: ({ model, thinkingLevel }) => {
-              if (!run.owned()) throw new Error("Compaction session changed");
-              if (announced) return;
-              announced = true;
-              run.setStatus("Pi fallback compaction...");
-              if (!ctx.hasUI) return;
-              if (remoteError !== undefined) {
-                ctx.ui.notify(`Codex remote compaction failed; using the configured summary model. ${errorMessage(remoteError)}`, "warning");
-              }
-              ctx.ui.notify(`Using Pi text compaction with ${model.provider}/${model.id} (${thinkingLevel}).`, "info");
-            },
-          });
+          try {
+            return await requestFallbackCompaction({
+              ...input,
+              summaryModel,
+              modelRegistry: ctx.modelRegistry,
+              settings: pi.getSettings(),
+              customInstructions: event.customInstructions,
+              signal,
+              sessionId,
+              onPrepared: ({ model, thinkingLevel }) => {
+                if (!run.owned()) throw new Error("Compaction session changed");
+                if (announced) return;
+                announced = true;
+                run.setStatus("Pi fallback compaction...");
+                if (!ctx.hasUI) return;
+                if (remoteError !== undefined) {
+                  const target = summaryModel ? "the configured summary model" : "Pi compaction";
+                  ctx.ui.notify(`Codex remote compaction failed; using ${target}. ${errorMessage(remoteError)}`, "warning");
+                }
+                ctx.ui.notify(`Using Pi text compaction with ${model.provider}/${model.id} (${thinkingLevel}).`, "info");
+              },
+            });
+          } catch (error) {
+            throw summaryModel ? new ConfiguredSummaryModelError(error) : error;
+          }
         },
       };
 

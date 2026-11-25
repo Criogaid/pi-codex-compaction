@@ -1751,6 +1751,125 @@ test("split-turn fallback aborted during first-segment retry backoff does not ro
   assert.deepEqual(fixture.notifications.filter((notice) => notice.level === "error"), []);
 });
 
+test("layered recovery distinguishes unconfigured chat-model summaries, configured summary failures, and preserved-history stops", async () => {
+  await rm(fallbackSettingsPath, { force: true });
+  const seedLayeredSession = async (options: {
+    emptyCut?: boolean;
+    corruptRetained?: boolean;
+    summaryStopReason?: "stop" | "error";
+    configuredSummary?: boolean;
+  } = {}) => {
+    if (options.configuredSummary) await configureFallback();
+    else await rm(fallbackSettingsPath, { force: true });
+
+    const session = SessionManager.inMemory();
+    session.appendMessage({ role: "user", content: "before-a", timestamp: 1 });
+    const keptByA: AgentMessage = { role: "user", content: "kept-by-a", timestamp: 2 };
+    const firstKeptA = session.appendMessage(keptByA);
+    const baseDetails = createCheckpointDetails({
+      identity: { ...capability, modelId: model.id },
+      replacementHistory: [{ type: "compaction", encrypted_content: "opaque-a" }],
+      keptMessages: [keptByA],
+    });
+    session.appendCompaction(fallbackSummary(baseDetails.checkpointId), firstKeptA, 100, baseDetails);
+    if (options.corruptRetained) session.appendContextEdit(firstKeptA, { content: "edited-after-a" });
+    const droppedId = session.appendMessage({ role: "user", content: "dropped-after-a", timestamp: 3 });
+    const tailId = session.appendMessage({ role: "user", content: "retained-after-a", timestamp: 4 });
+
+    const native = openaiProvider();
+    const summaryStopReason = options.summaryStopReason ?? "stop";
+    const registry = await testRegistry({
+      ...native,
+      id: model.provider,
+      getModels: () => [model],
+      streamSimple(requestModel, requestContext, streamOptions) {
+        if (streamOptions?.onProviderStreamEvent) {
+          return native.streamSimple(requestModel as Model<"openai-responses">, requestContext, streamOptions);
+        }
+        const stream = createAssistantMessageEventStream();
+        void (async () => {
+          await streamOptions?.onPayload?.({ model: requestModel.id, input: [] }, requestModel);
+          const response = {
+            role: "assistant" as const,
+            content: [{ type: "text" as const, text: "Chat model layered summary." }],
+            api: model.api, provider: model.provider, model: model.id, usage,
+            stopReason: summaryStopReason,
+            errorMessage: summaryStopReason === "error" ? "chat summary failed" : undefined,
+            timestamp: 5,
+          };
+          if (summaryStopReason === "error") stream.push({ type: "error", reason: "error", error: response });
+          else stream.push({ type: "done", reason: "stop", message: response });
+          stream.end(response);
+        })();
+        return stream;
+      },
+    });
+    if (options.configuredSummary) {
+      registry.registerProvider({
+        id: fallbackModel.provider, name: "Cheap provider", baseUrl: fallbackModel.baseUrl,
+        auth: { apiKey: { name: "Fixture", resolve: async () => ({ auth: { apiKey: "cheap-key" } }) } },
+        getModels: () => [fallbackModel],
+        streamSimple(requestModel) {
+          const stream = createAssistantMessageEventStream();
+          const response = {
+            role: "assistant" as const, content: [{ type: "text" as const, text: "" }],
+            api: requestModel.api, provider: requestModel.provider, model: requestModel.id, usage,
+            stopReason: "error" as const, errorMessage: "configured summary boom", timestamp: 5,
+          };
+          stream.push({ type: "error", reason: "error", error: response });
+          stream.end(response);
+          return stream;
+        },
+        stream() { throw new Error("not used"); },
+      });
+    }
+
+    const mock = mockPi("low", { transport: "sse", retry: { enabled: false, provider: { maxRetries: 0 } } });
+    codexCompaction(mock.pi);
+    const current = await context({ model, modelRegistry: registry, sessionManager: session });
+    const event = compactEvent();
+    event.branchEntries = session.getBranch();
+    event.preparation.firstKeptEntryId = options.emptyCut ? droppedId : tailId;
+    event.preparation.messagesToSummarize = options.emptyCut ? [] : [{ role: "user", content: "dropped-after-a", timestamp: 3 }];
+    using _fetchScope = mockFetch(async () => new Response("Service unavailable", { status: 503 }));
+    const result = await mock.events.get("session_before_compact")?.[0]?.(event, current.ctx) as SessionBeforeCompactResult | undefined;
+    return { result, notifications: current.notifications };
+  };
+
+  const unconfiguredOk = await seedLayeredSession();
+  assert.ok(unconfiguredOk.result?.compaction);
+  const warnings = unconfiguredOk.notifications.filter((item) => item.level === "warning");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0].message, /using Pi compaction\./);
+  assert.doesNotMatch(warnings[0].message, /configured summary model/i);
+
+  const chatFailed = await seedLayeredSession({ summaryStopReason: "error" });
+  assert.deepEqual(chatFailed.result, { cancel: true });
+  const chatErrors = chatFailed.notifications.filter((item) => item.level === "error");
+  assert.equal(chatErrors.length, 1);
+  assert.match(chatErrors[0].message, /Compaction stopped; previous history was preserved\./);
+  assert.doesNotMatch(chatErrors[0].message, /Configured summary model failed/i);
+
+  const emptyCut = await seedLayeredSession({ emptyCut: true });
+  assert.deepEqual(emptyCut.result, { cancel: true });
+  const emptyErrors = emptyCut.notifications.filter((item) => item.level === "error");
+  assert.equal(emptyErrors.length, 1);
+  assert.match(emptyErrors[0].message, /Compaction stopped; previous history was preserved\./);
+
+  const boundaryFailed = await seedLayeredSession({ corruptRetained: true });
+  assert.deepEqual(boundaryFailed.result, { cancel: true });
+  const boundaryErrors = boundaryFailed.notifications.filter((item) => item.level === "error");
+  assert.equal(boundaryErrors.length, 1);
+  assert.match(boundaryErrors[0].message, /Compaction stopped; previous history was preserved\./);
+  assert.doesNotMatch(boundaryErrors[0].message, /Configured summary model failed/i);
+
+  const configuredFailed = await seedLayeredSession({ configuredSummary: true });
+  assert.deepEqual(configuredFailed.result, { cancel: true });
+  const configuredErrors = configuredFailed.notifications.filter((item) => item.level === "error");
+  assert.equal(configuredErrors.length, 1);
+  assert.match(configuredErrors[0].message, /Configured summary model failed; compaction stopped\./);
+});
+
 test("a provider abort without a cancelled signal does not become a fallback summary", async () => {
   await configureFallback();
   const fixture = await fallbackFixture({ stopReason: "aborted" });
