@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { InMemoryCredentialStore, InMemoryModelsStore, type Api, type AuthResult, type ImageContent, type Model, type Provider } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
-import { createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, createAgentSessionRuntime, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager, type AgentSessionRuntime, type CreateAgentSessionRuntimeFactory, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { isObject, isObjectArray, type CompactionPayload, type JsonObject } from "../src/protocol.js";
 
 export const fixtureImage: ImageContent = { type: "image", mimeType: "image/png",
@@ -162,43 +162,44 @@ export async function sessionFixture(options: {
     retry: { enabled: false, provider: { maxRetries: 0 } },
     ...options.settings,
   });
-  async function start(manager: SessionManager) {
+  const start: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
     const loader = new DefaultResourceLoader({
-      cwd: directory, agentDir: directory, settingsManager,
+      cwd, agentDir, settingsManager,
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       systemPromptOverride: () => "You are a fixture assistant. Preserve the task's constraints.",
       extensionFactories: [...options.extensions],
     });
     await loader.reload();
-    const { session, extensionsResult } = await createAgentSession({
-      cwd: directory, agentDir: directory, model, modelRuntime: runtime, sessionManager: manager,
-      resourceLoader: loader, settingsManager, thinkingLevel: "low", noTools: "builtin",
+    const services = { cwd, agentDir, settingsManager, modelRuntime: runtime, resourceLoader: loader, diagnostics: [] };
+    const result = await createAgentSession({
+      ...services, model, sessionManager, sessionStartEvent, thinkingLevel: "low", noTools: "builtin",
     });
-    assert.deepEqual(extensionsResult.errors, []);
-    await session.bindExtensions({ mode: "print", onError: (error) => errors.push(error.error) });
-    return session;
-  }
-  let session: Awaited<ReturnType<typeof start>>;
+    assert.deepEqual(result.extensionsResult.errors, []);
+    await result.session.bindExtensions({ mode: "print", onError: (error) => errors.push(error.error) });
+    return { ...result, services, diagnostics: services.diagnostics };
+  };
+  let sessionRuntime: AgentSessionRuntime;
   const fetchScope = mockFetch(fetch);
   try {
-    session = await start(SessionManager.create(directory, join(directory, "sessions")));
+    sessionRuntime = await createAgentSessionRuntime(start, {
+      cwd: directory, agentDir: directory, sessionManager: SessionManager.create(directory, join(directory, "sessions")),
+    });
   } catch (error) {
     fetchScope[Symbol.dispose]();
     await rm(directory, { recursive: true, force: true });
     throw error;
   }
   return {
-    get session() { return session; },
-    model, models, runtime, requests, errors,
+    get session() { return sessionRuntime.session; },
+    model, models, runtime, sessionRuntime, requests, errors,
     async reopen() {
-      const path = session.sessionManager.getSessionFile();
+      const path = sessionRuntime.session.sessionManager.getSessionFile();
       assert.ok(path);
-      session.dispose();
-      session = await start(SessionManager.open(path));
+      assert.deepEqual(await sessionRuntime.switchSession(path), { cancelled: false });
     },
     async close() {
       try {
-        session.dispose();
+        await sessionRuntime.dispose();
         await rm(directory, { recursive: true, force: true });
       } finally {
         fetchScope[Symbol.dispose]();

@@ -132,7 +132,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
           : input instanceof Request
             ? await baseFetch(new Request(identity!.endpoint, new Request(input, init)))
             : await baseFetch(identity!.endpoint, init);
-        turnState.observeHeaders(response.headers);
+        turnState.observeResponse(response.status, response.headers);
         return attempt.observeResponse(response, request.signal, () => collector.completed);
       } catch (error) {
         attempt.fetchFailed(error);

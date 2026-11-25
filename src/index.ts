@@ -580,11 +580,11 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("before_provider_headers", (event, ctx) => {
-    turnState.applyToHeaders(ctx.sessionManager.getSessionId(), capableModel(ctx.model), event.headers);
+    turnState.applyToHeaders(ctx.sessionManager.getSessionId(), capableModel(ctx.model), pi.getSettings().transport, event.headers);
   });
 
-  pi.on("after_provider_response", (event, ctx) => {
-    turnState.observeResponse(ctx.sessionManager.getSessionId(), capableModel(ctx.model), event.headers);
+  pi.on("after_provider_response", (event) => {
+    turnState.observeResponse(event.status, event.headers);
   });
 
   pi.on("provider_stream_event", (event, ctx) => {

@@ -2,15 +2,25 @@
 // latch the first server-issued token within a turn, replay it across subsequent requests and
 // in-turn compactions, and clear it at turn settlement, model switch, or session change.
 import type { Api, ProviderHeaders } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
-import { isObject } from "./protocol.js";
+import { CODEX_API, isObject } from "./protocol.js";
 
 const TURN_STATE_HEADER = "x-codex-turn-state";
+
+type TransportSetting = ReturnType<ExtensionAPI["getSettings"]>["transport"];
+
+/** Codex reads a JSON header value as a string or, recursively, the first element of an array. */
+function jsonHeaderString(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  return Array.isArray(value) ? jsonHeaderString(value[0]) : undefined;
+}
 
 function headerTurnState(headers: Readonly<Record<string, unknown>>): string | undefined {
   for (const [name, value] of Object.entries(headers)) {
     if (name.toLowerCase() !== TURN_STATE_HEADER) continue;
-    if (typeof value === "string") return value;
+    const text = jsonHeaderString(value);
+    if (text !== undefined) return text;
   }
   return undefined;
 }
@@ -29,7 +39,9 @@ export class TurnStateSlot {
     return this.token;
   }
 
-  observeHeaders(headers: Headers | Readonly<Record<string, string>>): void {
+  /** Codex latches a token only from a response whose request succeeded. */
+  observeResponse(status: number, headers: Headers | Readonly<Record<string, string>>): void {
+    if (status < 200 || status >= 300) return;
     this.observe(headers instanceof Headers ? headers.get(TURN_STATE_HEADER) ?? undefined : headerTurnState(headers));
   }
 
@@ -58,9 +70,12 @@ interface ActiveTurn {
  */
 export class TurnStateTracker {
   private active?: ActiveTurn;
+  /** The slot that was current when Pi assembled the headers of its in-flight request. */
+  private requestSlot?: TurnStateSlot;
 
   reset(): void {
     this.active = undefined;
+    this.requestSlot = undefined;
   }
 
   startTurn(sessionId: string, target: CapableModel | undefined): void {
@@ -81,18 +96,15 @@ export class TurnStateTracker {
 
   endTurn(): void {
     this.active = undefined;
+    this.requestSlot = undefined;
   }
 
   /**
-   * `after_provider_response` names no model, so a response that arrives after a mid-request model
-   * switch latches into the new model's slot. Pi exposes no request identity to rule that out.
+   * `after_provider_response` names no model, so the response latches into the slot captured with its
+   * request's headers: a response that arrives after a model switch cannot seed the new model's slot.
    */
-  observeResponse(
-    sessionId: string,
-    target: CapableModel | undefined,
-    headers: Readonly<Record<string, string>>,
-  ): void {
-    this.slotFor(sessionId, target)?.observeHeaders(headers);
+  observeResponse(status: number, headers: Readonly<Record<string, string>>): void {
+    this.requestSlot?.observeResponse(status, headers);
   }
 
   observeStreamEvent(
@@ -107,8 +119,22 @@ export class TurnStateTracker {
     this.slotFor(sessionId, target)?.observeStreamEvent(event.data);
   }
 
-  applyToHeaders(sessionId: string, target: CapableModel | undefined, headers: ProviderHeaders): void {
-    applyTurnStateHeader(headers, this.slotFor(sessionId, target)?.value);
+  /**
+   * Pi sends Codex WebSocket headers only in the handshake of a pooled connection that later turns
+   * reuse, while Codex sends turn state per request in `client_metadata` and never in the handshake.
+   * Only SSE requests can therefore carry the token.
+   */
+  applyToHeaders(
+    sessionId: string,
+    target: CapableModel | undefined,
+    transport: TransportSetting,
+    headers: ProviderHeaders,
+  ): void {
+    const slot = this.slotFor(sessionId, target);
+    // Pi's session sends one provider request at a time, so the next response belongs to this request.
+    this.requestSlot = slot;
+    if (target?.identity.api === CODEX_API && transport !== "sse") return;
+    applyTurnStateHeader(headers, slot?.value);
   }
 
   /**
