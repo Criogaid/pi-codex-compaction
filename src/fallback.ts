@@ -1,5 +1,5 @@
 // Own summary-model resolution and Pi's native text summarization through the model registry.
-import { getSupportedThinkingLevels, type Api, type AssistantMessage, type AssistantMessageEventStream, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type AssistantMessage, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { compact, SettingsManager, type ExtensionAPI, type ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { SummaryModel } from "./fallback-settings.js";
 
@@ -48,7 +48,6 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
   const providerRetry = settings.getProviderRetrySettings();
   // Pi can append file lists to empty summaries; inspect the actual completions.
   const responses: AssistantMessage[] = [];
-  let abortedStream: AssistantMessageEventStream | undefined;
   const result = await compact(
     request.preparation,
     selection.model,
@@ -58,11 +57,9 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
     request.signal,
     selection.thinkingLevel,
     async (model, context, options) => {
-      // Pi can start another segment after an abort. Stop immediately when the signal is aborted
-      // so retry-backoff cancellation cannot route or dispatch a later segment; otherwise reuse
-      // the terminal stream when only the provider stopped early.
+      // Pi's retryAssistantCall normalizes backoff-sleep aborts to stopReason="aborted", which
+      // compact() does not treat as a failure before starting the turn-prefix segment.
       request.signal.throwIfAborted();
-      if (abortedStream) return abortedStream;
       const stream = request.modelRegistry.streamSimple(model, context, {
         ...options,
         transport: settings.getTransport(),
@@ -77,21 +74,19 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
         },
       });
       const message = await stream.result();
-      if (message.stopReason === "aborted") abortedStream = stream;
-      else responses.push(message);
+      if (message.stopReason === "aborted") {
+        request.signal.throwIfAborted();
+        throw new Error(PROVIDER_ABORT_MESSAGE);
+      }
+      responses.push(message);
       return stream;
     },
     undefined,
     settings.getRetrySettings(),
     undefined,
     request.sessionId,
-  ).catch((cause: unknown) => {
-    request.signal.throwIfAborted();
-    if (!abortedStream) throw cause;
-    throw new Error(PROVIDER_ABORT_MESSAGE, { cause });
-  });
+  );
   request.signal.throwIfAborted();
-  if (abortedStream) throw new Error(PROVIDER_ABORT_MESSAGE);
   request.onPrepared(selection);
   for (const message of responses) {
     // Pi owns retrying error responses; validate only completions it accepted.
