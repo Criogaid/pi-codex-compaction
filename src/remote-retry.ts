@@ -11,7 +11,8 @@ const CAPACITY_CODES = new Set(["server_is_overloaded", "policy_capacity_unavail
 const RATE_LIMIT_CODES = new Set(["rate_limit_exceeded", "slow_down"]);
 const HTTP_429_PERMANENT_TYPES = new Set(["usage_limit_reached", "usage_not_included", "insufficient_quota"]);
 const HTTP_PERMANENT_CODES = new Set([
-  "insufficient_quota", "credit_balance_exhausted", "organization_spend_limit_exceeded",
+  "insufficient_quota", "credit_balance_exhausted", "api_key_spend_limit_exceeded",
+  "organization_spend_limit_exceeded", "organization_usage_limit_exceeded",
   "project_spend_limit_exceeded", "usage_limit_reached", "usage_not_included", "context_length_exceeded",
   "invalid_prompt", "invalid_api_key", "authentication_error", "permission_denied", "access_denied",
   "cyber_policy", "bio_policy", "misalignment_policy_violation", "content_filter",

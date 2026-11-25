@@ -630,7 +630,8 @@ for (const api of responsesApis) {
 
   for (const [status, code, attempts] of [
     [503, "usage_not_included", 1], [503, "usage_limit_reached", 1],
-    [429, "usage_not_included", 1], [503, "model_not_found", 3],
+    [429, "usage_not_included", 1], [429, "api_key_spend_limit_exceeded", 1],
+    [429, "organization_usage_limit_exceeded", 1], [503, "model_not_found", 3],
   ] as const) {
     test(`${api}: HTTP ${status} with code-only ${code} makes ${attempts} attempt(s)`, async () => {
       const f = await fixture(api);
@@ -640,6 +641,43 @@ for (const api of responsesApis) {
         })));
       await assert.rejects(requestRemoteCompaction(f.request), attempts === 1 ? { constructor: Error } : assertTransientWithCause);
       f.assertAttempts(attempts);
+    });
+  }
+
+  for (const code of ["api_key_spend_limit_exceeded", "organization_usage_limit_exceeded"] as const) {
+    test(`${api}: HTTP 429 ${code} stops after 1 V2 attempt without layered fallback`, { timeout: 20_000 }, async (t) => {
+      let failCode: string | undefined;
+      const session = await sessionFixture({
+        api,
+        extensions: [codexCompaction],
+        settings: { retry: { provider: { maxRetries: 2, maxRetryDelayMs: 1_000 } } },
+        respond({ payload }) {
+          if (failCode && hasTrigger(payload)) {
+            return new Response(JSON.stringify({ error: { code: failCode, message: "Permanent quota cap" } }), {
+              status: 429,
+              headers: { "content-type": "application/json", "retry-after": "0" },
+            });
+          }
+          return undefined;
+        },
+      });
+      t.after(() => session.close());
+      await session.session.prompt("Preserve prior constraint. ".repeat(80));
+      await session.session.prompt("Continue prior task. ".repeat(80));
+      await session.session.compact();
+      const baseEntry = getLatestCompactionEntry(session.session.sessionManager.getBranch());
+      assert.ok(baseEntry);
+      await session.session.prompt("New work after checkpoint. ".repeat(80));
+      await session.session.prompt("Recent tail after checkpoint. ".repeat(80));
+
+      const before = session.requests.length;
+      failCode = code;
+      await assert.rejects(session.session.compact(), { message: "Compaction cancelled" });
+      const attempted = session.requests.slice(before);
+      assert.equal(attempted.filter(({ payload }) => hasTrigger(payload)).length, 1);
+      assert.equal(attempted.filter(({ payload }) => !hasTrigger(payload)).length, 0);
+      assert.equal(getLatestCompactionEntry(session.session.sessionManager.getBranch())?.id, baseEntry.id);
+      assert.deepEqual(session.errors, []);
     });
   }
 
