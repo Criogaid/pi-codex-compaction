@@ -85,6 +85,38 @@ test("discards a V2 checkpoint after switching to a branch with the same message
   assert.deepEqual(fixture.errors, []);
 });
 
+test("discards layered recovery after switching to a branch with the same messages", { timeout: 20_000 }, async (t) => {
+  await rm(configPath, { force: true });
+  let failRemote = false;
+  let otherLeaf: string;
+  const fixture = await sessionFixture({
+    extensions: [codexCompaction],
+    respond({ payload }) {
+      if (!failRemote) return undefined;
+      if (hasItem(payload, "compaction_trigger")) return new Response("Temporary service outage", { status: 503 });
+      fixture.session.sessionManager.branch(otherLeaf);
+      return undefined;
+    },
+  });
+  t.after(() => fixture.close());
+  const baseCompaction = await seedHistory(fixture);
+  await fixture.session.prompt("Discuss layered branch safety. ".repeat(80));
+  const { sessionManager } = fixture.session;
+  const conversationLeaf = sessionManager.getLeafId();
+  assert.ok(conversationLeaf);
+  otherLeaf = sessionManager.appendCustomEntry("fixture-branch", "other");
+  sessionManager.branch(conversationLeaf);
+  sessionManager.appendCustomEntry("fixture-branch", "original");
+  const messages = sessionManager.buildSessionProjection().messages;
+
+  failRemote = true;
+  await assert.rejects(fixture.session.compact(), { message: "Compaction cancelled" });
+  assert.equal(sessionManager.getLeafId(), otherLeaf);
+  assert.equal(getLatestCompactionEntry(sessionManager.getBranch())?.id, baseCompaction.id);
+  assert.deepEqual(sessionManager.buildSessionProjection().messages, messages);
+  assert.deepEqual(fixture.errors, []);
+});
+
 test("installs a V2 checkpoint on the starting model after a recorded chat model switch", { timeout: 20_000 }, async (t) => {
   const fixture = await sessionFixture({
     extensions: [codexCompaction],

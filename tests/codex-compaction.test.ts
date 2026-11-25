@@ -1870,6 +1870,54 @@ test("layered recovery distinguishes unconfigured chat-model summaries, configur
   assert.match(configuredErrors[0].message, /Configured summary model failed; compaction stopped\./);
 });
 
+test("V2 branch-change cancellation emits an English warning and preserves history", async () => {
+  await rm(fallbackSettingsPath, { force: true });
+  const session = SessionManager.inMemory();
+  const firstId = session.appendMessage({ role: "user", content: "initial request", timestamp: 1 });
+  session.appendMessage({ role: "user", content: "follow-up", timestamp: 2 });
+
+  const native = openaiProvider();
+  const registry = await testRegistry({ ...native, id: model.provider, getModels: () => [model] });
+  const mock = mockPi("low", { transport: "sse", retry: { enabled: false, provider: { maxRetries: 0 } } });
+  codexCompaction(mock.pi);
+  const current = await context({ model, modelRegistry: registry, sessionManager: session });
+  const event = compactEvent();
+  event.branchEntries = session.getBranch();
+  event.preparation.firstKeptEntryId = firstId;
+
+  const sseBody = [
+    `data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "compaction", encrypted_content: "opaque-v2" } })}`,
+    `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } } })}`,
+    "",
+  ].join("\n\n");
+  using _fetchScope = mockFetch(async () => {
+    session.appendMessage({ role: "user", content: "concurrent message", timestamp: 3 });
+    return new Response(sseBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+  });
+
+  const result = await mock.events.get("session_before_compact")?.[0]?.(event, current.ctx) as SessionBeforeCompactResult | undefined;
+  assert.deepEqual(result, { cancel: true });
+  const warnings = current.notifications.filter((item) => item.level === "warning");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0].message, /^[\x20-\x7E]+$/);
+  assert.match(warnings[0].message, /Session history changed during V2 compaction/i);
+});
+
+test("unconfigured fallback does not blame a configured summary model on unexpected errors", async () => {
+  await writeFile(fallbackSettingsPath, JSON.stringify({ version: 2, remoteCompaction: { enabled: false } }));
+  const mock = mockPi();
+  mock.pi.getSettings = () => { throw new Error("settings boom"); };
+  codexCompaction(mock.pi);
+  const current = await context({ model });
+
+  const result = await mock.events.get("session_before_compact")?.[0]?.(compactEvent(), current.ctx) as SessionBeforeCompactResult | undefined;
+  assert.deepEqual(result, { cancel: true });
+  const errors = current.notifications.filter((item) => item.level === "error");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /Compaction stopped\. settings boom/);
+  assert.doesNotMatch(errors[0].message, /Configured summary model failed/i);
+});
+
 test("a provider abort without a cancelled signal does not become a fallback summary", async () => {
   await configureFallback();
   const fixture = await fallbackFixture({ stopReason: "aborted" });
