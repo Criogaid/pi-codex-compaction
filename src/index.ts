@@ -8,6 +8,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
+  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { prepareRetention, userItemOrigins } from "./retention-input.js";
@@ -96,23 +97,20 @@ function providerRequestInputs(pi: ExtensionAPI, ctx: ExtensionContext): Provide
   };
 }
 
-function canonicalMessages(ctx: ExtensionContext): AgentMessage[] {
-  const branch = ctx.sessionManager.getBranch();
+function canonicalMessages(branch: SessionEntry[]): AgentMessage[] {
   return buildSessionContext(branch, branch.at(-1)?.id ?? null).messages;
 }
 
-function projectedCurrentMessages(
-  event: SessionBeforeCompactEvent,
+function projectCompactionMessages(
+  messages: AgentMessage[],
   identity: ProviderIdentity,
   prior: CodexCheckpointDetails | undefined,
 ): AgentMessage[] {
-  const leafId = event.branchEntries.at(-1)?.id ?? null;
-  const session = buildSessionContext(event.branchEntries, leafId);
-  if (!prior) return session.messages;
+  if (!prior) return messages;
   if (!sameProvider(prior, identity)) {
     throw new Error("The active opaque checkpoint belongs to a different provider backend");
   }
-  const projected = projectCheckpointRequest(session.messages, prior);
+  const projected = projectCheckpointRequest(messages, prior);
   if (!projected) throw new Error("The previous opaque checkpoint could not be projected safely");
   return projected;
 }
@@ -243,7 +241,11 @@ async function compactRemotely(
       ctx.ui.notify("Codex Remote Compaction V2 does not accept custom instructions; they are ignored.", "warning");
     }
     const prior = checkpoint.state === "parsed" ? checkpoint.details : undefined;
-    const currentMessages = projectedCurrentMessages(event, supported.identity, prior);
+    const sourceLength = event.branchEntries.length;
+    const sourceLeafId = event.branchEntries.at(-1)?.id;
+    const sourceMessages = canonicalMessages(event.branchEntries);
+    const sourceFingerprints = sourceMessages.map(fingerprintMessage);
+    const currentMessages = projectCompactionMessages(sourceMessages, supported.identity, prior);
     const request = compactionRequest(snapshots, sessionId, supported, currentMessages, providerRequestInputs(pi, ctx), {
       blockImages: settings.images?.blockImages ?? false,
       tools: () => activeTools(pi),
@@ -282,6 +284,16 @@ async function compactRemotely(
         : undefined,
     });
     if (!run.owned()) return { cancel: true };
+    const branch = ctx.sessionManager.getBranch();
+    // Append-only branch IDs establish ancestry. A new compaction may have the same summary but different details.
+    const sameBranch = branch[sourceLength - 1]?.id === sourceLeafId &&
+      !branch.slice(sourceLength).some((entry) => entry.type === "compaction");
+    const messages = sameBranch ? canonicalMessages(branch) : undefined;
+    if (!messages || messages.length !== sourceFingerprints.length ||
+        messages.some((message, index) => fingerprintMessage(message) !== sourceFingerprints[index])) {
+      if (ctx.hasUI) ctx.ui.notify("会话历史在 V2 压缩期间发生变化，已取消压缩并保留当前历史。", "warning");
+      return { cancel: true };
+    }
     const retention = prepareRetention(response.promptInput, signal, {
       images: response.images,
       contextual: response.contextual,
@@ -290,7 +302,7 @@ async function compactRemotely(
     const details = createCheckpointDetails({
       identity: response.identity,
       replacementHistory,
-      keptMessages: keptMessages(event.branchEntries, event.preparation.firstKeptEntryId),
+      keptMessages: keptMessages(branch, event.preparation.firstKeptEntryId),
     });
     return {
       compaction: {
@@ -452,7 +464,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("context", (_event, ctx) => {
-    snapshots.recordContext(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => canonicalMessages(ctx));
+    snapshots.recordContext(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => canonicalMessages(ctx.sessionManager.getBranch()));
   });
 
   // Pi runs every extension's `context` handlers first, so none of them sees the marker and load order cannot
@@ -461,7 +473,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     let messages: AgentMessage[] | undefined;
     const checkpoint = activeCheckpoint(ctx);
     if (checkpoint && await compatibleIdentity(checkpoint, ctx)) {
-      messages = projectCheckpointTranscript(event.messages, canonicalMessages(ctx), checkpoint);
+      messages = projectCheckpointTranscript(event.messages, canonicalMessages(ctx.sessionManager.getBranch()), checkpoint);
       if (!messages) {
         snapshots.discardSnapshots();
         warnOnce(ctx, `${checkpoint.checkpointId}:projection`,
@@ -471,7 +483,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     snapshots.recordProjectedRequest(
       ctx.sessionManager.getSessionId(),
       capableModel(ctx.model),
-      () => canonicalMessages(ctx),
+      () => canonicalMessages(ctx.sessionManager.getBranch()),
       () => activeCheckpoint(ctx),
       messages ?? event.messages,
       messages !== undefined,
@@ -495,7 +507,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
         snapshots.recordProviderRequest(
           ctx.sessionManager.getSessionId(),
           capableModel(ctx.model),
-          () => canonicalMessages(ctx),
+          () => canonicalMessages(ctx.sessionManager.getBranch()),
           () => ctx.getSystemPrompt(),
           () => ({ payload: event.payload, inputs: providerRequestInputs(pi, ctx), replay }),
         );

@@ -29,6 +29,87 @@ async function seedHistory(fixture: Awaited<ReturnType<typeof sessionFixture>>) 
   return entry;
 }
 
+test("discards a V2 checkpoint when an in-flight context edit changes dropped history", { timeout: 20_000 }, async (t) => {
+  const fixture = await sessionFixture({
+    extensions: [codexCompaction],
+    respond({ payload }) {
+      if (!hasItem(payload, "compaction_trigger")) return undefined;
+      const { sessionManager } = fixture.session;
+      const original = sessionManager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user");
+      assert.ok(original);
+      assert.match(JSON.stringify(payload.input), /cerulean/);
+      sessionManager.appendContextEdit(original.id, { content: "The approved project color is ochre." });
+      return undefined;
+    },
+  });
+  t.after(() => fixture.close());
+  await fixture.session.prompt(`${originalFact} ${"Preserve the original requirements. ".repeat(80)}`);
+  await fixture.session.prompt("Continue the agreed task. ".repeat(80));
+  const requestCount = fixture.requests.length;
+
+  await assert.rejects(fixture.session.compact(), { message: "Compaction cancelled" });
+  const branch = fixture.session.sessionManager.getBranch();
+  assert.equal(getLatestCompactionEntry(branch), null);
+  assert.equal(branch.at(-1)?.type, "context_edit");
+  const messages = JSON.stringify(fixture.session.sessionManager.buildSessionProjection().messages);
+  assert.match(messages, /ochre/);
+  assert.doesNotMatch(messages, /cerulean/);
+  assert.equal(fixture.requests.length - requestCount, 1, "A stale V2 result must not trigger text fallback");
+  assert.deepEqual(fixture.errors, []);
+});
+
+test("discards a V2 checkpoint after switching to a branch with the same messages", { timeout: 20_000 }, async (t) => {
+  let otherLeaf: string;
+  const fixture = await sessionFixture({
+    extensions: [codexCompaction],
+    respond({ payload }) {
+      if (hasItem(payload, "compaction_trigger")) fixture.session.sessionManager.branch(otherLeaf);
+      return undefined;
+    },
+  });
+  t.after(() => fixture.close());
+  await fixture.session.prompt("Remember the agreed requirements. ".repeat(80));
+  await fixture.session.prompt("Continue the agreed task. ".repeat(80));
+  const { sessionManager } = fixture.session;
+  const conversationLeaf = sessionManager.getLeafId();
+  assert.ok(conversationLeaf);
+  otherLeaf = sessionManager.appendCustomEntry("fixture-branch", "other");
+  sessionManager.branch(conversationLeaf);
+  sessionManager.appendCustomEntry("fixture-branch", "original");
+  const messages = sessionManager.buildSessionProjection().messages;
+
+  await assert.rejects(fixture.session.compact(), { message: "Compaction cancelled" });
+  assert.equal(sessionManager.getLeafId(), otherLeaf);
+  assert.equal(getLatestCompactionEntry(sessionManager.getBranch()), null);
+  assert.deepEqual(sessionManager.buildSessionProjection().messages, messages);
+  assert.deepEqual(fixture.errors, []);
+});
+
+test("installs a V2 checkpoint on the starting model after a recorded chat model switch", { timeout: 20_000 }, async (t) => {
+  const fixture = await sessionFixture({
+    extensions: [codexCompaction],
+    models: (base) => [base, { ...base, id: "gpt-fixture-second-model" }],
+    async respond({ payload }) {
+      if (hasItem(payload, "compaction_trigger")) {
+        await fixture.session.setModel(fixture.models[1]);
+      }
+    },
+  });
+  t.after(() => fixture.close());
+  await fixture.session.prompt("Remember the agreed requirements. ".repeat(80));
+  await fixture.session.prompt("Continue the agreed task. ".repeat(80));
+  const { details } = await fixture.session.compact();
+
+  const branch = fixture.session.sessionManager.getBranch();
+  const checkpoint = resolveLatestCheckpoint(branch);
+  assert.equal(checkpoint.state, "parsed");
+  assert.deepEqual(getLatestCompactionEntry(branch)?.details, details);
+  assert.equal(checkpoint.details.modelId, fixture.model.id);
+  assert.equal(fixture.session.model?.id, fixture.models[1].id);
+  assert.ok(branch.some((entry) => entry.type === "model_change" && entry.modelId === fixture.models[1].id));
+  assert.deepEqual(fixture.errors, []);
+});
+
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   for (const reason of ["remote failure", "V2 disabled"] as const) {
     for (const separateFallback of [false, true]) {
