@@ -142,6 +142,105 @@ test("installs a V2 checkpoint on the starting model after a recorded chat model
   assert.deepEqual(fixture.errors, []);
 });
 
+test("installs and replays a V2 checkpoint when an excluded !! bash command runs during compaction", { timeout: 20_000 }, async (t) => {
+  await rm(configPath, { force: true });
+  const fixture = await sessionFixture({
+    extensions: [codexCompaction],
+    respond({ payload }) {
+      if (hasItem(payload, "compaction_trigger")) {
+        fixture.session.recordBashResult(
+          "echo ok",
+          { output: "ok\n", exitCode: 0, cancelled: false, truncated: false },
+          { excludeFromContext: true },
+        );
+      }
+      return undefined;
+    },
+  });
+  t.after(() => fixture.close());
+  await fixture.session.prompt("Remember the agreed requirements. ".repeat(80));
+  await fixture.session.prompt("Continue the agreed task. ".repeat(80));
+  const { details } = await fixture.session.compact();
+
+  const branch = fixture.session.sessionManager.getBranch();
+  const checkpoint = resolveLatestCheckpoint(branch);
+  assert.equal(checkpoint.state, "parsed");
+  assert.deepEqual(getLatestCompactionEntry(branch)?.details, details);
+  assert.ok(branch.some((entry) => entry.type === "message" && entry.message.role === "bashExecution" && entry.message.excludeFromContext));
+
+  await fixture.session.prompt("Follow up after excluded bash.");
+  const replay = fixture.requests.at(-1)!.payload;
+  assert.ok(hasItem(replay, "compaction"));
+  assert.doesNotMatch(JSON.stringify(replay.input), /echo ok/);
+  assert.deepEqual(fixture.errors, []);
+});
+
+test("discards a V2 checkpoint when a context-included ! bash command runs during compaction", { timeout: 20_000 }, async (t) => {
+  await rm(configPath, { force: true });
+  const fixture = await sessionFixture({
+    extensions: [codexCompaction],
+    respond({ payload }) {
+      if (hasItem(payload, "compaction_trigger")) {
+        fixture.session.recordBashResult(
+          "echo visible",
+          { output: "visible\n", exitCode: 0, cancelled: false, truncated: false },
+          { excludeFromContext: false },
+        );
+      }
+      return undefined;
+    },
+  });
+  t.after(() => fixture.close());
+  await fixture.session.prompt("Remember the agreed requirements. ".repeat(80));
+  await fixture.session.prompt("Continue the agreed task. ".repeat(80));
+
+  await assert.rejects(fixture.session.compact(), { message: "Compaction cancelled" });
+  const branch = fixture.session.sessionManager.getBranch();
+  assert.equal(getLatestCompactionEntry(branch), null);
+  assert.ok(branch.some((entry) => entry.type === "message" && entry.message.role === "bashExecution" && !entry.message.excludeFromContext));
+  assert.deepEqual(fixture.errors, []);
+});
+
+test("installs and replays layered recovery when an excluded !! bash command runs during compaction", { timeout: 20_000 }, async (t) => {
+  await rm(configPath, { force: true });
+  let failRemote = false;
+  let recordedBash = false;
+  const fixture = await sessionFixture({
+    extensions: [codexCompaction],
+    respond({ payload }) {
+      if (!failRemote) return undefined;
+      if (hasItem(payload, "compaction_trigger")) return new Response("Temporary service outage", { status: 503 });
+      if (!recordedBash) {
+        recordedBash = true;
+        fixture.session.recordBashResult(
+          "echo layered",
+          { output: "layered\n", exitCode: 0, cancelled: false, truncated: false },
+          { excludeFromContext: true },
+        );
+      }
+      return undefined;
+    },
+  });
+  t.after(() => fixture.close());
+  await seedHistory(fixture);
+  await fixture.session.prompt("Discuss layered excluded bash handling. ".repeat(80));
+
+  failRemote = true;
+  const { details } = await fixture.session.compact();
+  const branch = fixture.session.sessionManager.getBranch();
+  const checkpoint = resolveLatestCheckpoint(branch);
+  assert.equal(checkpoint.state, "parsed");
+  assert.equal(checkpoint.details.version, 2);
+  assert.deepEqual(getLatestCompactionEntry(branch)?.details, details);
+
+  failRemote = false;
+  await fixture.session.prompt("Follow up after layered excluded bash.");
+  const replay = fixture.requests.at(-1)!.payload;
+  assert.ok(hasItem(replay, "compaction"));
+  assert.doesNotMatch(JSON.stringify(replay.input), /echo layered/);
+  assert.deepEqual(fixture.errors, []);
+});
+
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   for (const reason of ["remote failure", "V2 disabled"] as const) {
     for (const separateFallback of [false, true]) {

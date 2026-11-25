@@ -113,13 +113,18 @@ interface BranchSource {
   readonly fingerprints: readonly string[];
 }
 
+// Pi's convertToLlm skips only bashExecution messages marked excludeFromContext (!! prefix).
+function modelVisibleMessages(messages: readonly AgentMessage[]): AgentMessage[] {
+  return messages.filter((message) => !(message.role === "bashExecution" && message.excludeFromContext));
+}
+
 function captureBranchSource(branch: SessionEntry[]): BranchSource {
   const projection = projectBranch(branch);
   return {
     length: branch.length,
     leafId: branch.at(-1)?.id,
     projection,
-    fingerprints: projection.messages.map(fingerprintMessage),
+    fingerprints: modelVisibleMessages(projection.messages).map(fingerprintMessage),
   };
 }
 
@@ -129,8 +134,9 @@ function validateUnchangedBranch(branch: SessionEntry[], source: BranchSource): 
   if (source.length > 0 && branch[source.length - 1]?.id !== source.leafId) return undefined;
   if (branch.slice(source.length).some((entry) => entry.type === "compaction")) return undefined;
   const projection = projectBranch(branch);
-  return projection.messages.length === source.fingerprints.length &&
-    projection.messages.every((message, index) => fingerprintMessage(message) === source.fingerprints[index])
+  const visible = modelVisibleMessages(projection.messages);
+  return visible.length === source.fingerprints.length &&
+    visible.every((message, index) => fingerprintMessage(message) === source.fingerprints[index])
     ? projection : undefined;
 }
 
@@ -315,11 +321,16 @@ async function recoverLayeredCheckpoint(
     throw new Error("The opaque checkpoint backend changed during layered compaction");
   }
   if (!run.owned()) return { cancel: true };
-  // Revalidate branch ancestry and canonical messages after the asynchronous summary request.
-  if (!validateUnchangedBranch(ctx.sessionManager.getBranch(), source)) {
+  // Revalidate branch ancestry and model-visible messages after the asynchronous summary request.
+  const projection = validateUnchangedBranch(ctx.sessionManager.getBranch(), source);
+  if (!projection) {
     throw new Error("The layered compaction source changed");
   }
-  const details = createLayeredCheckpointDetails(prior, boundary, result.compaction.summary);
+  const details = createLayeredCheckpointDetails(
+    prior,
+    { ...boundary, retained: keptMessages(projection, firstKeptEntryId) },
+    result.compaction.summary,
+  );
   return { compaction: { ...result.compaction, summary: fallbackSummary(details.checkpointId), details } };
 }
 
