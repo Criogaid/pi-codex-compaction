@@ -267,11 +267,24 @@ async function compactFallback(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
   run: CompactionRun,
+  reasoning: ReturnType<ExtensionAPI["getThinkingLevel"]>,
   remoteError: unknown,
 ) {
   try {
     if (!run.owned()) return { cancel: true };
-    const result = await run.summarize({ preparation: event.preparation }, remoteError);
+    // Native prepareCompaction reads entry.summary (the recovery placeholder), so carry a v2 layer's plain text forward.
+    const checkpoint = remoteError === undefined ? resolveLatestCheckpoint(event.branchEntries) : undefined;
+    const layeredSummary = checkpoint?.state === "parsed" && checkpoint.details.version === 2
+      ? checkpoint.details.textSummary
+      : undefined;
+    const result = await run.summarize({
+      preparation: layeredSummary === undefined
+        ? event.preparation
+        : { ...event.preparation, previousSummary: layeredSummary },
+      defaultModel: layeredSummary !== undefined && ctx.model
+        ? { model: ctx.model, thinkingLevel: reasoning }
+        : undefined,
+    }, remoteError);
     if (!run.owned()) return { cancel: true };
     if (!result && remoteError !== undefined && ctx.hasUI) {
       ctx.ui.notify(`Codex remote compaction failed; using Pi compaction. ${errorMessage(remoteError)}`, "warning");
@@ -294,7 +307,7 @@ async function recoverLayeredCheckpoint(
   if (!run.owned()) return { cancel: true };
   const { firstKeptEntryId } = event.preparation;
   const messagesToSummarize = prepareCheckpointLayer(source.projection, firstKeptEntryId, prior);
-  if (messagesToSummarize.length === 0) {
+  if (convertToLlm(messagesToSummarize).length === 0) {
     throw new Error(`No messages after the active checkpoint need summarization (${errorMessage(remoteError)})`, {
       cause: remoteError,
     });
@@ -342,7 +355,7 @@ async function recoverAfterRemoteFailure(
 ) {
   if (!run.owned()) return { cancel: true };
   // A failure during checkpoint resolution cannot establish that native fallback is safe.
-  if (checkpoint?.state === "none") return compactFallback(event, ctx, run, error);
+  if (checkpoint?.state === "none") return compactFallback(event, ctx, run, reasoning, error);
   if (checkpoint?.state !== "parsed" || !source || !(error instanceof RemoteCompactionTransientError) ||
       !await compatibleIdentity(checkpoint.details, ctx, supported.model)) {
     return notifyStopped(
@@ -532,7 +545,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
 
       const result = configuration.remoteCompactionEnabled && supported
         ? await compactRemotely(pi, event, ctx, run, supported, requestSnapshots)
-        : await compactFallback(event, ctx, run, undefined);
+        : await compactFallback(event, ctx, run, pi.getThinkingLevel(), undefined);
       return owned() ? result : { cancel: true };
     } finally {
       if (ownsStatus()) ctx.ui.setStatus(STATUS_KEY, undefined);

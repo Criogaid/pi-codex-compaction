@@ -241,6 +241,110 @@ test("installs and replays layered recovery when an excluded !! bash command run
   assert.deepEqual(fixture.errors, []);
 });
 
+for (const separateFallback of [false, true]) {
+  test(`carries layered textSummary into native text compaction after V2 is disabled (separate fallback=${separateFallback})`, { timeout: 20_000 }, async (t) => {
+    await rm(configPath, { force: true });
+    let failRemote = false;
+    const fixture = await sessionFixture({
+      extensions: [codexCompaction],
+      respond({ payload }) {
+        if (failRemote && hasItem(payload, "compaction_trigger")) {
+          return new Response("Temporary service outage", { status: 503 });
+        }
+        return undefined;
+      },
+    });
+    t.after(() => fixture.close());
+    await seedHistory(fixture);
+    await fixture.session.prompt("New work before layered fallback. ".repeat(80));
+    await fixture.session.prompt("Recent tail during layered fallback. ".repeat(80));
+
+    failRemote = true;
+    await fixture.session.compact();
+    failRemote = false;
+
+    const layered = resolveLatestCheckpoint(fixture.session.sessionManager.getBranch());
+    assert.equal(layered.state, "parsed");
+    assert.equal(layered.details.version, 2);
+    const previousTextSummary = layered.details.textSummary;
+    assert.ok(previousTextSummary.trim().length > 0);
+
+    await fixture.session.prompt("More work after layered checkpoint. ".repeat(80));
+    await fixture.session.prompt("Latest tail before disabling V2. ".repeat(80));
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(configPath, JSON.stringify({
+      version: 2,
+      remoteCompaction: { enabled: false },
+      ...(separateFallback
+        ? { summaryModel: { provider: fixture.model.provider, model: fixture.model.id, thinkingLevel: "low" } }
+        : {}),
+    }));
+
+    const requestCount = fixture.requests.length;
+    await fixture.session.compact();
+    const summaryRequests = fixture.requests.slice(requestCount);
+    assert.ok(summaryRequests.length > 0);
+    const summaryInput = JSON.stringify(summaryRequests.map((request) => request.payload.input));
+    assert.ok(summaryInput.includes(previousTextSummary), "Text compaction must receive prior layered textSummary");
+    assert.doesNotMatch(summaryInput, /Earlier chat history was compressed by Codex Remote Compaction V2/);
+    assert.equal(resolveLatestCheckpoint(fixture.session.sessionManager.getBranch()).state, "none");
+    assert.deepEqual(fixture.errors, []);
+  });
+}
+
+for (const excludeFromContext of [true, false]) {
+  test(`layered recovery ${excludeFromContext ? "stops without summarizing" : "summarizes"} when only a ${excludeFromContext ? "!!" : "!"} bash entry is dropped`, { timeout: 20_000 }, async (t) => {
+    await rm(configPath, { force: true });
+    let failRemote = false;
+    const fixture = await sessionFixture({
+      extensions: [codexCompaction],
+      respond({ payload }) {
+        if (failRemote && hasItem(payload, "compaction_trigger")) {
+          return new Response(JSON.stringify({ error: { code: "server_is_overloaded" } }), {
+            status: 503,
+            headers: { "content-type": "application/json", "retry-after": "0" },
+          });
+        }
+        return undefined;
+      },
+    });
+    t.after(() => fixture.close());
+    await fixture.session.prompt(`${originalFact} ${"Preserve the original requirements. ".repeat(80)}`);
+    await fixture.session.prompt("Continue the agreed task. ".repeat(80));
+    await fixture.session.compact();
+    const baseEntry = getLatestCompactionEntry(fixture.session.sessionManager.getBranch());
+    assert.ok(baseEntry);
+    assert.equal(resolveLatestCheckpoint(fixture.session.sessionManager.getBranch()).state, "parsed");
+    const command = "echo local-shell-audit-control";
+    fixture.session.recordBashResult(
+      command,
+      { output: "local-shell-audit-control\n", exitCode: 0, cancelled: false, truncated: false },
+      { excludeFromContext },
+    );
+    // Keep the new turn as the retained tail so only the bash execution entry is newly dropped.
+    await fixture.session.prompt("Keep this new turn after the bash entry. ".repeat(80));
+
+    const requestCount = fixture.requests.length;
+    failRemote = true;
+    if (excludeFromContext) {
+      await assert.rejects(fixture.session.compact(), { message: "Compaction cancelled" });
+      const attempted = fixture.requests.slice(requestCount);
+      assert.equal(attempted.filter(({ payload }) => !hasItem(payload, "compaction_trigger")).length, 0);
+      assert.equal(getLatestCompactionEntry(fixture.session.sessionManager.getBranch())?.id, baseEntry.id);
+    } else {
+      await fixture.session.compact();
+      const attempted = fixture.requests.slice(requestCount);
+      const summaries = attempted.filter(({ payload }) => !hasItem(payload, "compaction_trigger"));
+      assert.equal(summaries.length, 1);
+      assert.match(JSON.stringify(summaries[0].payload.input), /local-shell-audit-control/);
+      const active = resolveLatestCheckpoint(fixture.session.sessionManager.getBranch());
+      assert.equal(active.state, "parsed");
+      assert.equal(active.details.version, 2);
+    }
+    assert.deepEqual(fixture.errors, []);
+  });
+}
+
 for (const api of ["openai-responses", "openai-codex-responses"] as const) {
   for (const reason of ["remote failure", "V2 disabled"] as const) {
     for (const separateFallback of [false, true]) {
