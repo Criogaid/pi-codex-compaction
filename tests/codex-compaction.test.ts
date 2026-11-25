@@ -1723,6 +1723,34 @@ test("split-turn fallback retries a transient first-segment error before request
   assert.equal(result.compaction.usage?.input, usage.input * 2);
 });
 
+test("split-turn fallback aborted during first-segment retry backoff does not route or request the second segment", async () => {
+  const controller = new AbortController();
+  const fixture = await splitTurnFallbackFixture({
+    firstResponse: { stopReason: "error", errorMessage: "HTTP 503 Service unavailable" },
+    retry: { enabled: true, maxRetries: 1, baseDelayMs: 5_000 },
+    onRequest: () => { setImmediate(() => controller.abort()); },
+  });
+  fixture.event.signal = controller.signal;
+  let routes = 0;
+  fixture.ctx.modelRegistry.registerVirtualModel({
+    provider: "summary-router", id: "virtual-abort", name: "Virtual abort",
+    thinkingLevels: ["off", "high"], maxTokens: 4_096,
+    route() {
+      routes++;
+      return { model: fallbackModel, thinkingLevel: "high" };
+    },
+  });
+  await fixture.ctx.modelRegistry.refresh({ allowNetwork: false });
+  await writeFile(fallbackSettingsPath, JSON.stringify({
+    version: 2, summaryModel: { provider: "summary-router", model: "virtual-abort", thinkingLevel: "high" },
+  }));
+
+  assert.deepEqual(await fixture.run(), { cancel: true });
+  assert.equal(fixture.calls.length, 1, "only the first segment's initial attempt should reach the provider");
+  assert.equal(routes, 1, "cancelled compaction must not route the second split-turn segment");
+  assert.deepEqual(fixture.notifications.filter((notice) => notice.level === "error"), []);
+});
+
 test("a provider abort without a cancelled signal does not become a fallback summary", async () => {
   await configureFallback();
   const fixture = await fallbackFixture({ stopReason: "aborted" });

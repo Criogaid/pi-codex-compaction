@@ -58,8 +58,10 @@ export async function requestFallbackCompaction(request: FallbackCompactionReque
     request.signal,
     selection.thinkingLevel,
     async (model, context, options) => {
-      // Pi can start another segment after an abort. It only reads .result(),
-      // so the terminal stream can satisfy that call without dispatching again.
+      // Pi can start another segment after an abort. Stop immediately when the signal is aborted
+      // so retry-backoff cancellation cannot route or dispatch a later segment; otherwise reuse
+      // the terminal stream when only the provider stopped early.
+      request.signal.throwIfAborted();
       if (abortedStream) return abortedStream;
       const stream = request.modelRegistry.streamSimple(model, context, {
         ...options,
