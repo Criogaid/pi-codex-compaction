@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { mergeRemoteCompactionHeader, requestRemoteCompaction } from "../src/remote.js";
+import { TurnStateSlot } from "../src/turn-state.js";
 import { assertTrimmedOutput, mockFetch, testRegistry } from "./helpers.js";
 import { CodexCompactionProtocolError, isObject, type JsonObject } from "../src/protocol.js";
 import { prepareRetention } from "../src/retention-input.js";
@@ -28,7 +29,7 @@ function response() {
 function request(modelRegistry: Awaited<ReturnType<typeof testRegistry>>) {
   return { modelRegistry, model, context: { messages: [{ role: "user" as const, content: "current", timestamp: 1 }] },
     reasoning: "high" as const, reasoningEffortUpdates: false, sessionId: "session",
-    signal: new AbortController().signal };
+    signal: new AbortController().signal, turnState: new TurnStateSlot() };
 }
 
 test("merges the V2 beta feature without dropping existing features", () => {

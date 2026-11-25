@@ -10,7 +10,7 @@ import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
 import { CodexCompactionProtocolError, type CompactionPayload, createCompactionCollector, isObject, isObjectArray, type JsonObject, normalizeCompactionEvent, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
 import { applyProviderRequest, type ProviderRequestSnapshot } from "./request-snapshot.js";
 import { CompactionAttempt, compactionRetryLimit, waitForCompactionRetry } from "./remote-retry.js";
-import { applyTurnStateHeader, TurnStateSlot } from "./turn-state.js";
+import { applyTurnStateHeader, type TurnStateSlot } from "./turn-state.js";
 
 const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 const REQUEST_TIMEOUT_MS = 300_000;
@@ -50,8 +50,8 @@ export interface RemoteCompactionRequest {
     contextualFrom?: number;
   };
   providerRequest?: ProviderRequestSnapshot;
-  /** Per-turn sticky-routing slot shared with an active turn or scoped to standalone compaction retries. */
-  turnState?: TurnStateSlot;
+  /** The active turn's sticky-routing slot, or a fresh one for a compaction outside a turn. */
+  turnState: TurnStateSlot;
   onPrepared?: () => void;
 }
 
@@ -96,7 +96,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   const configured = capableModel(model);
   if (!configured) throw new CodexCompactionProtocolError("Model is not configured for remote compaction");
   const retries = compactionRetryLimit(request.maxRetries);
-  const turnState = request.turnState ?? new TurnStateSlot();
+  const { turnState } = request;
   let prepared: (Pick<RemoteCompactionResponse, "promptInput" | "images" | "contextual"> & { readonly body: CompactionPayload }) | undefined;
   let identity: ProviderIdentity | undefined;
   const baseFetch = globalThis.fetch;

@@ -12,6 +12,7 @@ import { capableModel } from "../src/capability.js";
 import { isObject, isObjectArray, type JsonObject } from "../src/protocol.js";
 import { compactionRequest, RequestSnapshotTracker, type ProviderRequestInputs } from "../src/request-snapshot.js";
 import { requestRemoteCompaction } from "../src/remote.js";
+import { TurnStateSlot } from "../src/turn-state.js";
 import { assertTrimmedOutput, mockFetch, testRegistry, withResponsesPayloadHook } from "./helpers.js";
 
 const apiKey = `fixture.${Buffer.from(JSON.stringify({
@@ -76,6 +77,7 @@ for (const api of ["openai-responses", "openai-codex-responses"] as const) {
       await requestRemoteCompaction({
         modelRegistry, model, context, reasoning, reasoningEffortUpdates: false, sessionId,
         signal: new AbortController().signal,
+        turnState: new TurnStateSlot(),
       });
       assert.ok(ordinaryPayload && typeof ordinaryPayload === "object");
       const expected = ordinaryPayload as { input: unknown[] };
@@ -143,6 +145,7 @@ test("V2 rewrites only the sent body, preserving Pi effort updates in the checkp
       modelRegistry: registry, model, context: request.context, providerRequest: request.providerRequest,
       reasoning: "low", sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 1, maxRetryDelayMs: 1,
       reasoningEffortUpdates,
+      turnState: new TurnStateSlot(),
     });
     assert.equal(attempts.length, 2);
     assert.deepEqual(attempts[1], attempts[0]);
@@ -246,6 +249,7 @@ for (const path of ["matching prefix", "no snapshot", "settings mismatch", "serv
       await requestRemoteCompaction({
         modelRegistry: registry, model, context: request.context, providerRequest: request.providerRequest,
         reasoning: "low", reasoningEffortUpdates: false, sessionId, signal: AbortSignal.timeout(5_000), maxRetries: 0,
+        turnState: new TurnStateSlot(),
       });
       assert.ok(isObject(sent) && isObjectArray(sent.input));
       assert.equal(sent.service_tier, request.providerRequest ? "priority" : undefined);
@@ -319,6 +323,7 @@ test("V2 uses a fresh HTTP request with its feature header after an ordinary Web
     await requestRemoteCompaction({
       modelRegistry, model, context, reasoning: "high", reasoningEffortUpdates: false, sessionId,
       signal: AbortSignal.timeout(5_000),
+      turnState: new TurnStateSlot(),
     });
     assert.equal(httpRequests, 1);
     assert.equal(socketRequests, 1, "compaction must not reuse the ordinary connection");

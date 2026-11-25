@@ -15,6 +15,7 @@ import { parseCheckpointDetails } from "../src/checkpoint.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
 import codexCompaction from "../src/index.js";
 import { RemoteCompactionTransientError, requestRemoteCompaction, type RemoteCompactionRequest } from "../src/remote.js";
+import { TurnStateSlot } from "../src/turn-state.js";
 import { CodexCompactionProtocolError, isObject, type JsonObject } from "../src/protocol.js";
 import { isolateAgentConfig, mockFetch, sessionFixture, testRegistry } from "./helpers.js";
 
@@ -101,6 +102,7 @@ async function fixture(api: ResponsesApi, resolve?: () => Promise<AuthResult | u
   const request: RemoteCompactionRequest = {
     modelRegistry: registry, model, context, reasoning: "low", reasoningEffortUpdates: false, sessionId: "retry-session",
     signal: new AbortController().signal, maxRetryDelayMs: 1,
+    turnState: new TurnStateSlot(),
     onPrepared: () => { prepared += 1; },
   };
   function fetchReplies(reply: (attempt: number) => Response | Promise<Response>): typeof globalThis.fetch {

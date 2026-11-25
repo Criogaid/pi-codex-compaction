@@ -5,29 +5,19 @@ import type { Api, ProviderHeaders } from "@earendil-works/pi-ai";
 import { sameBackend, sameModel, type CapableModel, type ProviderIdentity } from "./capability.js";
 import { isObject } from "./protocol.js";
 
-export const TURN_STATE_HEADER = "x-codex-turn-state" as const;
+const TURN_STATE_HEADER = "x-codex-turn-state";
 
-function validTurnState(value: string | undefined): string | undefined {
-  if (!value || /[\r\n\0]/.test(value)) return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function readTurnStateHeader(headers: Headers | Readonly<Record<string, string | undefined>>): string | undefined {
-  if (headers instanceof Headers) return validTurnState(headers.get(TURN_STATE_HEADER) ?? undefined);
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === TURN_STATE_HEADER) return validTurnState(value);
+function headerTurnState(headers: Readonly<Record<string, unknown>>): string | undefined {
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== TURN_STATE_HEADER) continue;
+    if (typeof value === "string") return value;
   }
   return undefined;
 }
 
-function hasTurnStateHeader(headers: ProviderHeaders): boolean {
-  return Object.keys(headers).some((key) => key.toLowerCase() === TURN_STATE_HEADER);
-}
-
 /** Mutate `headers` in place with `token` unless a caller or earlier hook already set or deleted the header. */
 export function applyTurnStateHeader(headers: ProviderHeaders, token: string | undefined): void {
-  if (token === undefined || hasTurnStateHeader(headers)) return;
+  if (token === undefined || Object.keys(headers).some((key) => key.toLowerCase() === TURN_STATE_HEADER)) return;
   headers[TURN_STATE_HEADER] = token;
 }
 
@@ -39,27 +29,20 @@ export class TurnStateSlot {
     return this.token;
   }
 
-  observe(value: string | undefined): void {
-    if (this.token !== undefined) return;
-    const valid = validTurnState(value);
-    if (valid !== undefined) this.token = valid;
-  }
-
-  observeHeaders(headers: Headers | Readonly<Record<string, string | undefined>>): void {
-    if (this.token !== undefined) return;
-    this.observe(readTurnStateHeader(headers));
+  observeHeaders(headers: Headers | Readonly<Record<string, string>>): void {
+    this.observe(headers instanceof Headers ? headers.get(TURN_STATE_HEADER) ?? undefined : headerTurnState(headers));
   }
 
   observeStreamEvent(event: unknown): void {
-    if (this.token !== undefined || !isObject(event) || event.type !== "response.metadata" || !isObject(event.headers)) {
-      return;
-    }
-    for (const [key, value] of Object.entries(event.headers)) {
-      if (key.toLowerCase() === TURN_STATE_HEADER && typeof value === "string") {
-        this.observe(value);
-        return;
-      }
-    }
+    if (!isObject(event) || event.type !== "response.metadata" || !isObject(event.headers)) return;
+    this.observe(headerTurnState(event.headers));
+  }
+
+  private observe(value: string | undefined): void {
+    // Stream-event values are server JSON; one that fetch would reject as a header value is dropped.
+    if (this.token !== undefined || value === undefined || /[\r\n\0]/.test(value)) return;
+    const trimmed = value.trim();
+    if (trimmed.length > 0) this.token = trimmed;
   }
 }
 
@@ -100,6 +83,10 @@ export class TurnStateTracker {
     this.active = undefined;
   }
 
+  /**
+   * `after_provider_response` names no model, so a response that arrives after a mid-request model
+   * switch latches into the new model's slot. Pi exposes no request identity to rule that out.
+   */
   observeResponse(
     sessionId: string,
     target: CapableModel | undefined,
@@ -113,12 +100,11 @@ export class TurnStateTracker {
     target: CapableModel | undefined,
     event: { readonly provider: string; readonly api: Api; readonly model: string; readonly data: unknown },
   ): void {
-    const slot = this.slotFor(sessionId, target);
-    if (!slot || event.provider !== target!.identity.provider ||
-        event.api !== target!.identity.api || event.model !== target!.identity.modelId) {
+    if (!target || event.provider !== target.identity.provider ||
+        event.api !== target.identity.api || event.model !== target.identity.modelId) {
       return;
     }
-    slot.observeStreamEvent(event.data);
+    this.slotFor(sessionId, target)?.observeStreamEvent(event.data);
   }
 
   applyToHeaders(sessionId: string, target: CapableModel | undefined, headers: ProviderHeaders): void {
@@ -126,11 +112,10 @@ export class TurnStateTracker {
   }
 
   /**
-   * In-turn automatic compactions share the active turn's slot; standalone manual compactions
-   * use an isolated slot for their own retries so previous turns never leak into or out of them.
+   * In-turn automatic compactions share the active turn's slot. Compactions outside a turn, including
+   * manual ones (Pi aborts and settles the run first), get a fresh slot for their own retries.
    */
-  compactionSlot(sessionId: string, target: CapableModel, reason: "manual" | "threshold" | "overflow"): TurnStateSlot {
-    if (reason === "manual") return new TurnStateSlot();
+  compactionSlot(sessionId: string, target: CapableModel | undefined): TurnStateSlot {
     return this.slotFor(sessionId, target) ?? new TurnStateSlot();
   }
 

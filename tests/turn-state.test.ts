@@ -2,17 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import codexCompaction from "../src/index.js";
-import { isObject } from "../src/protocol.js";
-import { TURN_STATE_HEADER } from "../src/turn-state.js";
-import { isolateAgentConfig, sessionFixture } from "./helpers.js";
+import { isCompactionRequest, isolateAgentConfig, sessionFixture, sseResponse, textEvents } from "./helpers.js";
 
 isolateAgentConfig();
 
-function sseResponse(events: readonly Record<string, unknown>[], headers?: Record<string, string>): Response {
-  return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
-    headers: { "content-type": "text/event-stream", ...headers },
-  });
-}
+const TURN_STATE_HEADER = "x-codex-turn-state";
 
 function toolCallEvents(requestNumber: number, callId: string): Record<string, unknown>[] {
   const item = {
@@ -34,32 +28,6 @@ function toolCallEvents(requestNumber: number, callId: string): Record<string, u
         status: "completed",
         output: [item],
         usage: { input_tokens: 500, output_tokens: 20, total_tokens: 520 },
-      },
-    },
-  ];
-}
-
-function textEvents(requestNumber: number, text: string, inputTokens = 500, extra: readonly Record<string, unknown>[] = []): Record<string, unknown>[] {
-  const item = {
-    type: "message",
-    id: `msg_${requestNumber}`,
-    role: "assistant",
-    status: "completed",
-    content: [{ type: "output_text", text, annotations: [] }],
-  };
-  return [
-    { type: "response.created", response: { id: `resp_${requestNumber}` } },
-    ...extra,
-    { type: "response.output_item.added", output_index: 0, item: { ...item, content: [] } },
-    { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text },
-    { type: "response.output_item.done", output_index: 0, item },
-    {
-      type: "response.completed",
-      response: {
-        id: `resp_${requestNumber}`,
-        status: "completed",
-        output: [item],
-        usage: { input_tokens: inputTokens, output_tokens: 20, total_tokens: inputTokens + 20 },
       },
     },
   ];
@@ -122,9 +90,8 @@ test("in-turn auto-compaction replays the active turn's x-codex-turn-state", { t
     settings: {
       compaction: { enabled: true, reserveTokens: 1_024, keepRecentTokens: 128 },
     },
-    respond: ({ payload }) => {
-      const compacting = Array.isArray(payload.input) && payload.input.some((item) => isObject(item) && item.type === "compaction_trigger");
-      if (compacting) return undefined;
+    respond: (request) => {
+      if (isCompactionRequest(request)) return undefined;
       ordinaryCalls++;
       // Return high input tokens only on turn 2 to trigger threshold auto-compaction before agent_settled.
       const tokens = ordinaryCalls === 2 ? 31_500 : 500;
@@ -138,8 +105,7 @@ test("in-turn auto-compaction replays the active turn's x-codex-turn-state", { t
     await fixture.session.prompt(`Turn 1: ${"Preserve constraints. ".repeat(60)}`);
     await fixture.session.prompt(`Turn 2: ${"Trigger threshold compaction. ".repeat(60)}`);
 
-    const compactIndex = fixture.requests.findIndex(({ payload }) =>
-      Array.isArray(payload.input) && payload.input.some((item) => isObject(item) && item.type === "compaction_trigger"));
+    const compactIndex = fixture.requests.findIndex(isCompactionRequest);
     assert.equal(compactIndex, 2, "Expected threshold auto-compaction immediately after turn 2");
     assert.equal(fixture.requests[0].headers.get(TURN_STATE_HEADER), null);
     assert.equal(fixture.requests[1].headers.get(TURN_STATE_HEADER), null);
@@ -164,9 +130,8 @@ test("standalone manual compaction does not reuse the previous turn's token, rep
     settings: {
       retry: { enabled: false, provider: { maxRetries: 2, maxRetryDelayMs: 1_000 } },
     },
-    respond: ({ payload }) => {
-      const compacting = Array.isArray(payload.input) && payload.input.some((item) => isObject(item) && item.type === "compaction_trigger");
-      if (!compacting) {
+    respond: (request) => {
+      if (!isCompactionRequest(request)) {
         return sseResponse(textEvents(fixture.requests.length, `Reply. ${"word ".repeat(60)}`), {
           "x-codex-turn-state": "settled-turn-state",
         });
@@ -191,8 +156,7 @@ test("standalone manual compaction does not reuse the previous turn's token, rep
     await fixture.session.compact();
     await fixture.session.prompt("Turn 3 after manual compaction.");
 
-    const compactRequests = fixture.requests.filter(({ payload }) =>
-      Array.isArray(payload.input) && payload.input.some((item) => isObject(item) && item.type === "compaction_trigger"));
+    const compactRequests = fixture.requests.filter(isCompactionRequest);
     assert.equal(compactRequests.length, 2);
     assert.equal(compactRequests[0].headers.get(TURN_STATE_HEADER), null);
     assert.equal(compactRequests[1].headers.get(TURN_STATE_HEADER), "manual-compact-retry-state");

@@ -521,7 +521,8 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     try {
       const requestSnapshots = snapshots.current();
       const supported = capableModel(ctx.model);
-      const compactionTurnState = supported ? turnState.compactionSlot(sessionId, supported, event.reason) : undefined;
+      // Capture before the awaits below: a model switch while settings load replaces the turn's slot.
+      const compactionTurnState = turnState.compactionSlot(sessionId, supported);
       if (!owned()) return { cancel: true };
       const effort = reasoningEffortUpdates ??= readReasoningEffortUpdates(ctx);
       let configuration: CompactionConfiguration;
@@ -543,7 +544,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
         ownsStatus,
       });
 
-      const result = configuration.remoteCompactionEnabled && supported && compactionTurnState
+      const result = configuration.remoteCompactionEnabled && supported
         ? await compactRemotely(pi, event, ctx, run, supported, requestSnapshots, compactionTurnState)
         : await compactFallback(event, ctx, run, undefined);
       return owned() ? result : { cancel: true };

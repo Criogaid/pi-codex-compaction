@@ -74,6 +74,32 @@ export interface SessionRequest {
   readonly url: string;
 }
 
+export function isCompactionRequest({ payload }: SessionRequest): boolean {
+  return Array.isArray(payload.input) && payload.input.some((item) => isObject(item) && item.type === "compaction_trigger");
+}
+
+export function sseResponse(events: readonly JsonObject[], headers?: Record<string, string>): Response {
+  return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+    headers: { "content-type": "text/event-stream", ...headers },
+  });
+}
+
+export function textEvents(requestNumber: number, text: string, inputTokens = 500): JsonObject[] {
+  const item = {
+    type: "message", id: `msg_${requestNumber}`, role: "assistant", status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  };
+  return [
+    { type: "response.created", response: { id: `resp_${requestNumber}` } },
+    { type: "response.output_item.added", output_index: 0, item: { ...item, content: [] } },
+    { type: "response.content_part.added", output_index: 0, content_index: 0, part: { type: "output_text", text: "" } },
+    { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id: `resp_${requestNumber}`, status: "completed", output: [item],
+      usage: { input_tokens: inputTokens, output_tokens: 20, total_tokens: inputTokens + 20 } } },
+  ];
+}
+
 /** Exercise real Pi sessions and provider serialization; replace only network I/O with bounded SSE fixtures. */
 export async function sessionFixture(options: {
   readonly api?: "openai-responses" | "openai-codex-responses";
@@ -108,28 +134,17 @@ export async function sessionFixture(options: {
     requests.push(recorded);
     const response = await options.respond?.(recorded);
     if (response) return response;
-    assert.ok(Array.isArray(payload.input));
-    const compacting = payload.input.some((item) => isObject(item) && item.type === "compaction_trigger");
-    const item = compacting
-      ? { type: "compaction", encrypted_content: `fixture-checkpoint-${requests.length}` }
-      : { type: "message", id: `msg_${requests.length}`, role: "assistant", status: "completed",
-          content: [{ type: "output_text", text: `Fixture reply ${requests.length}.`, annotations: [] }] };
-    const inputTokens = (compacting ? undefined : options.ordinaryInputTokens?.()) ?? 500;
-    const outputTokens = 20;
-    const usage = { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens };
-    const events = [
-      { type: "response.created", response: { id: `resp_${requests.length}` } },
-      ...(!compacting ? [
-        { type: "response.output_item.added", output_index: 0, item: { ...item, content: [] } },
-        { type: "response.content_part.added", output_index: 0, content_index: 0, part: { type: "output_text", text: "" } },
-        { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: `Fixture reply ${requests.length}.` },
-      ] : []),
+    const requestNumber = requests.length;
+    if (!isCompactionRequest(recorded)) {
+      return sseResponse(textEvents(requestNumber, `Fixture reply ${requestNumber}.`, options.ordinaryInputTokens?.()));
+    }
+    const item = { type: "compaction", encrypted_content: `fixture-checkpoint-${requestNumber}` };
+    return sseResponse([
+      { type: "response.created", response: { id: `resp_${requestNumber}` } },
       { type: "response.output_item.done", output_index: 0, item },
-      { type: "response.completed", response: { id: `resp_${requests.length}`, status: "completed", output: [item], usage } },
-    ];
-    return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
-      headers: { "content-type": "text/event-stream" },
-    });
+      { type: "response.completed", response: { id: `resp_${requestNumber}`, status: "completed", output: [item],
+        usage: { input_tokens: 500, output_tokens: 20, total_tokens: 520 } } },
+    ]);
   };
   const runtime = await ModelRuntime.create({
     credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(),
