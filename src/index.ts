@@ -50,6 +50,7 @@ import {
 } from "./fallback-settings.js";
 import { registerCompactionCommand } from "./fallback-command.js";
 import { compactionRequest, RequestSnapshotTracker, type ProviderRequestInputs, type RequestSnapshots } from "./request-snapshot.js";
+import { type TurnStateSlot, TurnStateTracker } from "./turn-state.js";
 
 const STATUS_KEY = "codex-compaction";
 const COMPLETION_ENTRY_TYPE = "pi-codex-compaction-completed";
@@ -375,6 +376,7 @@ async function compactRemotely(
   run: CompactionRun,
   supported: CapableModel,
   snapshots: RequestSnapshots,
+  turnState: TurnStateSlot,
 ) {
   const { sessionId, signal } = run;
   const reasoning = pi.getThinkingLevel();
@@ -405,6 +407,7 @@ async function compactRemotely(
       context: request.context,
       userItemOrigins: userItemOrigins(request.messages),
       providerRequest: request.providerRequest,
+      turnState,
       reasoning,
       sessionId,
       thinkingBudgets: settings.thinkingBudgets,
@@ -479,6 +482,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   registerCompactionCommand(pi, compactionSettingsPath, (enabled) => { reasoningEffortUpdates = Promise.resolve(enabled); });
   const warnings = new Set<string>();
   const snapshots = new RequestSnapshotTracker();
+  const turnState = new TurnStateTracker();
   let latestRun = 0;
   let live = true;
   const warnOnce = (ctx: ExtensionContext, key: string, message: string) => {
@@ -501,6 +505,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     warnings.clear();
     snapshots.reset();
+    turnState.reset();
     await (reasoningEffortUpdates = readReasoningEffortUpdates(ctx));
   });
 
@@ -516,6 +521,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     try {
       const requestSnapshots = snapshots.current();
       const supported = capableModel(ctx.model);
+      const compactionTurnState = supported ? turnState.compactionSlot(sessionId, supported, event.reason) : undefined;
       if (!owned()) return { cancel: true };
       const effort = reasoningEffortUpdates ??= readReasoningEffortUpdates(ctx);
       let configuration: CompactionConfiguration;
@@ -537,8 +543,8 @@ export default function codexCompaction(pi: ExtensionAPI): void {
         ownsStatus,
       });
 
-      const result = configuration.remoteCompactionEnabled && supported
-        ? await compactRemotely(pi, event, ctx, run, supported, requestSnapshots)
+      const result = configuration.remoteCompactionEnabled && supported && compactionTurnState
+        ? await compactRemotely(pi, event, ctx, run, supported, requestSnapshots, compactionTurnState)
         : await compactFallback(event, ctx, run, undefined);
       return owned() ? result : { cancel: true };
     } finally {
@@ -563,7 +569,25 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event, ctx) => {
-    snapshots.recordRunStart(ctx.sessionManager.getSessionId(), event.systemPromptOptions);
+    const sessionId = ctx.sessionManager.getSessionId();
+    snapshots.recordRunStart(sessionId, event.systemPromptOptions);
+    turnState.startTurn(sessionId, capableModel(ctx.model));
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
+    turnState.ensureTurn(ctx.sessionManager.getSessionId(), capableModel(ctx.model));
+  });
+
+  pi.on("before_provider_headers", (event, ctx) => {
+    turnState.applyToHeaders(ctx.sessionManager.getSessionId(), capableModel(ctx.model), event.headers);
+  });
+
+  pi.on("after_provider_response", (event, ctx) => {
+    turnState.observeResponse(ctx.sessionManager.getSessionId(), capableModel(ctx.model), event.headers);
+  });
+
+  pi.on("provider_stream_event", (event, ctx) => {
+    turnState.observeStreamEvent(ctx.sessionManager.getSessionId(), capableModel(ctx.model), event);
   });
 
   pi.on("context", (_event, ctx) => {
@@ -627,10 +651,12 @@ export default function codexCompaction(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    turnState.endTurn();
     snapshots.recordSettledRun(ctx.sessionManager.getSessionId(), capableModel(ctx.model), () => providerRequestInputs(pi, ctx));
   });
 
   pi.on("model_select", async (event, ctx) => {
+    turnState.selectModel(ctx.sessionManager.getSessionId(), capableModel(event.model));
     const checkpoint = activeCheckpoint(ctx);
     if (!checkpoint || await compatibleIdentity(checkpoint, ctx, event.model)) return;
     warnOnce(ctx, `${checkpoint.checkpointId}:${event.model.provider}:${event.model.id}`, INCOMPATIBLE_BACKEND_WARNING);
@@ -640,6 +666,7 @@ export default function codexCompaction(pi: ExtensionAPI): void {
     live = false;
     warnings.clear();
     snapshots.reset();
+    turnState.reset();
     ctx.ui.setStatus(STATUS_KEY, undefined);
   });
 }

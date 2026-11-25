@@ -10,6 +10,7 @@ import { contextUserItems, type UserItemOrigin } from "./retention-input.js";
 import { CodexCompactionProtocolError, type CompactionPayload, createCompactionCollector, isObject, isObjectArray, type JsonObject, normalizeCompactionEvent, prepareRemoteCompactionPayload, withoutInputImages } from "./protocol.js";
 import { applyProviderRequest, type ProviderRequestSnapshot } from "./request-snapshot.js";
 import { CompactionAttempt, compactionRetryLimit, waitForCompactionRetry } from "./remote-retry.js";
+import { applyTurnStateHeader, TurnStateSlot } from "./turn-state.js";
 
 const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 const REQUEST_TIMEOUT_MS = 300_000;
@@ -49,6 +50,8 @@ export interface RemoteCompactionRequest {
     contextualFrom?: number;
   };
   providerRequest?: ProviderRequestSnapshot;
+  /** Per-turn sticky-routing slot shared with an active turn or scoped to standalone compaction retries. */
+  turnState?: TurnStateSlot;
   onPrepared?: () => void;
 }
 
@@ -62,7 +65,7 @@ export interface RemoteCompactionResponse {
   contextual: boolean[];
 }
 
-export function mergeRemoteCompactionHeader(headers: ProviderHeaders): ProviderHeaders {
+export function mergeRemoteCompactionHeader(headers: ProviderHeaders, turnState?: string): ProviderHeaders {
   const merged = { ...headers };
   const existingKey = Object.keys(merged).find((key) => key.toLowerCase() === "x-codex-beta-features");
   const features = new Set(((existingKey ? merged[existingKey] : "") ?? "")
@@ -70,6 +73,7 @@ export function mergeRemoteCompactionHeader(headers: ProviderHeaders): ProviderH
   features.add(REMOTE_COMPACTION_FEATURE);
   if (existingKey && existingKey !== "x-codex-beta-features") delete merged[existingKey];
   merged["x-codex-beta-features"] = [...features].join(",");
+  applyTurnStateHeader(merged, turnState);
   return merged;
 }
 
@@ -92,6 +96,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
   const configured = capableModel(model);
   if (!configured) throw new CodexCompactionProtocolError("Model is not configured for remote compaction");
   const retries = compactionRetryLimit(request.maxRetries);
+  const turnState = request.turnState ?? new TurnStateSlot();
   let prepared: (Pick<RemoteCompactionResponse, "promptInput" | "images" | "contextual"> & { readonly body: CompactionPayload }) | undefined;
   let identity: ProviderIdentity | undefined;
   const baseFetch = globalThis.fetch;
@@ -127,6 +132,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
           : input instanceof Request
             ? await baseFetch(new Request(identity!.endpoint, new Request(input, init)))
             : await baseFetch(identity!.endpoint, init);
+        turnState.observeHeaders(response.headers);
         return attempt.observeResponse(response, request.signal, () => collector.completed);
       } catch (error) {
         attempt.fetchFailed(error);
@@ -145,7 +151,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
         // Only the outer V2 loop retries; provider HTTP retries would multiply the global budget.
         maxRetries: 0,
         maxRetryDelayMs: request.maxRetryDelayMs,
-        transformHeaders: mergeRemoteCompactionHeader,
+        transformHeaders: (headers) => mergeRemoteCompactionHeader(headers, turnState.value),
         fetch: routedFetch,
         onPayload: async (payload, preparedModel) => {
           try {
@@ -211,6 +217,7 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
         },
         onProviderStreamEvent: (rawEvent) => {
           request.signal.throwIfAborted();
+          turnState.observeStreamEvent(rawEvent);
           const event = normalizeCompactionEvent(model.api, rawEvent);
           const transient = attempt.observeEvent(event);
           if (transient) throw transient;
