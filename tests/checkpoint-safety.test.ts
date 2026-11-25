@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { getLatestCompactionEntry } from "@earendil-works/pi-coding-agent";
+import { getLatestCompactionEntry, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { resolveLatestCheckpoint } from "../src/checkpoint.js";
 import { COMPACTION_SETTINGS_RELATIVE_PATH } from "../src/fallback-settings.js";
 import codexCompaction from "../src/index.js";
@@ -291,6 +291,75 @@ for (const separateFallback of [false, true]) {
     assert.deepEqual(fixture.errors, []);
   });
 }
+
+test("native text compaction after a layered checkpoint keeps before_provider_headers and the starting model on cycleModel", { timeout: 20_000 }, async (t) => {
+  await rm(configPath, { force: true });
+  let failRemote = false;
+  let requireGatewayHeader = false;
+  const gatewayHeaders: ExtensionFactory = (pi) => {
+    pi.on("before_provider_headers", (event) => {
+      event.headers["x-gateway-token"] = "required-token";
+    });
+  };
+  const fixture = await sessionFixture({
+    extensions: [gatewayHeaders, codexCompaction],
+    models: (base) => [base, { ...base, id: "gpt-fixture-second-model" }],
+    respond({ payload, headers }) {
+      if (failRemote && hasItem(payload, "compaction_trigger")) {
+        return new Response("Temporary service outage", { status: 503 });
+      }
+      if (requireGatewayHeader && headers.get("x-gateway-token") !== "required-token") {
+        return new Response("Forbidden", { status: 403 });
+      }
+      return undefined;
+    },
+  });
+  t.after(() => fixture.close());
+  await seedHistory(fixture);
+  await fixture.session.prompt("New work before layered fallback. ".repeat(80));
+  await fixture.session.prompt("Recent tail during layered fallback. ".repeat(80));
+
+  failRemote = true;
+  await fixture.session.compact();
+  failRemote = false;
+
+  const layered = resolveLatestCheckpoint(fixture.session.sessionManager.getBranch());
+  assert.equal(layered.state, "parsed");
+  assert.equal(layered.details.version, 2);
+  const previousTextSummary = layered.details.textSummary;
+
+  await fixture.session.prompt("More work after layered checkpoint. ".repeat(80));
+  await fixture.session.prompt("Latest tail before disabling V2. ".repeat(80));
+  await mkdir(dirname(configPath), { recursive: true });
+  await writeFile(configPath, JSON.stringify({ version: 2, remoteCompaction: { enabled: false } }));
+
+  const requestCount = fixture.requests.length;
+  requireGatewayHeader = true;
+  let cycled: ReturnType<typeof fixture.session.cycleModel> | undefined;
+  const unsubscribe = fixture.session.subscribe((event) => {
+    if (event.type === "compaction_start") {
+      // Run cycleModel after compact() freezes its starting model, while session_before_compact awaits settings.
+      setImmediate(() => { cycled = fixture.session.cycleModel(); });
+    }
+  });
+  try {
+    await fixture.session.compact();
+  } finally {
+    unsubscribe();
+  }
+  assert.equal((await cycled)?.model.id, fixture.models[1].id);
+
+  const summaryRequests = fixture.requests.slice(requestCount);
+  assert.ok(summaryRequests.length > 0);
+  assert.ok(summaryRequests.every((request) => request.headers.get("x-gateway-token") === "required-token"));
+  assert.ok(summaryRequests.every((request) => request.payload.model === fixture.models[0].id));
+  const summaryInput = JSON.stringify(summaryRequests.map((request) => request.payload.input));
+  assert.ok(summaryInput.includes(previousTextSummary));
+  assert.doesNotMatch(summaryInput, /Earlier chat history was compressed by Codex Remote Compaction V2/);
+  assert.equal(fixture.session.model?.id, fixture.models[1].id);
+  assert.equal(resolveLatestCheckpoint(fixture.session.sessionManager.getBranch()).state, "none");
+  assert.deepEqual(fixture.errors, []);
+});
 
 for (const excludeFromContext of [true, false]) {
   test(`layered recovery ${excludeFromContext ? "stops without summarizing" : "summarizes"} when only a ${excludeFromContext ? "!!" : "!"} bash entry is dropped`, { timeout: 20_000 }, async (t) => {
